@@ -75,6 +75,32 @@ def _usable(row: dict) -> bool:
         return False
 
 
+def _external_cash_flow(prev: dict | None, cur: dict | None) -> float:
+    if prev is None or cur is None:
+        return 0.0
+    try:
+        explicit = cur.get("external_cash_flow")
+        if explicit is not None:
+            return float(explicit)
+    except Exception:
+        pass
+    try:
+        total_delta = (
+            float(cur.get("total_value") or 0.0)
+            - float(prev.get("total_value") or 0.0)
+        )
+        cash_delta = (
+            float(cur.get("cash") or 0.0)
+            - float(prev.get("cash") or 0.0)
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    tolerance = max(1.0, abs(total_delta) * 0.005)
+    if abs(total_delta) >= 100.0 and abs(total_delta - cash_delta) <= tolerance:
+        return total_delta
+    return 0.0
+
+
 def build_benchmark(equity_curve: list[dict],
                     starting_equity: float = 1000.0) -> dict:
     """Whole-account return vs an equal-capital S&P 500 buy-and-hold since
@@ -114,6 +140,8 @@ def build_benchmark(equity_curve: list[dict],
         "alpha_pp": None,
         "sp500_equivalent_usd": None,
         "usd_vs_sp500": None,
+        "capital_basis": round(float(starting_equity), 2),
+        "net_external_cash_flow": 0.0,
         "pct_cycles_ahead": None,
         "best_alpha_pp": None,
         "best_alpha_ts": None,
@@ -134,16 +162,41 @@ def build_benchmark(equity_curve: list[dict],
     if not rows:
         return base
 
-    anchor, latest = rows[0], rows[-1]
+    annotated: list[dict] = []
+    basis = float(starting_equity)
+    flows: list[tuple[float, float]] = []
+    prev = None
+    for r in rows:
+        row = dict(r)
+        flow = _external_cash_flow(prev, row) if prev is not None else 0.0
+        basis += flow
+        sp = float(row["sp500_price"])
+        if flow:
+            flows.append((flow, sp))
+        row["_capital_basis"] = basis
+        row["_external_cash_flow"] = flow
+        annotated.append(row)
+        prev = row
+
+    anchor, latest = annotated[0], annotated[-1]
     sp0 = float(anchor["sp500_price"])
     sp1 = float(latest["sp500_price"])
     cur_val = float(latest["total_value"])
     init = float(starting_equity)
+    current_basis = float(latest.get("_capital_basis") or init)
+    net_flows = current_basis - init
 
-    port_ret = (cur_val - init) / init * 100.0 if init else 0.0
-    sp_ret = (sp1 - sp0) / sp0 * 100.0 if sp0 else 0.0
-    alpha_pp = port_ret - sp_ret
     sp_equiv = init * (sp1 / sp0) if sp0 else init
+    for flow, flow_sp in flows:
+        if flow_sp:
+            sp_equiv += flow * (sp1 / flow_sp)
+        else:
+            sp_equiv += flow
+    port_ret = ((cur_val - current_basis) / current_basis * 100.0
+                if current_basis else 0.0)
+    sp_ret = ((sp_equiv - current_basis) / current_basis * 100.0
+              if current_basis else 0.0)
+    alpha_pp = port_ret - sp_ret
     usd_vs = cur_val - sp_equiv
 
     # Running alpha series (cheap, bounded): for each benchmarkable point,
@@ -153,11 +206,23 @@ def build_benchmark(equity_curve: list[dict],
     n_ahead = 0
     best_a = best_ts = worst_a = worst_ts = None
     hist: list[dict] = []
-    for r in rows:
+    flow_lots: list[tuple[float, float]] = []
+    for r in annotated:
         tv = float(r["total_value"])
         sp = float(r["sp500_price"])
-        pr = (tv - init) / init * 100.0 if init else 0.0
-        sr = (sp - sp0) / sp0 * 100.0 if sp0 else 0.0
+        flow = float(r.get("_external_cash_flow") or 0.0)
+        if flow:
+            flow_lots.append((flow, sp))
+        basis_i = float(r.get("_capital_basis") or init)
+        sp_equiv_i = init * (sp / sp0) if sp0 else init
+        for flow_amt, flow_sp in flow_lots:
+            if flow_sp:
+                sp_equiv_i += flow_amt * (sp / flow_sp)
+            else:
+                sp_equiv_i += flow_amt
+        pr = (tv - basis_i) / basis_i * 100.0 if basis_i else 0.0
+        sr = ((sp_equiv_i - basis_i) / basis_i * 100.0
+              if basis_i else 0.0)
         a = pr - sr
         if a > 0:
             n_ahead += 1
@@ -205,10 +270,16 @@ def build_benchmark(equity_curve: list[dict],
         )
     else:
         rel = "by" if verdict != "TRACKING" else "within"
+        basis_phrase = (
+            f"the same ${current_basis:.2f} capital basis had been invested "
+            "in the index as deposits landed"
+            if abs(net_flows) >= 0.01
+            else f"the same ${init:.2f} had bought the index at inception"
+        )
         headline = (
             f"{_VERB[verdict]} buy-and-hold S&P 500 {rel} "
             f"{abs(alpha_pp):.2f}pp — ${cur_val:.2f} vs ${sp_equiv:.2f} if "
-            f"the same ${init:.2f} had bought the index at inception "
+            f"{basis_phrase} "
             f"(${usd_vs:+.2f}); ahead in {pct_ahead:.1f}% of {n} cycles."
         )
 
@@ -225,6 +296,8 @@ def build_benchmark(equity_curve: list[dict],
         "alpha_pp": round(alpha_pp, 4),
         "sp500_equivalent_usd": round(sp_equiv, 2),
         "usd_vs_sp500": round(usd_vs, 2),
+        "capital_basis": round(current_basis, 2),
+        "net_external_cash_flow": round(net_flows, 2),
         "pct_cycles_ahead": round(pct_ahead, 2),
         "best_alpha_pp": round(best_a, 4) if best_a is not None else None,
         "best_alpha_ts": best_ts,

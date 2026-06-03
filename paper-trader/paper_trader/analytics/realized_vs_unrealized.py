@@ -216,8 +216,13 @@ def build_realized_vs_unrealized(trades, equity_curve,
             continue
         if ts is None:
             continue
+        try:
+            basis = float(cv.get("capital_basis"))
+        except (TypeError, ValueError):
+            basis = float(starting_value)
         norm_curve.append({"ts_dt": ts, "ts": ts.isoformat(timespec="seconds"),
-                           "total": round(tv, 4)})
+                           "total": round(tv, 4),
+                           "capital_basis": round(basis, 4)})
     norm_curve.sort(key=lambda r: r["ts_dt"])
     out["n_curve_points"] = len(norm_curve)
     if not norm_curve:
@@ -233,15 +238,19 @@ def build_realized_vs_unrealized(trades, equity_curve,
     for row in annotated:
         total = row["total"]
         realized = row["realized"]
-        unrealized = round(total - starting - realized, 4)
+        basis = float(row.get("capital_basis") or starting)
+        unrealized = round(total - basis - realized, 4)
         series.append({"ts": row["ts"], "total": total,
-                       "realized": realized, "unrealized": unrealized})
+                       "realized": realized, "unrealized": unrealized,
+                       "capital_basis": round(basis, 4)})
 
     # Compress the time-series for the wire — keep first + downsample
     # the middle + always keep the last `MAX_SERIES_POINTS // 2` newest.
     out["series"] = _compress_series(series, MAX_SERIES_POINTS)
 
     last = series[-1]
+    starting = float(last.get("capital_basis") or starting)
+    out["starting_value"] = round(starting, 4)
     out["current_value"] = last["total"]
     out["realized_pnl_usd"] = last["realized"]
     out["unrealized_pnl_usd"] = last["unrealized"]

@@ -128,6 +128,29 @@ class TestVerdictsExactArithmetic:
         assert r["alpha_pp"] == 0.2
         assert "Tracking buy-and-hold S&P 500 within 0.20pp" in r["headline"]
 
+    def test_deposit_is_capital_basis_not_profit(self):
+        """A +$10k operator deposit must not become +1000% strategy return."""
+        rows = _curve(
+            [(1000, 5000), (1000, 5000), (11000, 5000)]
+            + [(11000, 5000)] * 9
+            + [(11310, 5100)],
+            step_h=3.0,
+        )
+        # Manual deposit row: equity and cash jump together by +10k.
+        rows[2]["cash"] = 10000.0
+        rows[1]["cash"] = 0.0
+        for row in rows[3:]:
+            row["cash"] = 10000.0
+        r = build_benchmark(rows, starting_equity=1000.0)
+        assert r["capital_basis"] == 11000.0
+        assert r["net_external_cash_flow"] == 10000.0
+        assert r["port_return_pct"] == round(310 / 11000 * 100, 4)
+        # S&P benchmark applies the same deposit at the deposit row, then both
+        # lots ride the 5000→5100 move to $11220.
+        assert r["sp500_equivalent_usd"] == 11220.0
+        assert r["usd_vs_sp500"] == 90.0
+        assert "capital basis" in r["headline"]
+
     def test_real_live_book_shape_locks_arithmetic(self):
         """Regression lock against the *real* 2026-05-17 live book: $1000 →
         $972.69 while ^GSPC 7444.88 → 7409.18. The bot is −2.25pp / −$22.52
