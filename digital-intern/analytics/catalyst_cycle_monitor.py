@@ -77,6 +77,45 @@ AI_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Fresh timestamps alone are not enough. These are usually recaps, analyst
+# churn, previews, or post-earnings commentary where the market already knows
+# the story and a repost should not page people.
+KNOWN_CONSENSUS_RE = re.compile(
+    r"\b("
+    r"price\s*target|maintained\s+by|raised\s+to|analysts?\s+have\s+lifted|"
+    r"upgrad(?:e|ed|es|ing)|downgrad(?:e|ed|es|ing)|"
+    r"set\s+to\s+report|to\s+report\s+.*earnings|earnings\s+preview|"
+    r"ahead\s+of\s+earnings|q[1-4]\s+earnings|on\s+.*earnings|"
+    r"after\s+earnings|post.?earnings|earnings\s+call|"
+    r"ceo\s+on|nobody\s+wants\s+to\s+be\s+left\s+behind|"
+    r"trading\s+\d+(?:\.\d+)?%\s+higher|trading\s+higher|"
+    r"stock\s+moves|why\s+.*stock|profit\s+from\s+others'? speculation|"
+    r"intrinsic\s+value|stick\s+to\s+intrinsic\s+value|"
+    r"s&p\s*500|nasdaq|dow\s+futures?|record\s+close|"
+    r"futures?\s+(ease|rise|fall)|markets?\s+in\s+focus|in\s+focus|"
+    r"microsoft\s+build|\bmsn\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+LOW_QUALITY_TRADE_CHATTER_RE = re.compile(
+    r"\b(drop\s+to|crash|shorts?|puts?|bearish|sell|support|resistance|"
+    r"checked\s+the\s+shorts?|checkmated)\b",
+    re.IGNORECASE,
+)
+
+URGENT_CATALYSTS = {
+    "EARNINGS",
+    "EARNINGS_PRE",
+    "PRODUCT",
+    "ANALYST",
+    "M&A",
+    "REGULATORY",
+    "GOVERNMENT",
+    "MACRO",
+    "SHORT_SQUEEZE",
+}
+
 CATALYST_WEIGHT = {
     "EARNINGS": 2.0,
     "EARNINGS_PRE": 1.6,
@@ -113,6 +152,47 @@ def _extract_tickers(title: str | None) -> set[str]:
 
 def _is_ai_context(title: str | None) -> bool:
     return bool(AI_CONTEXT_RE.search(title or ""))
+
+
+def _is_known_consensus_coverage(title: str | None) -> bool:
+    return bool(KNOWN_CONSENSUS_RE.search(title or ""))
+
+
+def _is_low_quality_trade_chatter(title: str | None) -> bool:
+    return bool(LOW_QUALITY_TRADE_CHATTER_RE.search(title or ""))
+
+
+def _source_family(source: str | None) -> str:
+    """Canonical source family for catalyst corroboration.
+
+    Aggregator labels such as ``yfinance/Stocktwits`` and
+    ``GoogleNews/Stocktwits`` are still Stocktwits chatter for alert-quality
+    purposes. Counting those wrappers as independent sources made a one-feed
+    forum thread look like a corroborated two-source catalyst.
+    """
+    s = (source or "").strip().lower()
+    if not s:
+        return ""
+    if "stocktwits" in s:
+        return "stocktwits"
+    if s.startswith("yahoofinance/") or s.startswith("yf/"):
+        return "yahoo"
+    if s.startswith("gn:"):
+        return "googlenews"
+    return s.split("/", 1)[0].split(":", 1)[0].strip()
+
+
+def _catalyst_source_credibility(source: str | None) -> float:
+    """Source credibility for catalyst alerts.
+
+    ``ml.features._source_credibility`` intentionally treats
+    ``yfinance/...`` / ``GN: ...`` as the aggregator's publisher grade for ML
+    features. For paging, a Stocktwits item republished through those wrappers
+    is still low-authority Stocktwits content, so override that family first.
+    """
+    if _source_family(source) == "stocktwits":
+        return 0.30
+    return _source_credibility(source or "")
 
 
 def _score_value(ai_score, ml_score) -> float | None:
@@ -180,19 +260,37 @@ def build_cycle_events(
         score_drop = (avg_prior - avg_recent) if avg_prior is not None else 0.0
         ai_context_count = sum(1 for r in recent if r["ai_context"])
         all_ai_context_count = sum(1 for r in items if r["ai_context"])
-        source_count = len({r["source"] for r in recent if r["source"]})
+        recent_source_families = {
+            _source_family(r["source"]) for r in recent
+            if _source_family(r["source"])
+        }
+        source_count = len(recent_source_families)
+        non_stocktwits_source_count = sum(
+            1 for f in recent_source_families if f != "stocktwits"
+        )
         max_source_cred = max(
-            (_source_credibility(r["source"]) for r in recent if r["source"]),
+            (_catalyst_source_credibility(r["source"]) for r in recent if r["source"]),
             default=0.0,
         )
-        all_source_count = len({r["source"] for r in items if r["source"]})
+        all_source_families = {
+            _source_family(r["source"]) for r in items
+            if _source_family(r["source"])
+        }
+        all_source_count = len(all_source_families)
+        non_stocktwits_all_source_count = sum(
+            1 for f in all_source_families if f != "stocktwits"
+        )
         max_any_source_cred = max(
-            (_source_credibility(r["source"]) for r in items if r["source"]),
+            (_catalyst_source_credibility(r["source"]) for r in items if r["source"]),
             default=0.0,
         )
         catalyst_strength = CATALYST_WEIGHT.get(catalyst, 0.0) * catalyst_conf
-        source_ok = source_count >= 2 or max_source_cred >= 0.6
-        any_source_ok = all_source_count >= 2 or max_any_source_cred >= 0.6
+        source_ok = non_stocktwits_source_count >= 2 or max_source_cred >= 0.6
+        any_source_ok = (
+            non_stocktwits_all_source_count >= 2 or max_any_source_cred >= 0.6
+        )
+        consensus_latest = _is_known_consensus_coverage(latest["title"])
+        noisy_trade_chatter = _is_low_quality_trade_chatter(latest["title"])
 
         fresh_score = (
             max_recent_score
@@ -204,18 +302,20 @@ def build_cycle_events(
 
         if (
             recent and latest_age_min <= RECENT_MINUTES
-            and fresh_score >= 9.0 and source_ok and catalyst != "UNKNOWN"
+            and fresh_score >= 9.0 and source_ok and catalyst in URGENT_CATALYSTS
+            and catalyst_conf >= 0.5 and not consensus_latest and not noisy_trade_chatter
         ):
             level = "urgent"
             kind = "fresh_ai_catalyst"
-            reason = "fresh high-score AI catalyst before the story gets stale"
+            reason = "fresh high-score catalyst"
         elif (
             recent and latest_age_min <= RECENT_MINUTES
-            and fresh_score >= 7.5 and source_ok and catalyst != "UNKNOWN"
+            and fresh_score >= 7.5 and source_ok and catalyst in URGENT_CATALYSTS
+            and catalyst_conf >= 0.5 and not consensus_latest and not noisy_trade_chatter
         ):
             level = "watch"
             kind = "fresh_ai_catalyst_watch"
-            reason = "fresh catalyst forming, but not strong enough for an urgent ping"
+            reason = "fresh catalyst forming"
         elif (
             len(items) >= 8 and not recent and latest_age_min >= 90
             and any_source_ok and all_ai_context_count >= 2
@@ -266,11 +366,19 @@ def _event_key(event: dict) -> str:
     return f"{event.get('kind')}:{event.get('ticker')}"
 
 
+def _shorten_text(value: str | None, limit: int = 170) -> str:
+    text = " ".join((value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
+
+
 def select_new_events(
     events: list[dict],
     throttle_state: dict | None,
     now_epoch: float | None = None,
     max_send: int = MAX_SEND_PER_RUN,
+    min_level: str = "urgent",
 ) -> tuple[list[dict], dict]:
     """Throttle event sends by ticker/kind."""
     now_epoch = time.time() if now_epoch is None else now_epoch
@@ -281,6 +389,8 @@ def select_new_events(
     }
     selected: list[dict] = []
     for event in events:
+        if min_level == "urgent" and event.get("level") != "urgent":
+            continue
         key = _event_key(event)
         throttle_s = URGENT_THROTTLE_S if event.get("level") == "urgent" else WATCH_THROTTLE_S
         last_raw = old.get(key)
@@ -299,21 +409,30 @@ def format_event(event: dict) -> str:
     if event.get("level") == "urgent":
         ping = f"<@{JONATHAN_DISCORD_USER_ID}> <@{SAO_DISCORD_USER_ID}> "
     label = "URGENT" if event.get("level") == "urgent" else "WATCH"
+    kind = event.get("kind") or ""
+    if event.get("level") == "urgent":
+        action = "BUY WATCH"
+    elif "profit_taking" in kind or "fatigue" in kind:
+        action = "SELL RISK"
+    else:
+        action = "HOLD"
     url = event.get("url") or ""
+    title = _shorten_text(event.get("title") or "(untitled)")
+    source = event.get("source") or "unknown"
+    score = event.get("fresh_score")
+    age = event.get("latest_age_min")
+    mentions = event.get("recent_mentions_30m")
+    sources = event.get("source_count_30m")
+    catalyst = event.get("catalyst")
+    catalyst_conf = event.get("catalyst_confidence", 0)
     lines = [
-        f"{ping}[CATALYST {label}] ${event['ticker']} — {event['kind']}",
-        f"Reason: {event['reason']}",
-        (
-            f"Signal: fresh_score={event['fresh_score']} "
-            f"age={event['latest_age_min']}m "
-            f"mentions30m={event['recent_mentions_30m']} "
-            f"src30m={event['source_count_30m']} "
-            f"catalyst={event['catalyst']} ({event['catalyst_confidence']:.0%})"
-        ),
-        f"Latest: {event.get('source') or 'unknown'} — {event.get('title') or '(untitled)'}",
+        f"{ping}**${event['ticker']} - {action}**  [{label}]",
+        f"Stats: score {score} | {age}m old | {mentions} mentions, {sources} sources | {catalyst} {catalyst_conf:.0%}",
+        f"Source: {source}",
+        f"Latest: \"{title}\"",
     ]
     if event.get("score_drop", 0) > 0:
-        lines.append(f"Cycle: recent score drop={event['score_drop']} vs prior window")
+        lines.append(f"Risk: signal quality dropped {event['score_drop']} vs prior window")
     if url:
         lines.append(f"<{url}>")
     return "\n".join(lines)[:1900]
@@ -359,7 +478,7 @@ def _write_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
-def run_once(dry_run: bool = False, min_level: str = "watch") -> dict:
+def run_once(dry_run: bool = False, min_level: str = "urgent") -> dict:
     db_path = _get_db_path()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=15)
     conn.execute("PRAGMA query_only=ON")
@@ -378,7 +497,7 @@ def run_once(dry_run: bool = False, min_level: str = "watch") -> dict:
     if min_level == "urgent":
         events = [e for e in events if e.get("level") == "urgent"]
     state = _load_state()
-    selected, new_state = select_new_events(events, state)
+    selected, new_state = select_new_events(events, state, min_level=min_level)
     report["selected_for_send"] = selected
     report["dry_run"] = dry_run
     report["scanned_rows"] = len(rows)
@@ -404,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--min-level",
         choices=("watch", "urgent"),
-        default=os.environ.get("CATALYST_MONITOR_MIN_LEVEL", "watch"),
+        default=os.environ.get("CATALYST_MONITOR_MIN_LEVEL", "urgent"),
         help="minimum level to send; report JSON still includes all events",
     )
     args = ap.parse_args(argv)

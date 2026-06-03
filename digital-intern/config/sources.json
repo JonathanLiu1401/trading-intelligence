@@ -349,6 +349,46 @@
    "url": "https://en.yna.co.kr/RSS/economy.xml"
   },
   {
+   "name": "The Elec",
+   "url": "https://www.thelec.net/rss/allArticle.xml"
+  },
+  {
+   "name": "GN: Korea semiconductors",
+   "url": "https://news.google.com/rss/search?q=South+Korea+semiconductor+Samsung+SK+Hynix+HBM+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: Samsung SK Hynix HBM",
+   "url": "https://news.google.com/rss/search?q=%22Samsung+Electronics%22+OR+%22005930.KS%22+OR+%22SK+Hynix%22+OR+%22000660.KS%22+HBM+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: Korean memory chips",
+   "url": "https://news.google.com/rss/search?q=DRAM+NAND+HBM+memory+Samsung+%22SK+Hynix%22+Korea+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: The Elec semis",
+   "url": "https://news.google.com/rss/search?q=site:thelec.net+Samsung+OR+%22SK+Hynix%22+OR+HBM+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: Business Korea semis",
+   "url": "https://news.google.com/rss/search?q=site:businesskorea.co.kr+Samsung+OR+%22SK+Hynix%22+OR+semiconductor+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: Korea JoongAng semis",
+   "url": "https://news.google.com/rss/search?q=site:koreajoongangdaily.joins.com+Samsung+OR+%22SK+Hynix%22+OR+semiconductor+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: Korea Herald semis",
+   "url": "https://news.google.com/rss/search?q=site:koreaherald.com+Samsung+OR+%22SK+Hynix%22+OR+semiconductor+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN: Yonhap Samsung SK Hynix",
+   "url": "https://news.google.com/rss/search?q=site:en.yna.co.kr+Samsung+OR+%22SK+Hynix%22+OR+semiconductor+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN KR: Samsung SK Hynix",
+   "url": "https://news.google.com/rss/search?q=%EC%82%BC%EC%84%B1%EC%A0%84%EC%9E%90+OR+SK%ED%95%98%EC%9D%B4%EB%8B%89%EC%8A%A4+OR+HBM+OR+%EB%B0%98%EB%8F%84%EC%B2%B4+when:3d&hl=ko&gl=KR&ceid=KR:ko"
+  },
+  {
    "name": "Japan Times Business",
    "url": "https://www.japantimes.co.jp/feed/topstories/"
   },
@@ -1231,6 +1271,102 @@
   {
    "name": "Carbon Brief",
    "url": "https://www.carbonbrief.org/feed"
+  },
+  {
+   "name": "GN Global Markets Breaking",
+   "url": "https://news.google.com/rss/search?q=global+markets+stocks+bonds+commodities+forex+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Reuters Global Markets",
+   "url": "https://news.google.com/rss/search?q=site:reuters.com+markets+OR+business+OR+finance+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN AP Business Global",
+   "url": "https://news.google.com/rss/search?q=site:apnews.com+business+markets+economy+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN FT Global Markets",
+   "url": "https://news.google.com/rss/search?q=site:ft.com+markets+OR+companies+OR+global-economy+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Nikkei Asia Business",
+   "url": "https://news.google.com/rss/search?q=site:asia.nikkei.com+Business+OR+Markets+OR+Technology+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Asia Semiconductors",
+   "url": "https://news.google.com/rss/search?q=semiconductor+TSMC+Samsung+SK+Hynix+Asia+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Taiwan Semiconductors",
+   "url": "https://news.google.com/rss/search?q=Taiwan+semiconductor+TSMC+UMC+MediaTek+ASE+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN China Tech Markets",
+   "url": "https://news.google.com/rss/search?q=China+technology+stocks+semiconductor+AI+export+controls+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Japan Tech Markets",
+   "url": "https://news.google.com/rss/search?q=Japan+technology+stocks+semiconductor+SoftBank+Tokyo+Electron+Advantest+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN India Markets",
+   "url": "https://news.google.com/rss/search?q=India+stock+market+Nifty+Sensex+RBI+earnings+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Europe Markets",
+   "url": "https://news.google.com/rss/search?q=Europe+stocks+ECB+earnings+Stoxx+DAX+FTSE+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Middle East Markets",
+   "url": "https://news.google.com/rss/search?q=Middle+East+markets+oil+Israel+Iran+Saudi+Gulf+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Emerging Markets",
+   "url": "https://news.google.com/rss/search?q=emerging+markets+stocks+currency+bonds+central+bank+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN FX Rates",
+   "url": "https://news.google.com/rss/search?q=yen+dollar+euro+yuan+currency+forex+carry+trade+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Credit Stress",
+   "url": "https://news.google.com/rss/search?q=credit+spreads+corporate+bonds+default+bankruptcy+debt+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN AI Capex",
+   "url": "https://news.google.com/rss/search?q=AI+capex+data+center+GPU+cloud+infrastructure+electricity+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Data Center Power",
+   "url": "https://news.google.com/rss/search?q=data+center+power+grid+utilities+cooling+AI+infrastructure+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Memory Pricing",
+   "url": "https://news.google.com/rss/search?q=DRAM+NAND+HBM+memory+pricing+Micron+Samsung+SK+Hynix+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Hyperscaler Cloud AI",
+   "url": "https://news.google.com/rss/search?q=Azure+AWS+Google+Cloud+Oracle+AI+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Analyst Semis",
+   "url": "https://news.google.com/rss/search?q=semiconductor+analyst+upgrade+downgrade+price+target+NVDA+AMD+MRVL+AVGO+MU+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Earnings Warnings",
+   "url": "https://news.google.com/rss/search?q=earnings+warning+guidance+cut+miss+beat+stocks+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Options Flow Market",
+   "url": "https://news.google.com/rss/search?q=options+flow+short+squeeze+gamma+squeeze+market+stocks+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Oil Geopolitics",
+   "url": "https://news.google.com/rss/search?q=oil+prices+geopolitical+risk+OPEC+Iran+shipping+Red+Sea+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Central Banks Global",
+   "url": "https://news.google.com/rss/search?q=central+bank+interest+rates+Fed+ECB+BOJ+when:3d&hl=en-US&gl=US&ceid=US:en"
   }
  ],
  "twitter_accounts": [

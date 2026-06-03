@@ -88,7 +88,7 @@ def _client(store, monkeypatch, *, sd_payload, sd_raises=False):
 
 def test_active_session_delta_injected_after_live_state(store, monkeypatch):
     client, captured = _client(store, monkeypatch, sd_payload=_ACTIVE_SD)
-    r = client.post("/api/chat", json={"message": "what changed?",
+    r = client.post("/api/chat", json={"message": "what did change?",
                                        "history": []})
     assert r.status_code == 200
     prompt = captured["prompt"]

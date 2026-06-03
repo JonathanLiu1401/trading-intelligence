@@ -22,7 +22,7 @@ SOURCES_PATH = BASE_DIR / "config" / "sources.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 BACKOFF_PATH = BASE_DIR / "data" / "rss_feed_backoff.json"
 
-MAX_WORKERS = 32  # parallel feed fetches
+MAX_WORKERS = 96  # high-throughput mode: parallel feed fetches
 FETCH_TIMEOUT = 8  # seconds; bounds dead/slow feeds so they don't starve workers
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

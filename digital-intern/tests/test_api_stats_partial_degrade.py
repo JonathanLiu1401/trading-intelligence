@@ -45,6 +45,8 @@ class _FakeStore:
 
 def _client(store, monkeypatch):
     monkeypatch.delenv("WEB_API_KEY", raising=False)
+    import dashboard.web_server as _ws
+    _ws._dashboard_cache.clear()
     return create_app(store=store).test_client()
 
 

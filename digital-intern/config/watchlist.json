@@ -12,5 +12,5 @@
   "japanese": ["6758.T", "9984.T", "6501.T", "6752.T"],
   "etfs": ["SMH", "SOXX", "PSI", "SPY", "QQQ", "IWM"],
   "portfolio": ["LITE", "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS"],
-  "keywords": ["DRAM", "NAND", "HBM", "memory", "semiconductor", "Micron", "SK Hynix", "Samsung", "Kioxia", "Western Digital", "LPDDR", "Fed", "inflation", "CPI", "earnings", "recession", "GDP", "interest rate", "tariff", "China", "export controls", "AI chips"]
+  "keywords": ["DRAM", "NAND", "HBM", "HBM3E", "HBM4", "memory", "semiconductor", "foundry", "KOSPI", "Micron", "SK Hynix", "SK hynix", "000660.KS", "Samsung", "Samsung Electronics", "005930.KS", "Kioxia", "Western Digital", "LPDDR", "Fed", "inflation", "CPI", "earnings", "recession", "GDP", "interest rate", "tariff", "China", "export controls", "AI chips"]
 }

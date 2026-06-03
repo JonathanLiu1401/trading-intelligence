@@ -10618,6 +10618,148 @@ _DASHBOARD_HTML = """<!doctype html>
       #dichat-panel { width: calc(100vw - 24px) !important; right: 12px !important;
         height: 70vh !important; bottom: 80px !important; }
     }
+
+    /* clean-ui-global-v2: readable operator dashboard baseline */
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --bg-panel: #171a21;
+      --bg-elevated: #20242d;
+      --bg-hover: #252a34;
+      --bg-input: #11141a;
+      --border: #303642;
+      --border-strong: #434b59;
+      --border-bright: #4b5563;
+      --text: #eef2f7;
+      --text-secondary: #c5ccd6;
+      --text-muted: #9aa3b2;
+      --muted: var(--text-secondary);
+      --amber: #facc15;
+      --amber-dim: rgba(250,204,21,0.12);
+      --cyan: #38bdf8;
+      --cyan-dim: rgba(56,189,248,0.14);
+      --green: #4ade80;
+      --green-dim: rgba(74,222,128,0.14);
+      --red: #fb7185;
+      --red-dim: rgba(251,113,133,0.14);
+      --blue: #60a5fa;
+      --blue-dim: rgba(96,165,250,0.14);
+      --yellow: #facc15;
+      --yellow-dim: rgba(250,204,21,0.12);
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --font-display: var(--font-sans);
+      --radius: 8px;
+      --radius-sm: 6px;
+    }
+    html, body {
+      background: var(--bg) !important;
+      color: var(--text) !important;
+      font-family: var(--font-sans) !important;
+      font-size: 16px !important;
+      line-height: 1.45 !important;
+      letter-spacing: 0 !important;
+    }
+    .brand, h1, h2, h3, .topbar, .topbar a,
+    .nav-drawer-header, .nav-drawer a,
+    .card-header, .stat .label, .stat .value,
+    th, td, .badge, .btn, button, label, select, input {
+      font-family: var(--font-sans) !important;
+      letter-spacing: 0 !important;
+      text-transform: none !important;
+      text-shadow: none !important;
+    }
+    .topbar {
+      height: 52px !important;
+      background: #141820 !important;
+      border-bottom: 1px solid var(--border) !important;
+      padding: 0 24px !important;
+    }
+    .brand {
+      color: var(--text) !important;
+      font-size: 17px !important;
+      font-weight: 750 !important;
+      margin-right: 22px !important;
+    }
+    .topbar a {
+      color: var(--text-secondary) !important;
+      font-size: 14px !important;
+      padding: 15px 12px 14px !important;
+      border-radius: 0 !important;
+      border-bottom: 3px solid transparent !important;
+    }
+    .topbar a:hover {
+      color: #fff !important;
+      background: var(--bg-hover) !important;
+    }
+    .topbar a.active {
+      color: #fff !important;
+      background: rgba(56,189,248,0.08) !important;
+      border-bottom-color: var(--cyan) !important;
+    }
+    .page-content {
+      padding: 24px !important;
+      max-width: 1500px !important;
+      margin: 0 auto !important;
+    }
+    .card {
+      background: var(--bg-panel) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--radius) !important;
+      box-shadow: none !important;
+    }
+    .card-header {
+      background: var(--bg-elevated) !important;
+      color: var(--text) !important;
+      border-bottom: 1px solid var(--border) !important;
+      font-size: 17px !important;
+      font-weight: 700 !important;
+    }
+    .card-body, .list-group-item {
+      background: var(--bg-panel) !important;
+      color: var(--text) !important;
+    }
+    table, .table {
+      color: var(--text) !important;
+      font-size: 14px !important;
+    }
+    th {
+      color: var(--text-muted) !important;
+      font-size: 13px !important;
+      font-weight: 650 !important;
+    }
+    td {
+      color: var(--text) !important;
+      font-size: 14px !important;
+      padding: 9px 10px !important;
+    }
+    .small-muted, .text-muted, .muted {
+      color: var(--text-muted) !important;
+    }
+    .ticker, .pl-pos, .pl-neg, td.num {
+      font-family: var(--font-mono) !important;
+      font-variant-numeric: tabular-nums;
+    }
+    .btn, button, .badge {
+      border-radius: var(--radius-sm) !important;
+      font-size: 13px !important;
+    }
+    .btn, button {
+      background: var(--bg-elevated) !important;
+      color: var(--text-secondary) !important;
+      border: 1px solid var(--border-strong) !important;
+    }
+    .btn:hover, button:hover {
+      color: #fff !important;
+      background: rgba(56,189,248,0.12) !important;
+      border-color: var(--cyan) !important;
+    }
+    @media (max-width: 480px) {
+      body { font-size: 15px !important; }
+      .page-content { padding: 16px !important; }
+      .card { padding: 0 !important; }
+      .topbar { padding: 0 12px !important; }
+    }
   </style>
 </head>
 <body>
@@ -11492,6 +11634,118 @@ _CHAT_HTML = """<!doctype html>
     .md-body table { border-collapse: collapse; margin: 0.4em 0; width: 100%; }
     .md-body th, .md-body td { border: 1px solid var(--border-strong); padding: 4px 8px; text-align: left; }
     .md-body th { background: var(--bg-panel); }
+    /* clean-ui-global-v2: readable operator dashboard baseline */
+    :root {
+      --bg: #101214;
+      --bg-panel: #171a1d;
+      --bg-elevated: #1e2227;
+      --bg-hover: #252a30;
+      --bg-input: #121518;
+      --border: rgba(226,232,240,0.16);
+      --border-strong: rgba(226,232,240,0.28);
+      --text: #f1f5f9;
+      --text-secondary: #cbd5e1;
+      --text-muted: #94a3b8;
+      --amber: #f6c453;
+      --amber-dim: rgba(246,196,83,0.16);
+      --cyan: #7dd3fc;
+      --cyan-dim: rgba(125,211,252,0.14);
+      --green: #86efac;
+      --green-dim: rgba(134,239,172,0.14);
+      --red: #fca5a5;
+      --red-dim: rgba(252,165,165,0.14);
+      --blue: #93c5fd;
+      --blue-dim: rgba(147,197,253,0.14);
+    }
+    html, body {
+      background: var(--bg) !important;
+      color: var(--text) !important;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+      font-size: 16px !important;
+      line-height: 1.55 !important;
+      letter-spacing: 0 !important;
+    }
+    body *, body *::before, body *::after {
+      letter-spacing: 0 !important;
+      text-shadow: none !important;
+      box-shadow: none !important;
+    }
+    .brand, h1, h2, h3 {
+      font-family: inherit !important;
+      letter-spacing: 0 !important;
+      text-transform: none !important;
+    }
+    .topbar {
+      height: auto !important;
+      min-height: 56px !important;
+      background: #15181b !important;
+      border-bottom-color: var(--border) !important;
+    }
+    .topbar a,
+    .nav-drawer a,
+    .bottom-tab {
+      font-size: 15px !important;
+      color: var(--text-secondary) !important;
+      border-radius: 6px !important;
+    }
+    .topbar a.active,
+    .topbar a:hover,
+    .nav-drawer a.active,
+    .nav-drawer a:hover,
+    .bottom-tab.active {
+      color: var(--text) !important;
+      background: var(--bg-hover) !important;
+    }
+    header.page h1 {
+      font-size: 24px !important;
+      font-weight: 650 !important;
+    }
+    header.page .sub,
+    .typing,
+    .chip {
+      color: var(--text-secondary) !important;
+      font-size: 14px !important;
+    }
+    .chat-wrap {
+      gap: 16px !important;
+      padding: 22px 24px !important;
+    }
+    .msg {
+      max-width: min(880px, 92vw) !important;
+      font-size: 16px !important;
+      line-height: 1.58 !important;
+      padding: 14px 16px !important;
+      border-radius: 8px !important;
+    }
+    .msg.assistant {
+      background: var(--bg-panel) !important;
+      border-color: var(--border) !important;
+      color: var(--text) !important;
+    }
+    .msg.user {
+      background: rgba(147,197,253,0.12) !important;
+      border-color: rgba(147,197,253,0.32) !important;
+      color: var(--text) !important;
+    }
+    .suggestion,
+    input.msg-input,
+    button.send {
+      font-family: inherit !important;
+      font-size: 15px !important;
+      border-radius: 6px !important;
+    }
+    input.msg-input {
+      color: var(--text) !important;
+      background: var(--bg-input) !important;
+      border-color: var(--border-strong) !important;
+      min-height: 44px !important;
+    }
+    button.send,
+    .suggestion {
+      color: var(--text) !important;
+      background: var(--bg-elevated) !important;
+      border-color: var(--border-strong) !important;
+    }
     /* === Mobile-first responsive additions ============================== */
     .nav-hamburger {
       display: none; flex-direction: column; justify-content: space-between;
