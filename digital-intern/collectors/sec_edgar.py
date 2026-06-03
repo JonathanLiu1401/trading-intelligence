@@ -38,6 +38,10 @@ EDGAR_USER_AGENT = os.environ.get(
     "Digital-Intern-Daemon contact@digital-intern.local",
 )
 
+HTTP_TIMEOUT = 15
+HTTP_RETRIES = 3
+HTTP_BACKOFF_BASE = 1.0
+
 # 8-K item keywords that are market-moving regardless of portfolio membership.
 # Matched case-insensitively against the filing summary.
 _HIGH_PRIORITY_ITEMS = [
@@ -60,6 +64,68 @@ def _is_high_priority(summary: str) -> str | None:
         if item.lower() in summary.lower():
             return item
     return None
+
+
+def _retry_after_seconds(raw: str | None) -> float | None:
+    """Parse Retry-After seconds. Date-form headers fall back to normal backoff."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _request_with_retries(url: str, *, params: dict | None = None) -> requests.Response | None:
+    """GET with bounded retry/backoff for SEC 429/5xx/transient failures."""
+    headers = {"User-Agent": EDGAR_USER_AGENT}
+    if url == EFTS_URL:
+        headers["Accept"] = "application/json"
+
+    for attempt in range(HTTP_RETRIES):
+        try:
+            resp = requests.get(
+                url, params=params, headers=headers, timeout=HTTP_TIMEOUT
+            )
+        except requests.RequestException as exc:
+            if attempt == HTTP_RETRIES - 1:
+                print(f"[sec_edgar] request failed after retries: {exc}")
+                return None
+            time.sleep(HTTP_BACKOFF_BASE * (2 ** attempt))
+            continue
+
+        if resp.status_code == 429:
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+            delay = min(retry_after or HTTP_BACKOFF_BASE * (2 ** attempt), 30.0)
+            if attempt == HTTP_RETRIES - 1:
+                print("[sec_edgar] rate-limited after retries (HTTP 429)")
+                return None
+            print(f"[sec_edgar] rate-limited (HTTP 429), retrying in {delay:.1f}s")
+            time.sleep(delay)
+            continue
+
+        if 500 <= resp.status_code < 600:
+            if attempt == HTTP_RETRIES - 1:
+                print(f"[sec_edgar] SEC returned HTTP {resp.status_code} after retries")
+                return None
+            time.sleep(HTTP_BACKOFF_BASE * (2 ** attempt))
+            continue
+
+        if resp.status_code != 200:
+            print(f"[sec_edgar] SEC returned HTTP {resp.status_code}")
+            return None
+        return resp
+
+    return None
+
+
+def _fetch_current_8k_feed():
+    """Fetch and parse the current 8-K Atom feed with HTTP retry visibility."""
+    resp = _request_with_retries(EDGAR_URL)
+    if resp is None:
+        return feedparser.parse(b"")
+    return feedparser.parse(resp.content)
 
 
 def _load_relevant_tickers() -> set[str]:
@@ -131,7 +197,7 @@ def collect_sec_edgar() -> list:
     """
     tickers = _load_relevant_tickers()
 
-    parsed = feedparser.parse(EDGAR_URL, agent=EDGAR_USER_AGENT)
+    parsed = _fetch_current_8k_feed()
     if getattr(parsed, "bozo", 0) and not parsed.entries:
         return []
 
@@ -207,10 +273,9 @@ def _efts_search(ticker: str, since: str, until: str) -> list:
         "enddt": until,
         "forms": EFTS_FORMS,
     }
-    headers = {"User-Agent": EDGAR_USER_AGENT, "Accept": "application/json"}
     try:
-        r = requests.get(EFTS_URL, params=params, headers=headers, timeout=15)
-        if r.status_code != 200:
+        r = _request_with_retries(EFTS_URL, params=params)
+        if r is None:
             return []
         hits = r.json().get("hits", {}).get("hits", [])
     except Exception:
