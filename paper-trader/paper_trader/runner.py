@@ -783,13 +783,36 @@ def _start_dashboard():
         print(f"[runner] dashboard disabled: {e}")
 
 
+def _stale_llm_patterns() -> list[str]:
+    """Full-cmdline patterns for direct child LLM subprocesses."""
+    from . import strategy
+
+    models = [
+        strategy.MODEL,
+        strategy.FALLBACK_MODEL,
+        getattr(strategy, "CODEX_AUTH_FALLBACK_MODEL", None),
+    ]
+    patterns: list[str] = []
+    for model in models:
+        if not model:
+            continue
+        pattern = (
+            f"codex exec --model {model}"
+            if str(model).startswith("gpt-")
+            else f"claude --model {model}"
+        )
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
 def _kill_stale_claude():
-    """Kill the runner's *own* lingering claude subprocess. strategy._claude_call()
-    launches `claude --model <model> --print ...` as a direct child of this
-    process; a wedged child that survives its Python-side timeout keeps holding
-    resources and can re-starve the next cycle. Match the live (Opus) model
-    first, then the Sonnet fallback model so a wedged fallback zombie is also
-    reaped.
+    """Kill the runner's *own* lingering LLM subprocess. strategy._claude_call()
+    launches either `codex exec --model <model> ...` for GPT/Codex models or
+    `claude --model <model> --print ...` for Claude models as a direct child of
+    this process; a wedged child that survives its Python-side timeout keeps
+    holding resources and can re-starve the next cycle. Match the configured
+    primary and fallback models so a wedged fallback zombie is also reaped.
 
     Both patterns are anchored on `claude --model <family>` because the CLI
     is always invoked as `claude --model <model> --print …` — the `--model`
@@ -812,7 +835,7 @@ def _kill_stale_claude():
     restricts the sweep to exactly the processes this breaker is meant to
     reap and nothing else."""
     own_pid = os.getpid()
-    for pattern in ("claude --model claude-opus", "claude --model claude-sonnet"):
+    for pattern in _stale_llm_patterns():
         try:
             killed = subprocess.run(
                 ["pkill", "-P", str(own_pid), "-f", pattern],
