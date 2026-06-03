@@ -26,7 +26,9 @@ def _make_store(tmp_path):
 
 
 def _insert_run(store, run_id, vs_spy_pct, total_return_pct=None,
-                equity_curve_json=None, status="complete"):
+                equity_curve_json=None, status="complete",
+                start_date="2025-01-01", end_date="2026-01-01",
+                spy_return_pct=0.0):
     """Insert one backtest_runs row. total_return_pct defaults to vs_spy;
     equity_curve_json is NOT NULL in the schema so a missing curve is the
     empty-JSON-array string (what `_load_runs` parses to an empty curve)."""
@@ -39,9 +41,10 @@ def _insert_run(store, run_id, vs_spy_pct, total_return_pct=None,
         "start_value, final_value, total_return_pct, spy_return_pct, "
         "vs_spy_pct, n_trades, n_decisions, status, started_at, "
         "equity_curve_json, model_id) VALUES "
-        "(?,1,'2025-01-01','2026-01-01',1000,1000,?,0.0,?,10,100,?,"
+        "(?,1,?,?,1000,1000,?,?,?,10,100,?,"
         "'2026-01-01T00:00:00Z',?,'ml_quant')",
-        (run_id, total_return_pct, vs_spy_pct, status, equity_curve_json),
+        (run_id, start_date, end_date, total_return_pct, spy_return_pct,
+         vs_spy_pct, status, equity_curve_json),
     )
     store.conn.commit()
 
@@ -134,15 +137,53 @@ def test_endpoint_grades_edge_drag_flat(tmp_path):
 
 
 def test_endpoint_leaderboard_sorted_by_median_vs_spy_desc(tmp_path):
-    """The route preserves the builder's median-vs-SPY descending order."""
+    """The route preserves the builder's yearly median-vs-SPY order."""
     store = _make_store(tmp_path)
     _seed_edge_drag_flat(store)
     data = json.loads(_client(tmp_path).get("/api/persona-leaderboard").data)
-    medians = [p["median_vs_spy"] for p in data["leaderboard"]]
+    medians = [p["median_vs_spy_annualized"] for p in data["leaderboard"]]
     assert medians == sorted(medians, reverse=True)
     # The EDGE persona tops it; the DRAG persona is last.
     assert data["leaderboard"][0]["persona"] == "Value Investor"
     assert data["leaderboard"][-1]["persona"] == "Momentum Trader"
+
+
+def test_endpoint_sorts_by_yearly_alpha_not_raw_lifetime_pct(tmp_path):
+    """A giant multi-year raw backtest must not outrank a better yearly edge.
+
+    This pins the bug where the persona page showed things like +1500% and
+    "beating S&P by 1400%" as if those lifetime numbers were comparable to
+    one-year runs.
+    """
+    store = _make_store(tmp_path)
+    for rid in range(1, 51):
+        persona_idx = ((rid - 1) % 10) + 1
+        if persona_idx == 1:
+            # Huge raw lifetime alpha over 20 years: impressive absolute
+            # number, but only about +15.9pp/year vs a flat SPY.
+            _insert_run(
+                store, rid, vs_spy_pct=1500.0, total_return_pct=1500.0,
+                start_date="2005-01-01", end_date="2025-01-01",
+                spy_return_pct=0.0,
+            )
+        elif persona_idx == 2:
+            # Smaller raw alpha, but over one year it is the better persona.
+            _insert_run(
+                store, rid, vs_spy_pct=80.0, total_return_pct=80.0,
+                start_date="2025-01-01", end_date="2026-01-01",
+                spy_return_pct=0.0,
+            )
+        else:
+            _insert_run(store, rid, vs_spy_pct=5.0)
+
+    data = json.loads(_client(tmp_path).get("/api/persona-leaderboard").data)
+    assert data["sort_metric"] == "median_vs_spy_annualized"
+    top = data["leaderboard"][0]
+    raw_giant = next(p for p in data["leaderboard"]
+                     if p["persona"] == "Value Investor")
+    assert top["persona"] == "Momentum Trader"
+    assert raw_giant["median_vs_spy"] == pytest.approx(1500.0)
+    assert raw_giant["median_vs_spy_annualized"] < top["median_vs_spy_annualized"]
 
 
 def test_endpoint_maps_run_id_to_persona_via_persona_for(tmp_path):

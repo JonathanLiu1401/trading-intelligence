@@ -2845,8 +2845,9 @@ TEMPLATE = r"""
           Each backtest run is one of 10 trading styles (Value, Momentum, Contrarian,
           Global Macro, GARP, Quant, Sector Rotator, Small/Mid Cap, ESG, Pure Speculator).
           This aggregates the backtest history by <em>style</em> — which approach actually
-          carries repeatable alpha. Ranked by median vs-SPY (the honest central read on a
-          leveraged window); per-persona verdict EDGE / FLAT / DRAG / INSUFFICIENT.
+          carries repeatable alpha. Ranked by median yearly vs-SPY so long backtests
+          cannot dominate the page with huge lifetime totals; per-persona verdict
+          EDGE / FLAT / DRAG / INSUFFICIENT.
         </div>
         <div id="persona-rankings-headline" style="font-size:13px;margin-bottom:12px;font-weight:600;"></div>
         <div id="persona-rankings-loading" style="padding:14px 4px;color:var(--text-muted);font-size:13px;">Loading personas…</div>
@@ -3022,9 +3023,10 @@ async function loadPersonaRankings() {
       {h: "Rank",          fn: (p, i) => (medals[i] || (i + 1) + "."),  colored: false},
       {h: "Persona",       fn: (p) => p.persona,                        colored: false},
       {h: "Runs",          fn: (p) => p.n,                              colored: false},
+      {h: "Median vs SPY / yr", fn: (p) => ppFmt(p.median_vs_spy_annualized), colored: true, raw: (p) => p.median_vs_spy_annualized},
       {h: "Median vs SPY", fn: (p) => ppFmt(p.median_vs_spy),           colored: true, raw: (p) => p.median_vs_spy},
-      {h: "Mean vs SPY",   fn: (p) => ppFmt(p.mean_vs_spy),             colored: true, raw: (p) => p.mean_vs_spy},
       {h: "Win Rate",      fn: (p) => (p.win_rate == null ? "—" : Math.round(p.win_rate * 100) + "%"), colored: false},
+      {h: "Median Return / yr", fn: (p) => (p.median_return_annualized == null ? "—" : ppFmt(p.median_return_annualized).replace("pp", "%")), colored: true, raw: (p) => p.median_return_annualized},
       {h: "Median Return", fn: (p) => (p.median_return == null ? "—" : ppFmt(p.median_return).replace("pp", "%")), colored: true, raw: (p) => p.median_return},
       {h: "Sharpe",        fn: (p) => numFmt(p.median_sharpe),          colored: true, raw: (p) => p.median_sharpe},
       {h: "Max DD",        fn: (p) => (p.median_max_drawdown_pct == null ? "—" : numFmt(p.median_max_drawdown_pct, 1) + "%"), colored: false},
