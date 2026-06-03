@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import feedparser
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PORTFOLIO_PATH = BASE_DIR / "config" / "portfolio.json"
@@ -21,6 +22,10 @@ DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 
 BATCH_PER_PASS = 10
 PER_TICKER_COOLDOWN_SEC = 240
+REQUEST_TIMEOUT = 8
+MAX_FETCH_ATTEMPTS = 3
+RETRY_BACKOFF_SEC = 1.0
+RETRY_BACKOFF_CAP_SEC = 8.0
 USER_AGENT = "Mozilla/5.0 (Digital Intern Daemon)"
 
 
@@ -101,16 +106,18 @@ def _article_id(link: str, title: str) -> str:
     return hashlib.sha256(f"{link}||{title}".encode("utf-8")).hexdigest()
 
 
-def _fetch_ticker(ticker: str) -> list:
-    url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
+def _retry_after_seconds(resp, fallback: float) -> float:
+    raw = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
     try:
-        parsed = feedparser.parse(url, agent=USER_AGENT)
-    except Exception as e:
-        print(f"[yahoo_ticker_rss] {ticker} error: {e}")
-        return []
-    if getattr(parsed, "bozo", 0) and not parsed.entries:
-        return []
+        seconds = float(raw) if raw is not None else fallback
+    except (TypeError, ValueError):
+        seconds = fallback
+    if seconds <= 0:
+        seconds = fallback
+    return min(seconds, RETRY_BACKOFF_CAP_SEC)
 
+
+def _parse_entries(ticker: str, parsed) -> list:
     out: list = []
     for entry in parsed.entries:
         title = (entry.get("title") or "").strip()
@@ -128,6 +135,44 @@ def _fetch_ticker(ticker: str) -> list:
             "_ticker": ticker,
         })
     return out
+
+
+def _fetch_ticker(ticker: str) -> list:
+    url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
+    backoff = RETRY_BACKOFF_SEC
+    last_error = "unknown"
+    headers = {"User-Agent": USER_AGENT}
+
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        retry_delay = backoff
+        try:
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                retry_delay = _retry_after_seconds(resp, backoff)
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            parsed = feedparser.parse(resp.content)
+            if getattr(parsed, "bozo", 0) and not parsed.entries:
+                bozo_exc = getattr(parsed, "bozo_exception", None)
+                detail = f": {bozo_exc}" if bozo_exc else ""
+                raise RuntimeError(f"feedparser bozo parse with no entries{detail}")
+            return _parse_entries(ticker, parsed)
+        except Exception as e:
+            last_error = str(e)
+            if attempt >= MAX_FETCH_ATTEMPTS:
+                break
+            print(
+                f"[yahoo_ticker_rss] {ticker} attempt {attempt}/"
+                f"{MAX_FETCH_ATTEMPTS} failed ({last_error}); "
+                f"retrying in {retry_delay:g}s"
+            )
+            time.sleep(retry_delay)
+            backoff = min(backoff * 2, RETRY_BACKOFF_CAP_SEC)
+
+    print(
+        f"[yahoo_ticker_rss] {ticker} failed after "
+        f"{MAX_FETCH_ATTEMPTS} attempts: {last_error}"
+    )
+    return []
 
 
 def collect_yahoo_ticker_rss(batch: int = BATCH_PER_PASS) -> list:
@@ -161,7 +206,8 @@ def collect_yahoo_ticker_rss(batch: int = BATCH_PER_PASS) -> list:
                 try:
                     raw.append(fut.result())
                 except Exception as e:
-                    print(f"[yahoo_ticker_rss] worker error: {e}")
+                    ticker = futures.get(fut, "?")
+                    print(f"[yahoo_ticker_rss] {ticker} worker error: {e}")
 
     conn = _ensure_db()
     new_articles: list = []
