@@ -239,9 +239,9 @@ FUTURES = ["ES=F", "NQ=F", "CL=F", "GC=F"]
 # Stocks: 2% SL / 3% TP. Leveraged ETFs: 4% SL / 6% TP (wider because
 # leveraged ETF intraday volatility is 2-3x the underlying — a 2% stop on
 # SOXL is the equivalent of ~0.7% on SOXX and would scalp out on noise).
-# Exit is documented in SYSTEM_PROMPT ("HARD EXITS" section) so Opus is
-# aware of the autonomy carve-out (invariant #12: change the prompt when
-# adding silent caps).
+# Stop-loss is documented in SYSTEM_PROMPT ("HARD EXITS" section) so Opus is
+# aware of the autonomy carve-out. Take-profit remains a per-position context
+# target, but it is not mechanically enforced.
 _LEVERAGED_ETFS_SL = frozenset({
     "TQQQ", "SOXL", "UPRO", "SPXL", "UDOW", "URTY", "TECL", "FNGU",
     "LABU", "NAIL", "CURE", "DFEN", "HIBL", "MIDU", "TNA", "WANT",
@@ -282,15 +282,11 @@ Small, safe trades will not outperform. Take calculated risks.
 High conviction = large size. Low conviction = stay cash.
 
 HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New stock positions you open
-are automatically sold when:
-- Price falls 2% below entry price (4% for leveraged ETFs) → stop-loss
-- Price rises 3% above entry price (6% for leveraged ETFs) → take-profit
-These exits execute BEFORE you receive the prompt each cycle (i.e. the snapshot
-you see already reflects them). If a position has disappeared from your
-portfolio since last cycle, it was hard-exited at SL or TP. Set entries with
-awareness that these limits enforce themselves — the resulting 1.5:1 risk-to-
-reward is the only mechanical exit discipline on the book; everything else
-remains your call.
+are automatically sold only when price falls 2% below entry price (4% for
+leveraged ETFs) → stop-loss. The old 3% / 6% take-profit level is now advisory
+context only: when a position reaches that level, decide dynamically from the
+stock's thesis, momentum, news, and prior trade history whether to hold, trim,
+or sell. Do not dump winners just because a static take-profit marker was hit.
 
 Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 
@@ -1478,13 +1474,13 @@ Return JSON only."""
 
 
 def _check_and_execute_hard_exits(store: "Store", snap: dict) -> list[str]:
-    """Execute mandatory SL/TP exits BEFORE Opus sees the prompt this cycle.
+    """Execute mandatory stop-loss exits BEFORE Opus sees the prompt this cycle.
 
     Surveys ``store.positions_needing_hard_exit()`` (open stock lots whose
-    last-marked current_price has breached the per-lot stop_loss_price /
-    take_profit_price set when the lot was opened). For each breached lot:
-    records a SELL at the current marked price, decrements the position via
-    ``upsert_position`` (negative qty closes the lot), and credits cash.
+    last-marked current_price has breached the per-lot stop_loss_price set when
+    the lot was opened). For each breached lot: records a SELL at the current
+    marked price, decrements the position via ``upsert_position`` (negative qty
+    closes the lot), and credits cash.
     Updates ``snap['cash']`` in place so any caller that already has the
     pre-exit snapshot in hand sees the post-exit cash for sizing logic; the
     caller still re-snapshots when ``hard_exits`` is non-empty so positions
@@ -1504,17 +1500,14 @@ def _check_and_execute_hard_exits(store: "Store", snap: dict) -> list[str]:
                 qty = float(pos["qty"])
                 price = float(pos["current_price"])
                 sl = float(pos["stop_loss_price"])
-                tp = float(pos["take_profit_price"])
             except (TypeError, ValueError) as e:
                 print(f"[strategy] hard-exit: non-numeric row for {ticker}: {e}")
                 continue
             if qty <= 0 or price <= 0:
                 continue
-            is_sl = price <= sl
-            exit_type = "HARD_SL" if is_sl else "HARD_TP"
-            threshold = sl if is_sl else tp
-            reason = (f"{exit_type}: price {price:.2f} "
-                      f"{'<=' if is_sl else '>='} threshold {threshold:.2f}")
+            if price > sl:
+                continue
+            reason = f"HARD_SL: price {price:.2f} <= threshold {sl:.2f}"
             cash = float(snap.get("cash", 0) or 0.0)
             total_value = float(snap.get("total_value", 0) or 0.0)
             notional = price * qty
@@ -1975,13 +1968,12 @@ def _ml_drought_decision(
     watch_px: dict,
     drought_reason: str,
 ) -> dict | None:
-    """Convert the qualified ML advisor output into an emergency decision.
+    """Convert the qualified ML advisor output into a safe drought fallback.
 
-    This is used only after the LLM path fails. It keeps the trader from
-    logging another inert NO_DECISION during a known LLM drought, while staying
-    conservative: HOLD stays HOLD, BUY sizing is capped by the ML-reported
-    conviction and available stock buying power, and malformed/no-price output
-    degrades to HOLD instead of guessing.
+    This is used only after the LLM path fails. It records the ML advisor's
+    view without allowing a new BUY to be placed while the model layer is down.
+    Risk-reducing non-BUY opinions still degrade to HOLD here because the
+    normal LLM/autonomy layer did not validate the action.
     """
     if not isinstance(ml_op, dict):
         return None
@@ -2000,56 +1992,14 @@ def _ml_drought_decision(
             "confidence": 0.50,
             "reasoning": reason,
         }
-    if not ticker:
-        return {
-            "action": "HOLD",
-            "ticker": "",
-            "confidence": 0.45,
-            "reasoning": reason + " (no ticker from ML advisor)",
-        }
-
-    try:
-        px = float(watch_px.get(ticker) or market.get_price(ticker) or 0.0)
-    except (TypeError, ValueError):
-        px = 0.0
-    if px <= 0:
-        return {
-            "action": "HOLD",
-            "ticker": "",
-            "confidence": 0.45,
-            "reasoning": reason + f" (no live price for {ticker})",
-        }
-
-    conviction = 0.10
-    m = re.search(r"conviction=([0-9]+)%", base_reason)
-    if m:
-        try:
-            conviction = max(0.05, min(0.40, float(m.group(1)) / 100.0))
-        except (TypeError, ValueError):
-            conviction = 0.10
-    buying_power = max(0.0, _stock_buying_power(snap))
-    total = max(0.0, float(snap.get("total_value") or 0.0))
-    # Emergency fallback should act, not overrun the book. Cap by both ML
-    # conviction and a hard 35% of book; still bounded by buying power.
-    notional = min(buying_power, total * min(conviction, 0.35))
-    qty = int(notional // px)
-    if qty <= 0 and buying_power >= px:
-        qty = 1
-    if qty <= 0:
-        return {
-            "action": "HOLD",
-            "ticker": "",
-            "confidence": 0.45,
-            "reasoning": (
-                reason + f" (insufficient buying power for 1 share of {ticker})"
-            ),
-        }
     return {
-        "action": "BUY",
-        "ticker": ticker,
-        "qty": float(qty),
-        "confidence": round(max(0.50, min(0.80, 0.40 + conviction)), 2),
-        "reasoning": f"{reason}; emergency_qty={qty} px={px:.2f}",
+        "action": "HOLD",
+        "ticker": "",
+        "confidence": 0.45,
+        "reasoning": (
+            reason
+            + f" (ML wanted BUY {ticker or '?'} but LLM is unavailable; no emergency buy)"
+        ),
     }
 
 
@@ -2070,9 +2020,8 @@ def decide() -> dict:
     market_open = market.is_market_open()
 
     snap = _portfolio_snapshot(store)
-    # Hard stop-loss / take-profit guard — executes BEFORE Opus sees the
-    # prompt. Defined in SYSTEM_PROMPT ("HARD EXITS" section) so Opus knows
-    # the autonomy carve-out (invariant #12 — when adding silent caps, the
+    # Hard stop-loss guard — executes BEFORE Opus sees the prompt. Defined in
+    # SYSTEM_PROMPT ("HARD EXITS" section) so Opus knows the autonomy carve-out.
     # prompt must teach them). Re-snapshot when something fired so cash +
     # positions + total_value all reflect the post-exit book.
     auto_exits: list[str] = _check_and_execute_hard_exits(store, snap)

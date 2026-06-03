@@ -352,18 +352,18 @@ class Store:
             self.conn.commit()
 
     def positions_needing_hard_exit(self) -> list[dict]:
-        """Open stock positions whose current_price breaches SL or TP.
+        """Open stock positions whose current_price breaches stop-loss.
 
         Read-only; pure SQL on the positions table. Skips options (only stock
-        type is hard-exited), zero-qty lots, lots without SL/TP set, and lots
-        with no fresh mark (current_price > 0 is the snapshot freshness
-        proxy). Caller is responsible for executing the SELL."""
+        type is hard-exited), zero-qty lots, lots without SL set, and lots with
+        no fresh mark (current_price > 0 is the snapshot freshness proxy).
+        Take-profit levels are advisory context now, not forced exits."""
         with self._lock:
             cur = self.conn.execute(
                 "SELECT * FROM positions WHERE closed_at IS NULL AND type='stock' "
                 "AND qty > 0 AND stop_loss_price IS NOT NULL "
-                "AND take_profit_price IS NOT NULL AND current_price > 0 "
-                "AND (current_price <= stop_loss_price OR current_price >= take_profit_price)"
+                "AND current_price > 0 "
+                "AND current_price <= stop_loss_price"
             )
             rows = cur.fetchall()
         return [dict(r) for r in rows]

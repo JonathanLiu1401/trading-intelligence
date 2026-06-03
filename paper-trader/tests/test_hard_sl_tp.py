@@ -1,10 +1,10 @@
-"""Tests for the hard stop-loss / take-profit auto-exit feature
+"""Tests for the hard stop-loss auto-exit feature
 (commit 3176d2f, 2026-05-24).
 
 This feature carries a load-bearing live-trading invariant: every BUY
-auto-stamps SL/TP, and every cycle BEFORE Opus sees the prompt the
-runner executes mandatory exits against any lot whose mark has breached
-its threshold. Two distinct surfaces must agree:
+auto-stamps SL/TP, but only stop-loss is mechanically executed BEFORE Opus
+sees the prompt. Take-profit is advisory context for dynamic LLM exits. Two
+distinct surfaces must agree:
 
   1. ``store.positions_needing_hard_exit`` — pure SQL that surfaces
      lots eligible for forced exit (qty>0, SL/TP set, mark current).
@@ -51,7 +51,8 @@ def fresh_store(tmp_path, monkeypatch):
 
 
 class TestSLTPConstants:
-    """Lock the literal SL/TP percentages — these are the load-bearing risk
+    """Lock the literal SL/TP percentages — SL is mechanically enforced and TP
+    is advisory context exposed to Opus.
     settings exposed verbatim to Opus via SYSTEM_PROMPT ('2% below entry',
     '4% for leveraged ETFs', etc.). A typo here silently re-prices every
     auto-exit. SYSTEM_PROMPT documents 2/3 stocks · 4/6 leveraged."""
@@ -109,14 +110,14 @@ class TestPositionsNeedingHardExit:
         assert len(rows) == 1
         assert rows[0]["ticker"] == "NVDA"
 
-    def test_returns_lot_breaching_take_profit(self, fresh_store):
+    def test_take_profit_breach_is_advisory_not_hard_exit(self, fresh_store):
         fresh_store.upsert_position(
             "NVDA", "stock", 1.0, 100.0,
             stop_loss_price=98.0, take_profit_price=103.0,
         )
         fresh_store.update_position_marks({1: (104.0, 4.0)})
         rows = fresh_store.positions_needing_hard_exit()
-        assert len(rows) == 1
+        assert rows == []
 
     def test_skips_lot_within_band(self, fresh_store):
         fresh_store.upsert_position(
@@ -139,20 +140,31 @@ class TestPositionsNeedingHardExit:
         rows = fresh_store.positions_needing_hard_exit()
         assert len(rows) == 1, "exact SL price must trigger exit"
 
-    def test_exact_take_profit_boundary_breaches(self, fresh_store):
+    def test_exact_take_profit_boundary_is_not_hard_exit(self, fresh_store):
         fresh_store.upsert_position(
             "NVDA", "stock", 1.0, 100.0,
             stop_loss_price=98.0, take_profit_price=103.0,
         )
         fresh_store.update_position_marks({1: (103.0, 3.0)})
-        assert len(fresh_store.positions_needing_hard_exit()) == 1
+        assert fresh_store.positions_needing_hard_exit() == []
 
     def test_skips_lot_with_null_sl(self, fresh_store):
-        """A lot without SL/TP set (e.g. legacy pre-migration) must NEVER
-        be auto-exited — the SQL guard requires both NOT NULL."""
+        """A lot without SL set (e.g. legacy pre-migration) must NEVER
+        be auto-exited — the SQL guard requires stop_loss_price."""
         fresh_store.upsert_position("NVDA", "stock", 1.0, 100.0)  # no SL/TP
         fresh_store.update_position_marks({1: (50.0, -50.0)})  # huge loss
         assert fresh_store.positions_needing_hard_exit() == []
+
+    def test_stop_loss_fires_even_without_take_profit(self, fresh_store):
+        """TP is advisory now; a missing TP marker must not disable stop-loss."""
+        fresh_store.upsert_position(
+            "NVDA", "stock", 1.0, 100.0,
+            stop_loss_price=98.0, take_profit_price=None,
+        )
+        fresh_store.update_position_marks({1: (97.0, -3.0)})
+        rows = fresh_store.positions_needing_hard_exit()
+        assert len(rows) == 1
+        assert rows[0]["ticker"] == "NVDA"
 
     def test_skips_lot_with_stale_mark(self, fresh_store):
         """current_price == 0 is the snapshot-freshness proxy. A lot
@@ -230,7 +242,7 @@ class TestCheckAndExecuteHardExits:
         assert "97.00" in trades[0]["reason"]
         assert "98.00" in trades[0]["reason"]
 
-    def test_tp_breach_closes_lot_and_credits_cash(self, fresh_store):
+    def test_tp_breach_does_not_close_lot_or_credit_cash(self, fresh_store):
         fresh_store.upsert_position(
             "NVDA", "stock", 2.0, 100.0,
             stop_loss_price=98.0, take_profit_price=103.0,
@@ -239,16 +251,14 @@ class TestCheckAndExecuteHardExits:
         snap = {"cash": 800.0, "total_value": 1008.0}
 
         exits = strategy._check_and_execute_hard_exits(fresh_store, snap)
-        assert exits == ["NVDA"]
-        # 2 * 104 = $208 → cash $1008
-        assert snap["cash"] == pytest.approx(1008.0)
-        trades = fresh_store.recent_trades(1)
-        assert "HARD_TP" in trades[0]["reason"]
-        assert trades[0]["qty"] == 2.0
+        assert exits == []
+        assert snap["cash"] == pytest.approx(800.0)
+        assert fresh_store.open_positions()[0]["ticker"] == "NVDA"
+        assert fresh_store.recent_trades(1) == []
 
     def test_multiple_breaches_in_one_cycle(self, fresh_store):
-        """Two lots breach simultaneously; both must be exited and snap
-        cash must reflect BOTH credits in order."""
+        """Only stop-loss breaches are mechanical; TP breaches stay open for
+        dynamic LLM review."""
         fresh_store.upsert_position(
             "NVDA", "stock", 1.0, 100.0,
             stop_loss_price=98.0, take_profit_price=103.0,
@@ -259,15 +269,16 @@ class TestCheckAndExecuteHardExits:
         )
         fresh_store.update_position_marks({
             1: (97.0, -3.0),     # NVDA SL breach
-            2: (52.0, 10.0),     # AMD TP breach
+            2: (52.0, 10.0),     # AMD TP marker, advisory only
         })
         snap = {"cash": 650.0, "total_value": 1009.0}
 
         exits = strategy._check_and_execute_hard_exits(fresh_store, snap)
-        assert set(exits) == {"NVDA", "AMD"}
-        # NVDA +$97, AMD +5*52=$260 → cash should be 650 + 97 + 260 = $1007
-        assert snap["cash"] == pytest.approx(1007.0)
-        assert fresh_store.open_positions() == []
+        assert exits == ["NVDA"]
+        assert snap["cash"] == pytest.approx(747.0)
+        open_positions = fresh_store.open_positions()
+        assert len(open_positions) == 1
+        assert open_positions[0]["ticker"] == "AMD"
 
     def test_skips_lot_with_zero_qty(self, fresh_store):
         """An ALREADY-flat lot (qty=0) must not generate a phantom exit."""
