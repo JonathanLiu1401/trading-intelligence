@@ -129,14 +129,14 @@ def test_option_trade_carries_multiplied_value(client):
 
 
 def _backdate_newest_trade(store, hours_ago: float) -> None:
-    """Rewrite the newest trade's timestamp to be ``hours_ago`` hours in the
-    past — the cleanest way to drive the verdict ladder past FRESH_HOURS /
-    FROZEN_HOURS without monkeypatching the wall clock inside Flask request
-    handling (the endpoint computes its own ``now_utc`` and forwards it)."""
+    """Rewrite the most recently inserted trade's timestamp to be
+    ``hours_ago`` hours in the past — the cleanest way to drive the verdict
+    ladder past FRESH_HOURS / FROZEN_HOURS without monkeypatching the wall
+    clock inside Flask request handling."""
     ts = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
     with store._lock:
         cur = store.conn.execute(
-            "SELECT id FROM trades ORDER BY timestamp DESC, id DESC LIMIT 1"
+            "SELECT id FROM trades ORDER BY id DESC LIMIT 1"
         )
         row = cur.fetchone()
         assert row is not None, "no trade to backdate"
@@ -144,6 +144,12 @@ def _backdate_newest_trade(store, hours_ago: float) -> None:
             "UPDATE trades SET timestamp=? WHERE id=?",
             (ts, row["id"]),
         )
+        store.conn.commit()
+
+
+def _clear_trades(store) -> None:
+    with store._lock:
+        store.conn.execute("DELETE FROM trades")
         store.conn.commit()
 
 
@@ -183,11 +189,13 @@ def test_fresh_static_frozen_boundaries_align_with_builder_constants(client):
     assert c.get("/api/last-fill").get_json()["state"] == "FRESH"
 
     # Just over FRESH (6.1h) → STATIC
+    _clear_trades(s)
     s.record_trade("B", "BUY", 1.0, 100.0, "just_static")
     _backdate_newest_trade(s, hours_ago=FRESH_HOURS + 0.1)
     assert c.get("/api/last-fill").get_json()["state"] == "STATIC"
 
     # Just over FROZEN (36.1h) → FROZEN
+    _clear_trades(s)
     s.record_trade("C", "BUY", 1.0, 100.0, "just_frozen")
     _backdate_newest_trade(s, hours_ago=FROZEN_HOURS + 0.1)
     assert c.get("/api/last-fill").get_json()["state"] == "FROZEN"
