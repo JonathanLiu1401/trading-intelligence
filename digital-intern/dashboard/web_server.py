@@ -11453,39 +11453,6 @@ _CHAT_HTML = """<!doctype html>
       font-family: var(--font-sans);
     }
     .suggestion:hover { background: var(--bg-hover); color: var(--text); }
-    .return-panel {
-      margin: 12px 24px 0;
-      padding: 12px 14px;
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      flex-shrink: 0;
-    }
-    .return-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 12px;
-      margin-bottom: 8px;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-    .return-title {
-      color: var(--text);
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-    .return-stats {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      font-family: var(--font-mono);
-      font-size: 12px;
-    }
-    .return-pos { color: var(--green); }
-    .return-neg { color: var(--red); }
-    .return-chart { position: relative; height: 180px; }
     .input-bar {
       display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--border); background: var(--bg-panel);
     }
@@ -11583,9 +11550,6 @@ _CHAT_HTML = """<!doctype html>
       .bottom-nav { display: grid; }
       .topbar { padding: 0 16px; }
       .msg { max-width: 90%; }
-      .return-panel { margin: 10px 16px 0; padding: 10px 12px; }
-      .return-chart { height: 150px; }
-      .return-head { align-items: flex-start; flex-direction: column; gap: 4px; }
       .chat-wrap { padding: 14px 16px 88px; }
       .input-bar { padding: 12px 16px; margin-bottom: 64px; }
       .suggestions { padding: 12px 16px 4px; }
@@ -11595,7 +11559,6 @@ _CHAT_HTML = """<!doctype html>
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" async></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <nav class="topbar">
@@ -11633,17 +11596,6 @@ _CHAT_HTML = """<!doctype html>
   <h1>Market Intel</h1>
   <div class="sub">Powered by Claude Opus 4.7 + Live News Feed</div>
 </header>
-<section class="return-panel">
-  <div class="return-head">
-    <span class="return-title">Paper Trader Return Graph</span>
-    <span class="return-stats">
-      <span id="return-total">value —</span>
-      <span id="return-basis">basis —</span>
-      <span id="return-pct">return —</span>
-    </span>
-  </div>
-  <div class="return-chart"><canvas id="return-chart"></canvas></div>
-</section>
 <div class="suggestions" id="suggestions"></div>
 <div class="chat-wrap" id="chat"></div>
 <div class="input-bar">
@@ -11656,7 +11608,6 @@ const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const msgs = [];
-let returnChart = null;
 
 function sendMsg() { ask(input.value.trim()); }
 input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
@@ -11767,84 +11718,6 @@ function renderSuggestions(list) {
   }
 }
 
-function money(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
-  const x = Number(n);
-  return (x < 0 ? '-$' : '$') + Math.abs(x).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-}
-function signedPct(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
-  const x = Number(n);
-  return (x >= 0 ? '+' : '') + x.toFixed(2) + '%';
-}
-async function refreshReturnGraph() {
-  const canvas = document.getElementById('return-chart');
-  if (!canvas || typeof Chart === 'undefined') return;
-  let j;
-  try {
-    const r = await fetch('/trader/api/equity-tail?limit=500', {cache: 'no-store'});
-    if (!r.ok) return;
-    j = await r.json();
-  } catch (e) { return; }
-  const rows = Array.isArray(j.equity) ? j.equity : [];
-  if (rows.length < 2) return;
-  const labels = rows.map(p => (p.timestamp || '').replace('T', ' ').slice(0, 16));
-  const values = rows.map(p => {
-    const pct = Number(p.deposit_adjusted_return_pct);
-    if (Number.isFinite(pct)) return pct;
-    const tv = Number(p.total_value), basis = Number(p.capital_basis || 1000);
-    return basis > 0 ? (tv / basis - 1) * 100 : null;
-  });
-  const last = j.portfolio || rows[rows.length - 1] || {};
-  const pct = Number(last.deposit_adjusted_return_pct);
-  const pnl = Number(last.deposit_adjusted_pnl);
-  const pctEl = document.getElementById('return-pct');
-  document.getElementById('return-total').textContent = 'value ' + money(last.total_value);
-  document.getElementById('return-basis').textContent = 'basis ' + money(last.capital_basis);
-  pctEl.textContent = 'return ' + signedPct(pct);
-  pctEl.className = (pct >= 0 ? 'return-pos' : 'return-neg');
-  if (Number.isFinite(pnl)) pctEl.title = 'Deposit-adjusted P/L ' + money(pnl);
-  if (returnChart) returnChart.destroy();
-  returnChart = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        label: 'Deposit-adjusted return %',
-        data: values,
-        borderColor: '#0acdff',
-        backgroundColor: 'rgba(10,205,255,0.12)',
-        pointRadius: 0,
-        pointHoverRadius: 3,
-        borderWidth: 2,
-        tension: 0.25,
-        fill: true,
-      }],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label: ctx => 'return ' + signedPct(ctx.parsed.y),
-          },
-        },
-      },
-      scales: {
-        x: {
-          ticks: { color: '#8b929d', maxRotation: 0, autoSkip: true, maxTicksLimit: 7 },
-          grid: { display: false },
-        },
-        y: {
-          ticks: { color: '#8b929d', callback: v => signedPct(Number(v)) },
-          grid: { color: 'rgba(255,255,255,0.05)' },
-        },
-      },
-    },
-  });
-}
 async function loadSuggestions() {
   try {
     const r = await fetch('/api/chat-suggestions', {cache: 'no-store'});
@@ -11857,10 +11730,7 @@ async function loadSuggestions() {
 renderSuggestions(SUGGESTIONS_FALLBACK);
 document.addEventListener('DOMContentLoaded', loadSuggestions);
 if (document.readyState !== 'loading') loadSuggestions();
-document.addEventListener('DOMContentLoaded', refreshReturnGraph);
-if (document.readyState !== 'loading') refreshReturnGraph();
 setInterval(loadSuggestions, 10 * 60 * 1000);
-setInterval(refreshReturnGraph, 15000);
 </script>
 
 <nav class="bottom-nav" id="bottomNav">
