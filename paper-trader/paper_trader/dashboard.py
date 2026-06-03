@@ -1580,10 +1580,16 @@ TEMPLATE = r"""
     <div class="card" style="margin-bottom:18px;">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
         <h2 style="margin:0;">Live portfolio</h2>
-        <div style="display:flex;gap:3px;font-size:11px;">
-          <button class="bt-filter-chip active" id="eq-range-all" onclick="setEqRange('all')">All</button>
-          <button class="bt-filter-chip" id="eq-range-24h" onclick="setEqRange('24h')">24h</button>
-          <button class="bt-filter-chip" id="eq-range-7d" onclick="setEqRange('7d')">7d</button>
+        <div style="display:flex;gap:3px;font-size:11px;flex-wrap:wrap;">
+          <button class="bt-filter-chip" id="eq-range-1d" onclick="setEqRange('1d')">1d</button>
+          <button class="bt-filter-chip" id="eq-range-5d" onclick="setEqRange('5d')">5d</button>
+          <button class="bt-filter-chip active" id="eq-range-1m" onclick="setEqRange('1m')">1m</button>
+          <button class="bt-filter-chip" id="eq-range-3m" onclick="setEqRange('3m')">3m</button>
+          <button class="bt-filter-chip" id="eq-range-ytd" onclick="setEqRange('ytd')">ytd</button>
+          <button class="bt-filter-chip" id="eq-range-1y" onclick="setEqRange('1y')">1y</button>
+          <button class="bt-filter-chip" id="eq-range-3y" onclick="setEqRange('3y')">3y</button>
+          <button class="bt-filter-chip" id="eq-range-5y" onclick="setEqRange('5y')">5y</button>
+          <button class="bt-filter-chip" id="eq-range-all" onclick="setEqRange('all')">all</button>
         </div>
       </div>
       <div class="stat-row" style="margin-bottom:10px;">
@@ -1608,6 +1614,25 @@ TEMPLATE = r"""
       <div style="margin-top:6px;">
         <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px;">Drawdown from peak (%)</div>
         <div style="position:relative;height:80px;"><canvas id="eq-dd"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ─── % change over standard windows (live, client-side from r.equity) ─── -->
+    <div class="card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Returns over time <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— portfolio % change over standard windows</span></span>
+        <span class="muted" id="pct-panel-asof" style="font-size:11px;text-transform:none;letter-spacing:normal;">—</span>
+      </h2>
+      <div class="stat-row" id="pct-panel-row">
+        <div class="stat"><div class="l">1d</div><div class="v" id="pct-1d">—</div></div>
+        <div class="stat"><div class="l">5d</div><div class="v" id="pct-5d">—</div></div>
+        <div class="stat"><div class="l">1m</div><div class="v" id="pct-1m">—</div></div>
+        <div class="stat"><div class="l">3m</div><div class="v" id="pct-3m">—</div></div>
+        <div class="stat"><div class="l">ytd</div><div class="v" id="pct-ytd">—</div></div>
+        <div class="stat"><div class="l">1y</div><div class="v" id="pct-1y">—</div></div>
+        <div class="stat"><div class="l">3y</div><div class="v" id="pct-3y">—</div></div>
+        <div class="stat"><div class="l">5y</div><div class="v" id="pct-5y">—</div></div>
+        <div class="stat"><div class="l">all</div><div class="v" id="pct-all">—</div></div>
       </div>
     </div>
 
@@ -3021,13 +3046,55 @@ function filterByModel(modelId) {
 // ───────── Trader pane ─────────
 let chart;
 let ddChart;
-let eqRange = "all";   // "all" | "24h" | "7d"
+// Supported ranges: "1d","5d","1m","3m","ytd","1y","3y","5y","all". Legacy
+// "24h" and "7d" callers (if any external links remain) are aliased to "1d"
+// and "5d" in setEqRange so they keep working without 404'ing the UI.
+let eqRange = "1m";
 let _lastEquity = [];  // cache for range filtering
 let _lastTrades = [];
 
+const EQ_RANGES = ["1d","5d","1m","3m","ytd","1y","3y","5y","all"];
+
+function _cutoffMsForRange(r) {
+  // Returns the cutoff (ms since epoch) for the given range, or null for "all".
+  // Date math uses UTC throughout so the windows are stable across DST.
+  if (r === "all") return null;
+  const now = Date.now();
+  if (r === "1d") return now - 86400000;
+  if (r === "5d") return now - 5 * 86400000;
+  if (r === "1y") {
+    const d = new Date(now); d.setUTCFullYear(d.getUTCFullYear() - 1);
+    return d.getTime();
+  }
+  if (r === "3y") {
+    const d = new Date(now); d.setUTCFullYear(d.getUTCFullYear() - 3);
+    return d.getTime();
+  }
+  if (r === "5y") {
+    const d = new Date(now); d.setUTCFullYear(d.getUTCFullYear() - 5);
+    return d.getTime();
+  }
+  if (r === "1m") {
+    const d = new Date(now); d.setUTCMonth(d.getUTCMonth() - 1);
+    return d.getTime();
+  }
+  if (r === "3m") {
+    const d = new Date(now); d.setUTCMonth(d.getUTCMonth() - 3);
+    return d.getTime();
+  }
+  if (r === "ytd") {
+    return Date.UTC(new Date(now).getUTCFullYear(), 0, 1, 0, 0, 0, 0);
+  }
+  return null;
+}
+
 function setEqRange(r) {
+  // Legacy aliases — keep older bookmarks / cross-page links functional.
+  if (r === "24h") r = "1d";
+  else if (r === "7d") r = "5d";
+  if (!EQ_RANGES.includes(r)) r = "1m";
   eqRange = r;
-  ["all","24h","7d"].forEach(k => {
+  EQ_RANGES.forEach(k => {
     const el = document.getElementById("eq-range-"+k);
     if (el) el.classList.toggle("active", k === r);
   });
@@ -3036,9 +3103,106 @@ function setEqRange(r) {
 
 function _filterEqByRange(eq) {
   if (eqRange === "all" || !eq.length) return eq;
-  const cutMs = eqRange === "24h" ? 86400000 : 7*86400000;
-  const cutoff = new Date(Date.now() - cutMs).toISOString();
-  return eq.filter(p => p.timestamp >= cutoff);
+  const cutMs = _cutoffMsForRange(eqRange);
+  if (cutMs == null) return eq;
+  const cutoff = new Date(cutMs).toISOString();
+  // Empty window (history shorter than the range) — fall back to the full
+  // available series so the chart still renders something instead of blanking.
+  const filt = eq.filter(p => p.timestamp >= cutoff);
+  return filt.length ? filt : eq;
+}
+
+function refreshPctChangePanel(eq) {
+  // Compute % change over each standard window purely client-side from the
+  // equity series. For each window: find the first point at-or-after the
+  // cutoff; show "—" if no point falls inside the window.
+  const asof = document.getElementById("pct-panel-asof");
+  if (!eq || !eq.length) {
+    EQ_RANGES.forEach(k => {
+      const el = document.getElementById("pct-"+k);
+      if (el) { el.textContent = "—"; el.className = "v"; }
+    });
+    if (asof) asof.textContent = "—";
+    return;
+  }
+  const last = eq[eq.length - 1];
+  const latestVal = +last.total_value || 0;
+  EQ_RANGES.forEach(k => {
+    const el = document.getElementById("pct-"+k);
+    if (!el) return;
+    let startVal = null;
+    if (k === "all") {
+      startVal = +eq[0].total_value || null;
+    } else {
+      const cutMs = _cutoffMsForRange(k);
+      const cutoff = cutMs == null ? null : new Date(cutMs).toISOString();
+      if (cutoff != null) {
+        for (let i = 0; i < eq.length; i++) {
+          if (eq[i].timestamp >= cutoff) {
+            startVal = +eq[i].total_value || null;
+            break;
+          }
+        }
+      }
+    }
+    if (startVal == null || startVal <= 0 || latestVal <= 0) {
+      el.textContent = "—"; el.className = "v";
+      return;
+    }
+    const pct = (latestVal / startVal - 1) * 100;
+    el.textContent = (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
+    el.className = "v " + (pct >= 0 ? "pos" : "neg");
+  });
+  if (asof) asof.textContent = "as of " + (last.timestamp || "").replace("T"," ").slice(0,19);
+}
+
+async function refreshEquityTail() {
+  // Lightweight 3s poll that pulls just the equity tail + current portfolio
+  // snapshot, so the chart's right edge moves like a live ticker without
+  // paying for the full ~145 KB /api/state body each tick. Appends only
+  // strictly-newer points by timestamp; if /api/state has not yet seeded
+  // _lastEquity (page just loaded), this tick is a no-op and the next 15s
+  // full refresh will populate the chart.
+  let r;
+  try {
+    r = await fetch(API_PREFIX + "/api/equity-tail").then(x => x.json());
+  } catch (e) { return; }
+  if (!r || r.warming || r.error || !Array.isArray(r.equity)) return;
+  const tail = r.equity;
+  if (!tail.length) return;
+  if (!_lastEquity || !_lastEquity.length) {
+    // First load before /api/state has resolved — seed the tail so the chart
+    // can render something immediately.
+    _lastEquity = tail.slice();
+  } else {
+    const lastTs = _lastEquity[_lastEquity.length - 1].timestamp || "";
+    let added = 0;
+    for (const p of tail) {
+      if ((p.timestamp || "") > lastTs) { _lastEquity.push(p); added++; }
+    }
+    if (!added) {
+      // No new equity point; still refresh the spans below in case
+      // total_value / cash drifted (mark-to-market intra-cycle).
+    }
+  }
+  // Update the headline spans from the fresh portfolio snapshot.
+  if (r.portfolio) {
+    const tvEl = document.getElementById("tv");
+    const cashEl = document.getElementById("cash");
+    if (tvEl && r.portfolio.total_value != null) tvEl.textContent = dollar(r.portfolio.total_value);
+    if (cashEl && r.portfolio.cash != null) cashEl.textContent = dollar(r.portfolio.cash);
+    const startVal = (_lastEquity && _lastEquity[0]) ? _lastEquity[0].total_value : 1000;
+    if (r.portfolio.total_value != null && startVal) {
+      const plPct = (r.portfolio.total_value / startVal - 1) * 100;
+      const plEl = document.getElementById("pl");
+      if (plEl) {
+        plEl.textContent = (plPct >= 0 ? "+" : "") + plPct.toFixed(2) + "%";
+        plEl.className = "v " + (plPct >= 0 ? "pos" : "neg");
+      }
+    }
+  }
+  drawEquityChart(_lastEquity, _lastTrades);
+  refreshPctChangePanel(_lastEquity);
 }
 
 function drawEquityChart(eq, trades) {
@@ -3248,6 +3412,7 @@ async function refresh() {
   _lastEquity = r.equity || [];
   _lastTrades = r.all_trades || r.trades || [];
   drawEquityChart(_lastEquity, _lastTrades);
+  refreshPctChangePanel(_lastEquity);
 
   const posBody = document.querySelector("#pos-tbl tbody");
   const portTotal = r.portfolio.total_value || 0;
@@ -6985,6 +7150,7 @@ refreshScorecard();
 refreshSessionDelta();
 refreshGlobalStale();
 setInterval(refresh, 15_000);
+setInterval(refreshEquityTail, 3_000);
 setInterval(refreshSignals, 30_000);
 setInterval(refreshAnalytics, 30_000);
 setInterval(refreshSectorPulse, 60_000);
@@ -7400,6 +7566,43 @@ def state():
         "equity": eq,
         "sp500": sp,
         "all_trades": all_trades,
+    })
+
+
+@app.route("/api/equity-tail")
+@swr_cached("equity-tail", 2.0)
+def equity_tail_api():
+    """Lightweight equity-tail poll — the cheap counterpart to /api/state.
+
+    The trader page polls this every 3s so the live-portfolio chart's right
+    edge moves like a ticker without paying for the full /api/state body
+    (~145 KB, six lock-held store reads). Returns at most ``limit`` (default
+    60, max 500) most-recent equity_curve points plus the current portfolio
+    ``total_value`` and ``cash``. 2-second SWR cache absorbs any traffic
+    burst from concurrent clients without hammering the WAL writer.
+    """
+    try:
+        limit = int(request.args.get("limit", 60))
+    except (TypeError, ValueError):
+        limit = 60
+    limit = max(1, min(500, limit))
+    store = get_store()
+    eq = store.equity_curve(limit)
+    pf = store.get_portfolio() or {}
+    total_value = pf.get("total_value")
+    cash = pf.get("cash")
+    try:
+        total_value = float(total_value) if total_value is not None else None
+    except (TypeError, ValueError):
+        total_value = None
+    try:
+        cash = float(cash) if cash is not None else None
+    except (TypeError, ValueError):
+        cash = None
+    return jsonify({
+        "now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "equity": eq,
+        "portfolio": {"total_value": total_value, "cash": cash},
     })
 
 
