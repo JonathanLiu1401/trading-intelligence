@@ -153,7 +153,7 @@ def test_ml_drought_fallback_turns_llm_drought_into_hold(stub_decide_inputs,
     assert "llm_drought_reason" in payload
 
 
-def test_ml_drought_buy_fallback_sizes_from_conviction(monkeypatch):
+def test_ml_drought_buy_fallback_never_places_emergency_buy(monkeypatch):
     monkeypatch.setattr(strategy.market, "get_price", lambda t: 100.0)
     decision = strategy._ml_drought_decision(
         {
@@ -171,10 +171,11 @@ def test_ml_drought_buy_fallback_sizes_from_conviction(monkeypatch):
         "claude returned no response (timeout)",
     )
 
-    assert decision["action"] == "BUY"
-    assert decision["ticker"] == "AMD"
-    # 20% conviction on a $1000 book => $200 notional => 2 shares.
-    assert decision["qty"] == 2.0
+    assert decision["action"] == "HOLD"
+    assert decision["ticker"] == ""
+    assert "qty" not in decision
+    assert "emergency_qty" not in decision["reasoning"]
+    assert "no emergency buy" in decision["reasoning"]
     assert "ml-drought-fallback" in decision["reasoning"]
 
 
