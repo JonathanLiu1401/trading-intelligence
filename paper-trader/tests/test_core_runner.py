@@ -399,6 +399,8 @@ class TestKillStaleClaude:
     def _real_cmdline(model: str) -> str:
         # Mirrors the argv strategy._claude_call builds, joined the way
         # `pkill -f` matches (against the space-joined command line).
+        if model.startswith("gpt-"):
+            return " ".join(["codex", "exec", "--model", model, "-c"])
         return " ".join(
             ["claude", "--model", model, "--print",
              "--permission-mode", "bypassPermissions"]
