@@ -13,12 +13,61 @@ from . import market
 from .analytics.hold_discipline import build_hold_discipline
 from .analytics.sector_exposure import classify as _sector_classify
 from .analytics.stress_scenarios import _LEVERAGE_BETA, build_stress_scenarios
-from .store import INITIAL_CASH, get_store
+from .store import (
+    INITIAL_CASH,
+    capital_basis_snapshot,
+    equity_curve_with_capital_basis,
+    get_store,
+)
 
 DISCORD_CHANNEL = "channel:1496099475838603324"
 # Single source of truth — keep P/L baselines in lockstep with the store.
 # A hardcoded copy silently desyncs every reported P/L% if INITIAL_CASH moves.
 _INITIAL_EQUITY = INITIAL_CASH
+
+
+def _capital_pnl_snapshot(store, total_value: float) -> dict:
+    try:
+        curve = store.equity_curve(limit=5000)
+    except Exception:
+        curve = []
+    if curve:
+        try:
+            latest = float(curve[-1].get("total_value") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            latest = 0.0
+        tolerance = max(1.0, abs(float(total_value)) * 0.05)
+        if abs(latest - float(total_value)) > tolerance:
+            curve = []
+    return capital_basis_snapshot(
+        curve, total_value, initial_cash=_INITIAL_EQUITY)
+
+
+def _performance_equity_curve(curve: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for raw in equity_curve_with_capital_basis(curve):
+        row = dict(raw)
+        adj = row.get("deposit_adjusted_pnl")
+        if adj is not None:
+            try:
+                row["total_value"] = _INITIAL_EQUITY + float(adj)
+            except (TypeError, ValueError):
+                pass
+        out.append(row)
+    return out
+
+
+def _pl_line_values(store, total_value: float) -> tuple[float, float, float, float]:
+    cap = _capital_pnl_snapshot(store, total_value)
+    basis = float(cap.get("capital_basis") or _INITIAL_EQUITY)
+    net_flow = float(cap.get("net_external_cash_flow") or 0.0)
+    pl = float(cap.get("deposit_adjusted_pnl")
+               if cap.get("deposit_adjusted_pnl") is not None
+               else total_value - basis)
+    pct = float(cap.get("deposit_adjusted_return_pct")
+                if cap.get("deposit_adjusted_return_pct") is not None
+                else (pl / basis * 100.0 if basis > 0 else 0.0))
+    return pl, pct, basis, net_flow
 
 
 # ── Discord delivery health ──────────────────────────────────────────────
@@ -500,14 +549,15 @@ def send_decision_log(summary: dict) -> bool:
     pf = summary.get("snapshot") or {}
     total_value = float(pf.get("total_value") or 0.0)
     cash = float(pf.get("cash") or 0.0)
-    pl = total_value - _INITIAL_EQUITY
-    pl_pct = pl / _INITIAL_EQUITY * 100
+    pl, pl_pct, basis, net_flow = _pl_line_values(get_store(), total_value)
 
     parts = [
         f"**Δ DECISION** `{action} {ticker}` → `{status}`",
         f"conf=`{conf}` value=`${total_value:.2f}` "
         f"P/L=`${pl:+.2f}` (`{pl_pct:+.2f}%`) cash=`${cash:.2f}`",
     ]
+    if abs(net_flow) >= 0.01:
+        parts.append(f"basis=`${basis:.2f}` net deposits=`${net_flow:+.2f}`")
     if auto:
         parts.append("auto: " + "; ".join(f"`{a}`" for a in auto))
     if detail:
@@ -576,7 +626,9 @@ def _book_exposure_line(store) -> str:
             total = 0.0
         if total <= 0:
             return ""
-        pl_pct = (total - _INITIAL_EQUITY) / _INITIAL_EQUITY * 100.0
+        _pl, pl_pct, basis, net_flow = _pl_line_values(store, total)
+        basis_tok = (f" vs ${basis:.0f} basis"
+                     if abs(net_flow) >= 0.01 else " from start")
         # ``cash`` is the operator's "what can I act with right now" number on
         # a wedge-page — biggest-position-weight alone tells them how
         # concentrated the FROZEN book is, but a 70%-biggest line with no
@@ -611,7 +663,7 @@ def _book_exposure_line(store) -> str:
             held.append({**p, "_market_value": cur * q * mult})
         n = len(held)
         if n == 0:
-            return f"book: ${total:.2f} ({pl_pct:+.2f}% from start) · 100% cash"
+            return f"book: ${total:.2f} ({pl_pct:+.2f}%{basis_tok}) · 100% cash"
         biggest = max(held, key=lambda p: p["_market_value"])
         bw_pct = (biggest["_market_value"] / total * 100.0) if total > 0 else 0.0
         bt = biggest.get("ticker") or "?"
@@ -636,7 +688,7 @@ def _book_exposure_line(store) -> str:
         # a write race) never renders a >100% token.
         cash_pct = (cash / total * 100.0) if total > 0 else 0.0
         cash_pct = max(0.0, min(100.0, cash_pct))
-        return (f"book: ${total:.2f} ({pl_pct:+.2f}% from start) · "
+        return (f"book: ${total:.2f} ({pl_pct:+.2f}%{basis_tok}) · "
                 f"{n} {n_word} · cash {cash_pct:.1f}% · "
                 f"biggest {bt} {bw_pct:.1f}%{upl_tok}")
     except Exception as e:
@@ -1104,7 +1156,8 @@ def _session_block(store, window_hours: float, label: str) -> str:
                     f"Only open mover `{best['ticker']}` "
                     f"${best['unrealized_pl']:+.2f}"
                 )
-        d = _window_delta(store.equity_curve(limit=5000), since)
+        d = _window_delta(
+            _performance_equity_curve(store.equity_curve(limit=5000)), since)
         if d and "port_pct" in d:
             seg = f"Δ port `{d['port_pct']:+.2f}%`"
             if "spy_pct" in d:
@@ -1149,7 +1202,8 @@ def _benchmark_line(store) -> str:
     precedent)."""
     try:
         from .analytics.benchmark import build_benchmark
-        b = build_benchmark(store.equity_curve(limit=5000),
+        b = build_benchmark(equity_curve_with_capital_basis(
+                                store.equity_curve(limit=5000)),
                              starting_equity=_INITIAL_EQUITY)
         if b.get("state") == "NO_DATA":
             return ""
@@ -1204,7 +1258,7 @@ def _drawdown_line(store) -> str:
     try:
         from .analytics.drawdown import compute_drawdown
         dd = compute_drawdown(
-            store.equity_curve(limit=2000),
+            _performance_equity_curve(store.equity_curve(limit=2000)),
             store.open_positions(),
             starting_equity=_INITIAL_EQUITY,
         )
@@ -1305,7 +1359,7 @@ def _realized_vs_unrealized_line(store) -> str:
         # (dashboard.realized_vs_unrealized_api) — reversed into
         # oldest→newest because that endpoint and the builder both want it.
         trades = list(reversed(store.recent_trades(5000)))
-        curve = store.equity_curve(limit=2000)
+        curve = equity_curve_with_capital_basis(store.equity_curve(limit=2000))
         rvu = build_realized_vs_unrealized(
             trades, curve, starting_value=_INITIAL_EQUITY,
         )
@@ -1698,7 +1752,7 @@ def _recovery_line(store) -> str:
         from .analytics.drawdown import compute_drawdown
         from .analytics.recovery import build_recovery
         from .analytics.tail_risk import build_tail_risk
-        eq = store.equity_curve(limit=2000)
+        eq = _performance_equity_curve(store.equity_curve(limit=2000))
         dd = compute_drawdown(eq, store.open_positions(),
                               starting_equity=_INITIAL_EQUITY)
         rec = build_recovery(dd, build_tail_risk(eq), _INITIAL_EQUITY)
@@ -4720,7 +4774,7 @@ def _today_session_line(store, now: datetime | None = None) -> str:
         since = _today_session_anchor_iso(now)
         if not since:
             return ""
-        eq = store.equity_curve(limit=5000)
+        eq = _performance_equity_curve(store.equity_curve(limit=5000))
         if not eq or len(eq) < 2:
             return ""
         last = eq[-1]
@@ -5089,8 +5143,12 @@ def send_hourly_summary() -> bool:
     # ``_pos_pct_weight``/``_pos_alpha_token`` can actually fire.
     positions = _merge_stale_marks(store.open_positions(), pf.get("positions"))
     sp = market.benchmark_sp500()
-    pl = pf["total_value"] - _INITIAL_EQUITY
-    pl_pct = pl / _INITIAL_EQUITY * 100
+    pl, pl_pct, basis, net_flow = _pl_line_values(
+        store, float(pf["total_value"]))
+    basis_line = (
+        f"Capital     ${basis:.2f} (net deposits {net_flow:+.2f})\n"
+        if abs(net_flow) >= 0.01 else ""
+    )
 
     recent_trades = store.recent_trades(5)
     trade_lines = [
@@ -5114,6 +5172,7 @@ def send_hourly_summary() -> bool:
         f"```\n"
         f"Equity      ${pf['total_value']:.2f}\n"
         f"Cash        ${pf['cash']:.2f}\n"
+        f"{basis_line}"
         f"P/L         ${pl:+.2f} ({pl_pct:+.2f}%)\n"
         f"{sp_line}\n"
         f"```\n"
@@ -5471,8 +5530,11 @@ def send_daily_close() -> bool:
     positions = _merge_stale_marks(store.open_positions(), pf.get("positions"))
     sp = market.benchmark_sp500()
 
-    pl = pf["total_value"] - _INITIAL_EQUITY
-    pl_pct = pl / _INITIAL_EQUITY * 100
+    pl, pl_pct, basis, net_flow = _pl_line_values(
+        store, float(pf["total_value"]))
+    basis_note = (f" vs ${basis:.0f} capital basis"
+                  if abs(net_flow) >= 0.01
+                  else f" vs ${_INITIAL_EQUITY:.0f} start")
 
     # daily slice
     today = datetime.now(timezone.utc).date().isoformat()
@@ -5512,7 +5574,7 @@ def send_daily_close() -> bool:
         f"```\n"
         f"Equity         ${pf['total_value']:.2f}\n"
         f"Cash           ${pf['cash']:.2f}\n"
-        f"Total P/L      ${pl:+.2f} ({pl_pct:+.2f}%)  vs ${_INITIAL_EQUITY:.0f} start\n"
+        f"Total P/L      ${pl:+.2f} ({pl_pct:+.2f}%)  {basis_note}\n"
         f"Realized P/L (today, cash flow basis)  ${pnl_real:+.2f}\n"
         f"{realized_rt_line}"
         f"Trades today   {n_trades}\n"

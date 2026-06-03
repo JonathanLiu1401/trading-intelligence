@@ -12,7 +12,12 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
 
-from .store import INITIAL_CASH, get_store
+from .store import (
+    INITIAL_CASH,
+    capital_basis_snapshot as _store_capital_basis_snapshot,
+    equity_curve_with_capital_basis,
+    get_store,
+)
 from .backtest import BACKTEST_DB  # re-exported so tests can monkeypatch dash.BACKTEST_DB
 
 app = Flask(__name__)
@@ -52,6 +57,29 @@ def _git_sha(repo_dir: str, ref: str = "HEAD") -> str | None:
 
 _BOOT_SHA = _git_sha(_REPO_DIR)
 _BOOT_TIME = __import__("time").time()
+
+
+def _with_capital_basis(equity: list[dict]) -> list[dict]:
+    return equity_curve_with_capital_basis(equity)
+
+
+def _capital_basis_snapshot(equity: list[dict], total_value: float | None) -> dict:
+    return _store_capital_basis_snapshot(equity, total_value)
+
+
+def _deposit_adjusted_equity_values(equity: list[dict]) -> list[dict]:
+    """Return equity rows whose total_value is performance-only, not deposits."""
+    out: list[dict] = []
+    for raw in _with_capital_basis(equity):
+        row = dict(raw)
+        adj = row.get("deposit_adjusted_pnl")
+        if adj is not None:
+            try:
+                row["total_value"] = INITIAL_CASH + float(adj)
+            except (TypeError, ValueError):
+                pass
+        out.append(row)
+    return out
 
 
 def _head_sha_and_behind() -> tuple[str | None, int]:
@@ -1595,7 +1623,7 @@ TEMPLATE = r"""
       <div class="stat-row" style="margin-bottom:10px;">
         <div class="stat"><div class="l">total value</div><div class="v" id="tv">—</div></div>
         <div class="stat"><div class="l">cash</div><div class="v" id="cash">—</div></div>
-        <div class="stat"><div class="l">return vs start</div><div class="v" id="pl">—</div></div>
+        <div class="stat"><div class="l">return vs capital</div><div class="v" id="pl">—</div></div>
         <div class="stat"><div class="l">vs SPY (same period)</div><div class="v" id="vs-spy-live">—</div></div>
         <div class="stat"><div class="l">max drawdown</div><div class="v" id="live-maxdd">—</div></div>
         <div class="stat"><div class="l">cash deployed</div><div class="v" id="live-deployed">—</div></div>
@@ -1606,7 +1634,7 @@ TEMPLATE = r"""
         </div>
       </div>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">
-        <span style="color:#0acdff;">●</span> Portfolio (% from start) &nbsp;
+        <span style="color:#0acdff;">●</span> Portfolio (% vs capital basis) &nbsp;
         <span style="border-top:2px dashed rgba(255,183,77,0.7);display:inline-block;width:16px;vertical-align:middle;"></span> SPY (% from same start) &nbsp;
         <span style="color:var(--text-muted);">↑ buy &nbsp; ↓ sell</span>
       </div>
@@ -1620,7 +1648,7 @@ TEMPLATE = r"""
     <!-- ─── % change over standard windows (live, client-side from r.equity) ─── -->
     <div class="card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
-        <span>Returns over time <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— portfolio % change over standard windows</span></span>
+        <span>Returns over time <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— deposit-adjusted portfolio % change over standard windows</span></span>
         <span class="muted" id="pct-panel-asof" style="font-size:11px;text-transform:none;letter-spacing:normal;">—</span>
       </h2>
       <div class="stat-row" id="pct-panel-row">
@@ -3127,12 +3155,16 @@ function refreshPctChangePanel(eq) {
   }
   const last = eq[eq.length - 1];
   const latestVal = +last.total_value || 0;
+  const latestAdjPct = Number.isFinite(+last.deposit_adjusted_return_pct)
+    ? +last.deposit_adjusted_return_pct : null;
   EQ_RANGES.forEach(k => {
     const el = document.getElementById("pct-"+k);
     if (!el) return;
     let startVal = null;
+    let startAdjPct = null;
     if (k === "all") {
       startVal = +eq[0].total_value || null;
+      startAdjPct = 0;
     } else {
       const cutMs = _cutoffMsForRange(k);
       const cutoff = cutMs == null ? null : new Date(cutMs).toISOString();
@@ -3140,10 +3172,18 @@ function refreshPctChangePanel(eq) {
         for (let i = 0; i < eq.length; i++) {
           if (eq[i].timestamp >= cutoff) {
             startVal = +eq[i].total_value || null;
+            startAdjPct = Number.isFinite(+eq[i].deposit_adjusted_return_pct)
+              ? +eq[i].deposit_adjusted_return_pct : null;
             break;
           }
         }
       }
+    }
+    if (latestAdjPct != null && startAdjPct != null) {
+      const pct = latestAdjPct - startAdjPct;
+      el.textContent = (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
+      el.className = "v " + (pct >= 0 ? "pos" : "neg");
+      return;
     }
     if (startVal == null || startVal <= 0 || latestVal <= 0) {
       el.textContent = "—"; el.className = "v";
@@ -3191,9 +3231,10 @@ async function refreshEquityTail() {
     const cashEl = document.getElementById("cash");
     if (tvEl && r.portfolio.total_value != null) tvEl.textContent = dollar(r.portfolio.total_value);
     if (cashEl && r.portfolio.cash != null) cashEl.textContent = dollar(r.portfolio.cash);
-    const startVal = (_lastEquity && _lastEquity[0]) ? _lastEquity[0].total_value : 1000;
-    if (r.portfolio.total_value != null && startVal) {
-      const plPct = (r.portfolio.total_value / startVal - 1) * 100;
+    const plPct = Number.isFinite(+r.portfolio.deposit_adjusted_return_pct)
+      ? +r.portfolio.deposit_adjusted_return_pct
+      : null;
+    if (plPct != null) {
       const plEl = document.getElementById("pl");
       if (plEl) {
         plEl.textContent = (plPct >= 0 ? "+" : "") + plPct.toFixed(2) + "%";
@@ -3209,11 +3250,14 @@ function drawEquityChart(eq, trades) {
   const filtered = _filterEqByRange(eq);
   if (!filtered.length) return;
 
-  // Normalize: portfolio and SPY both as % from first point in filtered range
+  // Normalize: portfolio is deposit-adjusted return vs capital basis; SPY is
+  // still shown from the same visible start for quick tape comparison.
   const baseVal = filtered[0].total_value || 1000;
   const baseSpy = filtered[0].sp500_price || 1;
   const labels = filtered.map(p => p.timestamp.replace("T"," ").slice(0,16));
-  const portPct = filtered.map(p => ((p.total_value / baseVal) - 1) * 100);
+  const portPct = filtered.map(p => Number.isFinite(+p.deposit_adjusted_return_pct)
+    ? +p.deposit_adjusted_return_pct
+    : ((p.total_value / baseVal) - 1) * 100);
   const spyPct  = filtered.map(p => p.sp500_price ? ((p.sp500_price / baseSpy) - 1) * 100 : null);
   const cashPct = filtered.map(p => p.cash != null ? (p.cash / p.total_value) * 100 : null);
 
@@ -3402,12 +3446,17 @@ async function refresh() {
   document.getElementById("hb").textContent = "updated " + fmtTs(r.now, "sec");
   document.getElementById("tv").textContent = dollar(r.portfolio.total_value);
   document.getElementById("cash").textContent = dollar(r.portfolio.cash);
-  const startVal = (r.equity && r.equity[0]) ? r.equity[0].total_value : 1000;
-  const pl = r.portfolio.total_value - startVal;
-  const plPct = (r.portfolio.total_value / startVal - 1) * 100;
+  const plPct = Number.isFinite(+r.portfolio.deposit_adjusted_return_pct)
+    ? +r.portfolio.deposit_adjusted_return_pct
+    : null;
   const plEl = document.getElementById("pl");
-  plEl.textContent = (plPct >= 0 ? "+" : "") + plPct.toFixed(2) + "%";
-  plEl.className = "v " + (plPct >= 0 ? "pos" : "neg");
+  if (plPct != null) {
+    plEl.textContent = (plPct >= 0 ? "+" : "") + plPct.toFixed(2) + "%";
+    plEl.className = "v " + (plPct >= 0 ? "pos" : "neg");
+  } else {
+    plEl.textContent = "—";
+    plEl.className = "v";
+  }
   const _spEl = document.getElementById("sp"); if (_spEl) _spEl.textContent = r.sp500 ? fmt(r.sp500) : "—";
   _lastEquity = r.equity || [];
   _lastTrades = r.all_trades || r.trades || [];
@@ -7553,8 +7602,14 @@ def state():
     positions = [_enrich_open_position(p) for p in store.open_positions()]
     trades = store.recent_trades(40)
     decisions = store.recent_decisions(20)
-    eq = store.equity_curve(5000)  # full history for accurate chart
+    eq = _with_capital_basis(store.equity_curve(5000))  # full history for accurate chart
     sp = eq[-1]["sp500_price"] if eq else None
+    total_value = pf.get("total_value")
+    try:
+        total_for_basis = float(total_value) if total_value is not None else None
+    except (TypeError, ValueError):
+        total_for_basis = None
+    pf = {**pf, **_capital_basis_snapshot(eq, total_for_basis)}
     # Include all trades for chart markers (not just recent 40)
     all_trades = store.recent_trades(500)
     return jsonify({
@@ -7587,7 +7642,8 @@ def equity_tail_api():
         limit = 60
     limit = max(1, min(500, limit))
     store = get_store()
-    eq = store.equity_curve(limit)
+    full_eq = _with_capital_basis(store.equity_curve(5000))
+    eq = full_eq[-limit:]
     pf = store.get_portfolio() or {}
     total_value = pf.get("total_value")
     cash = pf.get("cash")
@@ -7599,10 +7655,11 @@ def equity_tail_api():
         cash = float(cash) if cash is not None else None
     except (TypeError, ValueError):
         cash = None
+    capital = _capital_basis_snapshot(full_eq, total_value)
     return jsonify({
         "now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "equity": eq,
-        "portfolio": {"total_value": total_value, "cash": cash},
+        "portfolio": {"total_value": total_value, "cash": cash, **capital},
     })
 
 
@@ -7686,18 +7743,23 @@ def portfolio_api():
     if total_value is not None and total_value > 0:
         pnl_pct = round(unrealized_pl / total_value * 100.0, 2)
 
-    pnl_vs_start = None
-    pnl_vs_start_pct = None
+    eq = store.equity_curve(5000)
+    capital = _capital_basis_snapshot(eq, total_value)
+    pnl_vs_start = capital["deposit_adjusted_pnl"]
+    pnl_vs_start_pct = capital["deposit_adjusted_return_pct"]
     if total_value is not None:
-        pnl_vs_start = round(total_value - INITIAL_CASH, 2)
-        if INITIAL_CASH > 0:
-            pnl_vs_start_pct = round(
-                (total_value / INITIAL_CASH - 1.0) * 100.0, 2)
+        pnl_vs_initial = round(total_value - INITIAL_CASH, 2)
+        pnl_vs_initial_pct = (round((total_value / INITIAL_CASH - 1.0) * 100.0, 2)
+                              if INITIAL_CASH > 0 else None)
+    else:
+        pnl_vs_initial = None
+        pnl_vs_initial_pct = None
 
     return jsonify({
         "total_value": total_value,
         "cash": cash,
         "starting_value": INITIAL_CASH,
+        **capital,
         "n_positions": n_positions,
         "open_value": round(open_value, 2),
         "unrealized_pl": round(unrealized_pl, 2),
@@ -7706,6 +7768,8 @@ def portfolio_api():
         "last_updated": pf.get("last_updated"),
         "pnl_vs_start": pnl_vs_start,
         "pnl_vs_start_pct": pnl_vs_start_pct,
+        "pnl_vs_initial": pnl_vs_initial,
+        "pnl_vs_initial_pct": pnl_vs_initial_pct,
     })
 
 
@@ -8757,7 +8821,8 @@ def analytics_api():
         positions = store.open_positions()
         # Pull a generous trades sample for round-trip accounting.
         trades = list(reversed(store.recent_trades(2000)))  # oldest → newest
-        eq = store.equity_curve(5000)  # most recent 5000, ascending after the bugfix
+        eq = _with_capital_basis(store.equity_curve(5000))  # ascending
+        perf_eq = _deposit_adjusted_equity_values(eq)
 
         total_value = pf.get("total_value") or 0.0
 
@@ -8781,11 +8846,11 @@ def analytics_api():
         # `== null` branch fires and renders "—" instead of "-0.00 (0.00%)".
         max_dd_usd: float | None = None
         max_dd_pct: float | None = None
-        if eq:
+        if perf_eq:
             max_dd_usd = 0.0
             max_dd_pct = 0.0
-            peak = eq[0]["total_value"]
-            for p in eq:
+            peak = perf_eq[0]["total_value"]
+            for p in perf_eq:
                 v = p["total_value"]
                 if v > peak:
                     peak = v
@@ -8802,7 +8867,7 @@ def analytics_api():
         sharpe = None
         daily_returns: list[float] = []
         by_day: dict[str, float] = {}
-        for p in eq:
+        for p in perf_eq:
             day = (p["timestamp"] or "")[:10]
             if day:
                 by_day[day] = p["total_value"]  # last write wins, leaves us with EOD close
@@ -8912,12 +8977,12 @@ def analytics_api():
 
         # ─── 5. Daily P/L (today only, UTC bucket) ───
         today = datetime.now(timezone.utc).date().isoformat()
-        today_eq = [p for p in eq if (p["timestamp"] or "").startswith(today)]
+        today_eq = [p for p in perf_eq if (p["timestamp"] or "").startswith(today)]
         daily_pl = None
         daily_pl_pct = None
         if today_eq:
             open_val = today_eq[0]["total_value"]
-            cur_val = total_value
+            cur_val = today_eq[-1]["total_value"]
             if open_val:
                 daily_pl = round(cur_val - open_val, 2)
                 daily_pl_pct = round(daily_pl / open_val * 100, 2)
@@ -8925,8 +8990,8 @@ def analytics_api():
         # Compute the tail-risk + drawdown SSOT objects ONCE so the
         # tail_risk and recovery folds below share the exact same inputs
         # /api/recovery does (no double-compute, no cross-fold drift).
-        _tr = build_tail_risk(eq)
-        _dd = compute_drawdown(eq, positions, starting_equity=INITIAL_CASH)
+        _tr = build_tail_risk(perf_eq)
+        _dd = compute_drawdown(perf_eq, positions, starting_equity=INITIAL_CASH)
 
         payload = {
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -9131,7 +9196,8 @@ def tail_risk_api():
     try:
         from .analytics.tail_risk import build_tail_risk
         store = get_store()
-        result = build_tail_risk(store.equity_curve(5000))
+        result = build_tail_risk(
+            _deposit_adjusted_equity_values(store.equity_curve(5000)))
         mt = _mark_trust_block(store)
         if mt is not None:
             result["mark_trust"] = mt
@@ -9154,7 +9220,8 @@ def portfolio_beta_api():
     try:
         from .analytics.portfolio_beta import build_portfolio_beta
         store = get_store()
-        result = build_portfolio_beta(store.equity_curve(5000))
+        result = build_portfolio_beta(
+            _deposit_adjusted_equity_values(store.equity_curve(5000)))
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -9180,7 +9247,7 @@ def recovery_api():
         from .analytics.recovery import build_recovery
         from .analytics.tail_risk import build_tail_risk
         store = get_store()
-        eq = store.equity_curve(limit=2000)
+        eq = _deposit_adjusted_equity_values(store.equity_curve(limit=2000))
         positions = store.open_positions()
         dd = compute_drawdown(eq, positions, starting_equity=INITIAL_CASH)
         tr = build_tail_risk(eq)
@@ -11124,7 +11191,7 @@ def drawdown_api():
     try:
         from .analytics.drawdown import compute_drawdown
         store = get_store()
-        eq = store.equity_curve(limit=2000)
+        eq = _deposit_adjusted_equity_values(store.equity_curve(limit=2000))
         positions = store.open_positions()
         result = compute_drawdown(eq, positions,
                                   starting_equity=INITIAL_CASH)
@@ -11152,7 +11219,7 @@ def benchmark_api():
     try:
         from .analytics.benchmark import build_benchmark
         store = get_store()
-        eq = store.equity_curve(limit=5000)
+        eq = _with_capital_basis(store.equity_curve(limit=5000))
         return jsonify(build_benchmark(eq, starting_equity=INITIAL_CASH))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -12490,7 +12557,7 @@ def realized_vs_unrealized_api():
         from .analytics.realized_vs_unrealized import build_realized_vs_unrealized
         store = get_store()
         trades = list(reversed(store.recent_trades(limit=5000)))  # oldest→newest
-        curve = store.equity_curve(limit=2000)
+        curve = _with_capital_basis(store.equity_curve(limit=2000))
         return jsonify(build_realized_vs_unrealized(
             trades, curve, starting_value=INITIAL_CASH))
     except Exception as e:
@@ -13780,7 +13847,7 @@ def risk_adjusted_returns_api():
     try:
         from .analytics.risk_adjusted_returns import build_risk_adjusted_returns
         store = get_store()
-        eq = store.equity_curve(limit=2000)
+        eq = _deposit_adjusted_equity_values(store.equity_curve(limit=2000))
         return jsonify(build_risk_adjusted_returns(eq))
     except Exception as e:
         return jsonify({"error": str(e)}), 500

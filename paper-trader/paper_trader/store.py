@@ -77,6 +77,85 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def external_cash_flow(prev: dict | None, cur: dict | None) -> float:
+    """Infer operator deposits/withdrawals from adjacent equity rows.
+
+    The live book currently has no explicit cash-flow ledger. A manual deposit
+    moves account equity and cash by the same amount; normal trades move cash
+    without a matching total-value jump, and marks move total_value without
+    cash. This is intentionally conservative so routine mark/trade noise does
+    not become capital basis.
+    """
+    if prev is None or cur is None:
+        return 0.0
+    try:
+        total_delta = (
+            float(cur.get("total_value") or 0.0)
+            - float(prev.get("total_value") or 0.0)
+        )
+        cash_delta = (
+            float(cur.get("cash") or 0.0)
+            - float(prev.get("cash") or 0.0)
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    tolerance = max(1.0, abs(total_delta) * 0.005)
+    if abs(total_delta) >= 100.0 and abs(total_delta - cash_delta) <= tolerance:
+        return total_delta
+    return 0.0
+
+
+def equity_curve_with_capital_basis(equity: list[dict],
+                                    initial_cash: float = INITIAL_CASH
+                                    ) -> list[dict]:
+    """Annotate equity rows with deposit-adjusted P/L fields."""
+    rows: list[dict] = []
+    cumulative_flow = 0.0
+    prev: dict | None = None
+    for raw in equity or []:
+        row = dict(raw)
+        flow = external_cash_flow(prev, row) if prev is not None else 0.0
+        cumulative_flow += flow
+        basis = max(0.01, float(initial_cash) + cumulative_flow)
+        try:
+            total_value = float(row.get("total_value") or 0.0)
+        except (TypeError, ValueError):
+            total_value = 0.0
+        pnl = total_value - basis
+        row["external_cash_flow"] = round(flow, 2)
+        row["cumulative_external_cash"] = round(cumulative_flow, 2)
+        row["capital_basis"] = round(basis, 2)
+        row["deposit_adjusted_pnl"] = round(pnl, 2)
+        row["deposit_adjusted_return_pct"] = round(pnl / basis * 100.0, 4)
+        rows.append(row)
+        prev = row
+    return rows
+
+
+def capital_basis_snapshot(equity: list[dict],
+                           total_value: float | None,
+                           initial_cash: float = INITIAL_CASH) -> dict:
+    rows = equity_curve_with_capital_basis(equity, initial_cash)
+    if rows:
+        last = rows[-1]
+        basis = float(last.get("capital_basis") or initial_cash)
+        net_deposits = float(last.get("cumulative_external_cash") or 0.0)
+    else:
+        basis = float(initial_cash)
+        net_deposits = 0.0
+    pnl = None
+    pct = None
+    if total_value is not None and basis > 0:
+        pnl = round(float(total_value) - basis, 2)
+        pct = round((float(total_value) - basis) / basis * 100.0, 2)
+    return {
+        "capital_basis": round(basis, 2),
+        "net_external_cash_flow": round(net_deposits, 2),
+        "deposit_adjusted_pnl": pnl,
+        "deposit_adjusted_return_pct": pct,
+    }
+
+
 def _hold_duration(opened_at: str | None, closed_at: str | None
                    ) -> tuple[int | None, float | None]:
     """Parse an opened_at / closed_at pair into ``(hold_seconds, hold_days)``.
