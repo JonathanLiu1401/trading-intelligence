@@ -2918,7 +2918,7 @@ class BacktestEngine:
                 "AND (url IS NULL OR url NOT LIKE 'backtest://%') "
                 "AND (source IS NULL OR (source NOT LIKE 'backtest_%' "
                 "AND source NOT LIKE 'opus_annotation%'))"
-            ).fetchall()
+            )
             # Hindsight label filter: an article whose `first_seen` lags
             # `published` by more than this many days was almost certainly
             # collected retroactively (e.g. by backfill_news.py / GDELT) and
@@ -2926,6 +2926,8 @@ class BacktestEngine:
             # publication. Trusting that `ai_score` for a historical backtest
             # is silent lookahead — fall back to the keyword baseline instead.
             LABEL_STALENESS_DAYS = 60
+            win_start = self.start - timedelta(days=30)
+            win_end = self.end + timedelta(days=30)
             from email.utils import parsedate_to_datetime as _parse_822
 
             def _parse_day(raw):
@@ -2942,10 +2944,14 @@ class BacktestEngine:
                 except Exception:
                     return None
 
+            scanned = 0
             for (title, url, source, published, first_seen, ai_score,
                  kw_score, full_text, urgency) in rows:
+                scanned += 1
                 pub_d = _parse_day(published)
                 if pub_d is None:
+                    continue
+                if pub_d < win_start or pub_d > win_end:
                     continue
                 day_str = pub_d.isoformat()
                 # Decode full text for richer scoring
@@ -3005,8 +3011,7 @@ class BacktestEngine:
                     "urgency": urg_v,
                     "hindsight_contaminated": hindsight_contaminated,
                 })
-            print(f"[local_news] loaded {sum(len(v) for v in result.values())} articles "
-                  f"across {len(result)} days from local DB")
+            print(f"[local_news] scanned {scanned} rows, loaded {sum(len(v) for v in result.values())} articles across {len(result)} days from local DB")
         except FileNotFoundError:
             # Expected for pre-2015 backtest windows that pre-date the digital-intern
             # articles DB — SEC merge below still runs.
