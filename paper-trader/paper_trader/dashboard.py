@@ -88,6 +88,21 @@ th, td, .stat .num, .stat .lbl, .stat .v, .stat .l,
   background: #141820 !important;
   border-bottom: 1px solid var(--border) !important;
   padding: 0 24px !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  scrollbar-width: none;
+}
+.topbar-nav, .topnav-links {
+  min-width: 0 !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  scrollbar-width: none;
+}
+.topbar::-webkit-scrollbar,
+.topbar-nav::-webkit-scrollbar,
+.topnav::-webkit-scrollbar,
+.topnav-links::-webkit-scrollbar {
+  display: none;
 }
 .brand {
   color: var(--text) !important;
@@ -101,6 +116,8 @@ th, td, .stat .num, .stat .lbl, .stat .v, .stat .l,
   padding: 15px 12px 14px !important;
   border-radius: 0 !important;
   border-bottom: 3px solid transparent !important;
+  flex: 0 0 auto !important;
+  white-space: nowrap !important;
 }
 .topbar a:hover, .topnav a:hover {
   color: #fff !important;
@@ -182,6 +199,17 @@ button:hover, .btn:hover, .bt-filter-chip:hover, .bt-btn:hover, .compute-mini-bt
 }
 .empty, .muted {
   color: var(--text-muted) !important;
+}
+@media (max-width: 768px) {
+  .topbar-nav, .topnav-links {
+    display: none !important;
+  }
+  .nav-hamburger {
+    display: flex !important;
+  }
+  .topbar, .topnav {
+    padding: 0 16px !important;
+  }
 }
 @media (max-width: 480px) {
   body { font-size: 15px !important; }
@@ -2125,7 +2153,11 @@ TEMPLATE = r"""
       <a href="/trader/" class="{% if initial_tab != 'backtests' %}active{% endif %}">Paper Trader</a>
       <a href="/trader/backtests" class="{% if initial_tab == 'backtests' %}active{% endif %}">Backtests</a>
       <a href="/backtests/compare">Compare</a>
+      <a href="/strategy-lab">Strategy Lab</a>
       <a href="/journal">Journal</a>
+      <a href="/personas">Personas</a>
+      <a href="/tape">Tape</a>
+      <a href="/pulse">News Pulse</a>
       <a href="/ops/">Ops View</a>
       <a href="/intern/chat">Chat</a>
       <a href="/system/">System</a>
@@ -2152,7 +2184,11 @@ TEMPLATE = r"""
     <a href="/trader/" class="{% if initial_tab != 'backtests' %}active{% endif %}">Paper Trader</a>
     <a href="/trader/backtests" class="{% if initial_tab == 'backtests' %}active{% endif %}">Backtests</a>
     <a href="/backtests/compare">Compare</a>
+    <a href="/strategy-lab">Strategy Lab</a>
     <a href="/journal">Journal</a>
+    <a href="/personas">Personas</a>
+    <a href="/tape">Tape</a>
+    <a href="/pulse">News Pulse</a>
     <a href="/ops/">Ops View</a>
     <a href="/intern/chat">Chat</a>
     <a href="/system/">System</a>
