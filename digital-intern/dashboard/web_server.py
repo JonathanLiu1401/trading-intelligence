@@ -10674,6 +10674,19 @@ _DASHBOARD_HTML = """<!doctype html>
       background: #141820 !important;
       border-bottom: 1px solid var(--border) !important;
       padding: 0 24px !important;
+      overflow-x: auto !important;
+      overflow-y: hidden !important;
+      scrollbar-width: none;
+    }
+    .topbar-nav {
+      min-width: 0 !important;
+      overflow-x: auto !important;
+      overflow-y: hidden !important;
+      scrollbar-width: none;
+    }
+    .topbar::-webkit-scrollbar,
+    .topbar-nav::-webkit-scrollbar {
+      display: none;
     }
     .brand {
       color: var(--text) !important;
@@ -10687,6 +10700,8 @@ _DASHBOARD_HTML = """<!doctype html>
       padding: 15px 12px 14px !important;
       border-radius: 0 !important;
       border-bottom: 3px solid transparent !important;
+      flex: 0 0 auto !important;
+      white-space: nowrap !important;
     }
     .topbar a:hover {
       color: #fff !important;
@@ -10771,7 +10786,11 @@ _DASHBOARD_HTML = """<!doctype html>
     <a href="/trader/">Paper Trader</a>
     <a href="/trader/backtests">Backtests</a>
     <a href="/backtests/compare">Compare</a>
+    <a href="/strategy-lab">Strategy Lab</a>
     <a href="/journal">Journal</a>
+    <a href="/personas">Personas</a>
+    <a href="/tape">Tape</a>
+    <a href="/pulse">News Pulse</a>
     <a href="/ops/">Ops View</a>
     <a href="/intern/chat">Chat</a>
     <a href="/system/">System</a>
@@ -10787,7 +10806,11 @@ _DASHBOARD_HTML = """<!doctype html>
   <a href="/trader/">Paper Trader</a>
   <a href="/trader/backtests">Backtests</a>
   <a href="/backtests/compare">Compare</a>
+  <a href="/strategy-lab">Strategy Lab</a>
   <a href="/journal">Journal</a>
+  <a href="/personas">Personas</a>
+  <a href="/tape">Tape</a>
+  <a href="/pulse">News Pulse</a>
   <a href="/ops/">Ops View</a>
   <a href="/intern/chat">Chat</a>
   <a href="/system/">System</a>
@@ -11680,6 +11703,19 @@ _CHAT_HTML = """<!doctype html>
       min-height: 56px !important;
       background: #15181b !important;
       border-bottom-color: var(--border) !important;
+      overflow-x: auto !important;
+      overflow-y: hidden !important;
+      scrollbar-width: none;
+    }
+    .topbar-nav {
+      min-width: 0 !important;
+      overflow-x: auto !important;
+      overflow-y: hidden !important;
+      scrollbar-width: none;
+    }
+    .topbar::-webkit-scrollbar,
+    .topbar-nav::-webkit-scrollbar {
+      display: none;
     }
     .topbar a,
     .nav-drawer a,
@@ -11687,6 +11723,8 @@ _CHAT_HTML = """<!doctype html>
       font-size: 15px !important;
       color: var(--text-secondary) !important;
       border-radius: 6px !important;
+      flex: 0 0 auto !important;
+      white-space: nowrap !important;
     }
     .topbar a.active,
     .topbar a:hover,
@@ -11823,7 +11861,11 @@ _CHAT_HTML = """<!doctype html>
     <a href="/trader/">Paper Trader</a>
     <a href="/trader/backtests">Backtests</a>
     <a href="/backtests/compare">Compare</a>
+    <a href="/strategy-lab">Strategy Lab</a>
     <a href="/journal">Journal</a>
+    <a href="/personas">Personas</a>
+    <a href="/tape">Tape</a>
+    <a href="/pulse">News Pulse</a>
     <a href="/ops/">Ops View</a>
     <a href="/intern/chat" class="active">Chat</a>
     <a href="/system/">System</a>
@@ -11839,7 +11881,11 @@ _CHAT_HTML = """<!doctype html>
   <a href="/trader/">Paper Trader</a>
   <a href="/trader/backtests">Backtests</a>
   <a href="/backtests/compare">Compare</a>
+  <a href="/strategy-lab">Strategy Lab</a>
   <a href="/journal">Journal</a>
+  <a href="/personas">Personas</a>
+  <a href="/tape">Tape</a>
+  <a href="/pulse">News Pulse</a>
   <a href="/ops/">Ops View</a>
   <a href="/intern/chat" class="active">Chat</a>
   <a href="/system/">System</a>
