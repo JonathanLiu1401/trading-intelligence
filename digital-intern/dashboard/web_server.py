@@ -157,12 +157,11 @@ def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
         rows = _ro_query(
             "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
             "FROM articles "
-            "WHERE (CASE WHEN ai_score>kw_score THEN ai_score ELSE kw_score END) >= ? "
-            "AND url NOT LIKE 'backtest://%' "
-            "AND source NOT LIKE 'backtest_%' "
-            "AND source NOT LIKE 'opus_annotation%' "
-            "ORDER BY ai_score DESC, kw_score DESC, first_seen DESC LIMIT ?",
-            (min_score, max(1, min(500, int(limit)))),
+            "WHERE first_seen >= datetime('now','-30 days') "
+            "AND (ai_score >= ? OR kw_score >= ?) "
+            f"AND {_LIVE_ONLY_SQL} "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (min_score, min_score, max(1, min(500, int(limit)))),
         )
     except sqlite3.Error:
         return []
@@ -5880,8 +5879,80 @@ def create_app(store=None) -> Flask:
             return jsonify({"error": "unauthorized"}), 401
         snap = _read_json(BASE_DIR / "data" / "portfolio_pl.json")
         if snap is None:
-            return jsonify({"error": "no snapshot yet"}), 503
+            # The local ArticleNet launch intentionally does not start the
+            # heavier portfolio worker. Keep the dashboard usable by adapting
+            # the live Paper Trader portfolio surface to the shape this panel
+            # expects instead of returning a hard 503 forever.
+            trader = _read_paper_trader_portfolio()
+            if trader is not None:
+                return jsonify(_portfolio_panel_snapshot_from_trader(trader))
+            return jsonify(_empty_portfolio_panel_snapshot("no snapshot yet"))
         return jsonify(snap)
+
+    def _read_paper_trader_portfolio() -> dict | None:
+        import json as _json
+        import urllib.request as _urllib
+        try:
+            with _urllib.urlopen("http://127.0.0.1:8090/api/portfolio", timeout=2.5) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _float_or_none(value) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _portfolio_panel_snapshot_from_trader(trader: dict) -> dict:
+        total_value = _float_or_none(trader.get("total_value"))
+        basis = _float_or_none(trader.get("capital_basis"))
+        if basis is None:
+            basis = _float_or_none(trader.get("starting_value"))
+        pnl = _float_or_none(trader.get("deposit_adjusted_pnl"))
+        if pnl is None:
+            pnl = _float_or_none(trader.get("pnl_vs_initial"))
+        if pnl is None and total_value is not None and basis is not None:
+            pnl = total_value - basis
+        pnl_pct = _float_or_none(trader.get("deposit_adjusted_return_pct"))
+        if pnl_pct is None:
+            pnl_pct = _float_or_none(trader.get("pnl_vs_initial_pct"))
+        if pnl_pct is None and pnl is not None and basis:
+            pnl_pct = (pnl / basis) * 100.0
+        positions = trader.get("positions") if isinstance(trader.get("positions"), list) else []
+        options = trader.get("options") if isinstance(trader.get("options"), list) else []
+        return {
+            "as_of": trader.get("last_updated"),
+            "source": "paper_trader_fallback",
+            "summary": {
+                "grand_value": total_value,
+                "total_value": total_value,
+                "grand_pnl": pnl,
+                "total_pnl": pnl,
+                "grand_pnl_pct": pnl_pct,
+                "total_pnl_pct": pnl_pct,
+            },
+            "positions": positions,
+            "options": options,
+        }
+
+    def _empty_portfolio_panel_snapshot(error: str) -> dict:
+        return {
+            "as_of": None,
+            "source": "empty",
+            "error": error,
+            "summary": {
+                "grand_value": 0.0,
+                "total_value": 0.0,
+                "grand_pnl": 0.0,
+                "total_pnl": 0.0,
+                "grand_pnl_pct": 0.0,
+                "total_pnl_pct": 0.0,
+            },
+            "positions": [],
+            "options": [],
+        }
 
     CONFIG_PATH = BASE_DIR / "config" / "portfolio.json"
 

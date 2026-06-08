@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Trading Stack - Section</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--panel2:#20242d;--hover:#252a34;--border:#303642;--strong:#465063;--text:#eef2f7;--muted:#9aa3b2;--green:#4ade80;--yellow:#facc15;--red:#fb7185;--cyan:#38bdf8;--font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.45 var(--font)}a{color:inherit;text-decoration:none}
+.topbar{height:48px;display:flex;align-items:center;gap:2px;padding:0 20px;background:var(--panel);border-bottom:1px solid var(--border);overflow-x:auto;position:sticky;top:0;z-index:20}.brand{color:var(--yellow);font-weight:700;font-size:13px;margin-right:14px;white-space:nowrap}.topbar a{color:var(--muted);padding:6px 11px;border-radius:6px;white-space:nowrap}.topbar a:hover{color:var(--text);background:var(--hover)}.topbar a.active{color:var(--yellow);background:rgba(250,204,21,.12)}
+main{max-width:1480px;margin:0 auto;padding:18px 20px 28px}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}h1{font-size:22px;line-height:1.1;margin:0 0 4px;font-weight:700}.sub{color:var(--muted);max-width:720px}.stamp{color:var(--muted);font-family:var(--mono);font-size:12px;margin-top:6px}.actions{display:flex;gap:8px;flex-wrap:wrap}.cmd-btn,button.cmd-btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:7px 12px;border:1px solid var(--strong);background:var(--panel2);color:var(--text);border-radius:6px;font:600 13px/1 var(--font);cursor:pointer}.cmd-btn:hover,button.cmd-btn:hover{background:var(--hover);border-color:var(--cyan)}.cmd-btn.primary{color:#071018;background:var(--cyan);border-color:var(--cyan)}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px}.card{grid-column:span 6;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0}.card.wide{grid-column:span 12}.title{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}.title h2{margin:0;font-size:13px;font-weight:700}.badge{display:inline-flex;align-items:center;min-height:22px;padding:3px 8px;border:1px solid var(--strong);border-radius:99px;font:700 11px/1 var(--mono);color:var(--muted);white-space:nowrap}.badge.ok{color:var(--green);border-color:rgba(74,222,128,.45);background:rgba(74,222,128,.10)}.badge.warn{color:var(--yellow);border-color:rgba(250,204,21,.45);background:rgba(250,204,21,.10)}.badge.down{color:var(--red);border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.10)}
+.headline{font-size:16px;font-weight:700;margin:4px 0 10px;overflow-wrap:anywhere}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.metric{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:9px}.metric .k{color:var(--muted);font-size:11px;text-transform:capitalize}.metric .v{font:700 17px/1.25 var(--mono);margin-top:4px;overflow-wrap:anywhere}.table-wrap{overflow:auto;margin-top:12px;border:1px solid var(--border);border-radius:6px}.table{width:100%;border-collapse:collapse;table-layout:fixed}.table th,.table td{text-align:left;border-bottom:1px solid var(--border);padding:8px 9px;vertical-align:top;overflow-wrap:anywhere}.table th{color:var(--muted);font-size:11px;font-weight:600;text-transform:capitalize}.table tr:last-child td{border-bottom:0}.empty{color:var(--muted);font-family:var(--mono);font-size:12px;margin-top:10px;padding:10px;background:var(--panel2);border:1px solid var(--border);border-radius:6px}.loading{color:var(--muted);font-family:var(--mono)}
+@media(max-width:980px){main{padding:14px 12px 22px}.head{flex-direction:column}.card,.card.wide{grid-column:span 12}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+<nav class="topbar">
+  <span class="brand">TRADING STACK</span>
+  <a href="/" data-path="/">Command Center</a>
+  <a href="/intern/" data-path="/intern/">Digital Intern</a>
+  <a href="/trader/" data-path="/trader/">Paper Trader</a>
+  <a href="/trader/backtests" data-path="/trader/backtests">Backtests</a>
+  <a href="/backtests/compare" data-path="/backtests/compare">Compare</a>
+  <a href="/strategy-lab" data-path="/strategy-lab">Strategy Lab</a>
+  <a href="/journal" data-path="/journal">Journal</a>
+  <a href="/personas" data-path="/personas">Personas</a>
+  <a href="/tape" data-path="/tape">Tape</a>
+  <a href="/pulse" data-path="/pulse">News Pulse</a>
+  <a href="/ops/" data-path="/ops/">Ops View</a>
+  <a href="/intern/chat" data-path="/intern/chat">Chat</a>
+  <a href="/system/" data-path="/system/">System</a>
+</nav>
+<main>
+  <div class="head">
+    <div>
+      <h1 id="title">Loading</h1>
+      <div class="sub" id="description"></div>
+      <div class="stamp" id="asOf">loading</div>
+    </div>
+    <div class="actions">
+      <button class="cmd-btn primary" id="refreshBtn" type="button">Refresh</button>
+      <a class="cmd-btn" href="/trader/">Trader</a>
+      <a class="cmd-btn" href="/trader/backtests">Backtests</a>
+      <a class="cmd-btn" href="/intern/">Intern</a>
+      <a class="cmd-btn" href="/ops/">Ops</a>
+    </div>
+  </div>
+  <section class="grid" id="cards"><div class="loading">Loading section data...</div></section>
+</main>
+<script>
+const pathToSection={
+  "/backtests":"compare",
+  "/backtests/compare":"compare",
+  "/strategy-lab":"strategy",
+  "/journal":"journal",
+  "/personas":"personas",
+  "/tape":"tape",
+  "/pulse":"pulse"
+};
+const $=id=>document.getElementById(id);
+function sectionKey(){return pathToSection[window.location.pathname]||"compare"}
+function esc(v){return String(v==null?"--":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
+function badgeClass(s){return s==="down"?"down":s==="warn"?"warn":"ok"}
+function cell(v){
+  if(v==null||v==="")return "--";
+  if(typeof v==="object")return esc(JSON.stringify(v).slice(0,220));
+  const t=String(v);
+  return esc(t.length>260?t.slice(0,257)+"...":t);
+}
+function renderCard(card,i){
+  const metrics=(card.metrics||[]).map(m=>`<div class="metric"><div class="k">${esc(m.label)}</div><div class="v">${esc(m.value)}</div></div>`).join("");
+  const rows=card.rows||[], cols=card.columns||[];
+  let table="";
+  if(rows.length&&cols.length){
+    table=`<div class="table-wrap"><table class="table"><thead><tr>${cols.map(c=>`<th>${esc(c.replaceAll("_"," "))}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${cell(r[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  }else{
+    table=`<div class="empty">No row table for this slice. Status and headline are shown above.</div>`;
+  }
+  return `<article class="card ${i===0?"wide":""}"><div class="title"><h2>${esc(card.title)}</h2><span class="badge ${badgeClass(card.status)}">${esc(card.state||card.status)}</span></div><div class="headline">${esc(card.headline)}</div>${metrics?`<div class="metrics">${metrics}</div>`:""}${table}</article>`;
+}
+async function load(){
+  const section=sectionKey();
+  document.querySelectorAll(".topbar a").forEach(a=>{
+    if(a.dataset.path===window.location.pathname)a.classList.add("active");else a.classList.remove("active");
+  });
+  $("cards").innerHTML='<div class="loading">Loading section data...</div>';
+  const r=await fetch(`/api/sections/${section}?ts=${Date.now()}`);
+  const d=await r.json();
+  if(!r.ok||!d.ok)throw new Error(d.description||d.error||`HTTP ${r.status}`);
+  document.title=`Trading Stack - ${d.title}`;
+  $("title").textContent=d.title;
+  $("description").textContent=d.description||"";
+  $("asOf").textContent=`as of ${d.as_of||"--"}`;
+  $("cards").innerHTML=(d.cards||[]).map(renderCard).join("");
+}
+$("refreshBtn").addEventListener("click",()=>load().catch(showError));
+function showError(e){$("cards").innerHTML=`<article class="card wide"><div class="title"><h2>Load Failed</h2><span class="badge down">down</span></div><div class="headline">${esc(e.message)}</div></article>`}
+load().catch(showError);
+</script>
+</body>
+</html>

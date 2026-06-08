@@ -348,10 +348,19 @@ CATALYST_CYCLE_INTERVAL = 120     # AI catalyst/profit-taking cycle monitor ever
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
 WEB_SERVER_PORT     = int(os.environ.get("WEB_SERVER_PORT", "8080"))
 WEB_SERVER_HOST     = os.environ.get("WEB_SERVER_HOST", "0.0.0.0")
-EMBEDDED_WEB_SERVER_ENABLED = (
-    os.environ.get("DIGITAL_INTERN_EMBEDDED_WEB", "1").strip().lower()
-    not in {"0", "false", "no", "off"}
-)
+
+
+def _env_enabled(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off"}
+
+
+EMBEDDED_WEB_SERVER_ENABLED = _env_enabled("DIGITAL_INTERN_EMBEDDED_WEB", "1")
+CONTINUOUS_TRAINER_ENABLED = _env_enabled("DIGITAL_INTERN_CONTINUOUS_TRAINER", "1")
+DIGITAL_INTERN_WORKERS = {
+    name.strip()
+    for name in os.environ.get("DIGITAL_INTERN_WORKERS", "").split(",")
+    if name.strip()
+}
 
 # Active portfolio + watchlist tickers used for price alerts and relevance boosts.
 # Keep in sync with config/portfolio.json (positions + sector_watchlist).
@@ -5505,7 +5514,6 @@ def main():
         ("purge",       purge_worker),
         ("stats",       stats_worker),
         ("ml_trainer",  ml_trainer_worker),
-        ("continuous_trainer", continuous_trainer_worker),
         ("recursive_labeler", recursive_labeler_worker),
         ("price_alert", price_alert_worker),
         ("portfolio_pl",    portfolio_pl_worker),
@@ -5513,10 +5521,24 @@ def main():
         ("catalyst_cycle", catalyst_cycle_worker),
         ("export",      export_worker),
     ]
+    if CONTINUOUS_TRAINER_ENABLED:
+        workers.append(("continuous_trainer", continuous_trainer_worker))
+    else:
+        log.info("[daemon] continuous_trainer disabled; ArticleNet ml_trainer remains enabled")
     if EMBEDDED_WEB_SERVER_ENABLED:
         workers.append(("web_server", web_server_worker))
     else:
         log.info("[daemon] Embedded web_server disabled; standalone dashboard owns port 8080")
+
+    if DIGITAL_INTERN_WORKERS:
+        known_workers = {name for name, _fn in workers}
+        unknown_workers = sorted(DIGITAL_INTERN_WORKERS - known_workers)
+        if unknown_workers:
+            log.warning(f"[daemon] unknown DIGITAL_INTERN_WORKERS ignored: {unknown_workers}")
+        workers = [(name, fn) for name, fn in workers if name in DIGITAL_INTERN_WORKERS]
+        if not workers:
+            raise RuntimeError("DIGITAL_INTERN_WORKERS did not match any daemon workers")
+        log.info(f"[daemon] worker allowlist active: {[name for name, _fn in workers]}")
 
     # Map name → fn for lookup during respawn
     worker_map = {name: fn for name, fn in workers}

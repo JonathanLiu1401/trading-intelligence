@@ -18051,7 +18051,8 @@ def run(host: str = "0.0.0.0", port: int = 8090):
     # restart serves real data instead of a cold-stall + {"warming": true}.
     # Guarded by _swr_active(): inert under pytest (no 16 background builds
     # during the test suite). Daemon thread — does not block app.run().
-    if _swr_active():
+    prewarm_enabled = _os.environ.get("PAPER_TRADER_DASHBOARD_PREWARM", "1").strip().lower()
+    if _swr_active() and prewarm_enabled not in {"0", "false", "no", "off"}:
         _threading.Thread(target=_swr_prewarm, name="dash-swr-prewarm",
                            daemon=True).start()
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
