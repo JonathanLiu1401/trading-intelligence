@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jonathan.trading-intelligence.paper-trader</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/nice</string>
+    <string>-n</string>
+    <string>10</string>
+    <string>/Users/jonathan/trading-intelligence/.venv/bin/python</string>
+    <string>runner.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jonathan/trading-intelligence/paper-trader</string>
+
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>.</string>
+    <key>PAPER_TRADER_DASHBOARD_PREWARM</key>
+    <string>0</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jonathan/trading-intelligence/logs/paper-trader.launchd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/jonathan/trading-intelligence/logs/paper-trader.launchd.err.log</string>
+</dict>
+</plist>
