@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jonathan.trading-intelligence.digital-intern</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/nice</string>
+    <string>-n</string>
+    <string>15</string>
+    <string>/Users/jonathan/trading-intelligence/.venv/bin/python</string>
+    <string>-c</string>
+    <string>from dashboard.web_server import run_server; run_server(None, host='127.0.0.1', port=8080)</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jonathan/trading-intelligence/digital-intern</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DIGITAL_INTERN_CONTINUOUS_TRAINER</key>
+    <string>0</string>
+    <key>DIGITAL_INTERN_WORKERS</key>
+    <string>web_server</string>
+    <key>DIGITAL_INTERN_EMBEDDED_WEB</key>
+    <string>1</string>
+    <key>DIGITAL_INTERN_LLM_MODEL</key>
+    <string>gpt-5.5</string>
+    <key>DIGITAL_INTERN_CHAT_LLM_TIMEOUT</key>
+    <string>45</string>
+    <key>DIGITAL_INTERN_CODEX_REASONING_EFFORT</key>
+    <string>xhigh</string>
+    <key>PYTHONPATH</key>
+    <string>.</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jonathan/trading-intelligence/logs/digital-intern.launchd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/jonathan/trading-intelligence/logs/digital-intern.launchd.err.log</string>
+</dict>
+</plist>

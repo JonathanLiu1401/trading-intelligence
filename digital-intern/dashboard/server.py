@@ -24,7 +24,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -864,19 +864,47 @@ def _command_center_payload() -> dict[str, Any]:
 async def command_center():
     if not COMMAND_CENTER_HTML.exists():
         return JSONResponse({"error": "command_center.html missing"}, status_code=500)
-    return FileResponse(str(COMMAND_CENTER_HTML), media_type="text/html")
+    return HTMLResponse(COMMAND_CENTER_HTML.read_text(encoding="utf-8"))
 
 
 async def ops_index():
     if not DASHBOARD_HTML.exists():
         return JSONResponse({"error": "dashboard.html missing"}, status_code=500)
-    return FileResponse(str(DASHBOARD_HTML), media_type="text/html")
+    return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
 async def section_index():
     if not SECTION_PAGE_HTML.exists():
         return JSONResponse({"error": "section_page.html missing"}, status_code=500)
-    return FileResponse(str(SECTION_PAGE_HTML), media_type="text/html")
+    return HTMLResponse(SECTION_PAGE_HTML.read_text(encoding="utf-8"))
+
+
+def _fetch_upstream(
+    url: str,
+    method: str,
+    body: bytes,
+    headers: dict[str, str],
+    timeout: float,
+) -> tuple[bytes, int, str]:
+    req = urllib.request.Request(
+        url,
+        data=body if body else None,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as upstream:
+            return (
+                upstream.read(),
+                upstream.status,
+                upstream.headers.get("Content-Type", "application/octet-stream"),
+            )
+    except urllib.error.HTTPError as e:
+        return (
+            e.read(),
+            e.code,
+            e.headers.get("Content-Type", "text/plain"),
+        )
 
 
 async def _proxy_http(
@@ -900,21 +928,15 @@ async def _proxy_http(
             headers[key] = value
     if forwarded_prefix:
         headers["X-Forwarded-Prefix"] = forwarded_prefix
-    req = urllib.request.Request(
-        url,
-        data=body if body else None,
-        headers=headers,
-        method=request.method,
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as upstream:
-            payload = upstream.read()
-            status = upstream.status
-            content_type = upstream.headers.get("Content-Type", "application/octet-stream")
-    except urllib.error.HTTPError as e:
-        payload = e.read()
-        status = e.code
-        content_type = e.headers.get("Content-Type", "text/plain")
+        payload, status, content_type = await asyncio.to_thread(
+            _fetch_upstream,
+            url,
+            request.method,
+            body,
+            headers,
+            timeout,
+        )
     except Exception as e:
         return JSONResponse(
             {"ok": False, "error": f"proxy to {port}{upstream_path} failed: {e}"},
@@ -1074,51 +1096,51 @@ async def api_section(section: str):
         "news-pulse": "pulse",
     }
     key = aliases.get(section, section)
-    payload = _section_payload(key)
+    payload = await asyncio.to_thread(_section_payload, key)
     return JSONResponse(payload, status_code=200 if payload.get("ok") else 404)
 
 
 @app.get("/api/stats")
 @app.get("/ops/api/stats")
 async def api_stats():
-    return JSONResponse(_stats_payload())
+    return JSONResponse(await asyncio.to_thread(_stats_payload))
 
 
 @app.get("/api/articles")
 @app.get("/ops/api/articles")
 async def api_articles(limit: int = 50, min_score: float = 0.0):
-    return JSONResponse(_articles_payload(limit, min_score))
+    return JSONResponse(await asyncio.to_thread(_articles_payload, limit, min_score))
 
 
 @app.get("/api/metrics")
 @app.get("/ops/api/metrics")
 async def api_metrics():
-    return JSONResponse(_tail_jsonl(METRICS_LOG, 200))
+    return JSONResponse(await asyncio.to_thread(_tail_jsonl, METRICS_LOG, 200))
 
 
 @app.get("/api/logs")
 @app.get("/ops/api/logs")
 async def api_logs(n: int = 50):
-    return JSONResponse(_tail_jsonl(STRUCTURED_LOG, max(1, min(2000, n))))
+    return JSONResponse(await asyncio.to_thread(_tail_jsonl, STRUCTURED_LOG, max(1, min(2000, n))))
 
 
 @app.get("/api/health")
 @app.get("/ops/api/health")
 async def api_health():
-    workers = _worker_health()
+    workers = await asyncio.to_thread(_worker_health)
     return JSONResponse({
         "service": _service_info(),
         "workers": workers,
         "core_status": _core_workers_status(workers),
-        "errors": _recent_errors(),
-        "last": _last_heartbeat_and_alert(),
+        "errors": await asyncio.to_thread(_recent_errors),
+        "last": await asyncio.to_thread(_last_heartbeat_and_alert),
     })
 
 
 @app.get("/api/articles_per_hour")
 @app.get("/ops/api/articles_per_hour")
 async def api_articles_per_hour():
-    return JSONResponse(_articles_per_hour_24h())
+    return JSONResponse(await asyncio.to_thread(_articles_per_hour_24h))
 
 
 @app.post("/api/restart")

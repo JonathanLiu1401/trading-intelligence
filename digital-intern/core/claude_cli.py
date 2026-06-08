@@ -28,6 +28,10 @@ import time
 from pathlib import Path
 
 DEFAULT_LLM_MODEL = os.environ.get("DIGITAL_INTERN_LLM_MODEL", "gpt-5.5")
+CODEX_REASONING_EFFORT = os.environ.get(
+    "DIGITAL_INTERN_CODEX_REASONING_EFFORT",
+    "xhigh",
+)
 
 # Substrings (matched case-insensitively against the CLI's failure text) that
 # mean "spawning again right now is pointless". Kept to the small set actually
@@ -41,6 +45,20 @@ _QUOTA_MARKERS = (
 QUOTA_COOLDOWN_S = 3600  # how long to short-circuit after a quota error
 
 _quota_blocked_until: float = 0.0
+
+
+def _resolve_cli(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for path in (
+        f"/usr/local/bin/{name}",
+        f"/opt/homebrew/bin/{name}",
+        f"/usr/bin/{name}",
+    ):
+        if Path(path).exists():
+            return path
+    return None
 
 
 def _is_quota_error(text: str) -> bool:
@@ -72,7 +90,8 @@ def claude_call(
 
     use_codex = model.startswith("gpt-")
     cli = "codex" if use_codex else "claude"
-    if not shutil.which(cli):
+    cli_path = _resolve_cli(cli)
+    if not cli_path:
         return None
 
     # Breaker open: a quota error was seen recently. Don't spawn — every caller
@@ -84,16 +103,16 @@ def claude_call(
 
     try:
         cmd = ([
-            "codex", "exec",
+            cli_path, "exec",
             "--model", model,
-            "-c", 'model_reasoning_effort="none"',
+            "-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
             "--sandbox", "read-only",
             "--cd", str(Path.cwd()),
             "--ephemeral",
             "--color", "never",
             prompt,
         ] if use_codex else [
-            "claude", "--model", model, "--print",
+            cli_path, "--model", model, "--print",
             "--permission-mode", "bypassPermissions",
         ])
         env = os.environ.copy()

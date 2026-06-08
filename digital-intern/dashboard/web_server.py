@@ -5676,7 +5676,7 @@ _CHAT_SUGGESTIONS_FILLERS = [
 _CHAT_LLM_FALLBACK_MODELS = ("gpt-5.5", "claude-sonnet-4-6")
 _CHAT_LLM_TIMEOUT_S = max(
     2,
-    int(os.environ.get("DIGITAL_INTERN_CHAT_LLM_TIMEOUT", "4")),
+    int(os.environ.get("DIGITAL_INTERN_CHAT_LLM_TIMEOUT", "45")),
 )
 _CHAT_DEEP_KEYWORDS = (
     "paper trader",

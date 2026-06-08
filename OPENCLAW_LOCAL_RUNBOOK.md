@@ -104,11 +104,18 @@ Mac-safe launchd steady state after recovery:
 com.jonathan.trading-intelligence.unified-dashboard
   127.0.0.1:8765
   uvicorn dashboard.server:app
+  installed LaunchAgent calls launchd/run_unified_dashboard.sh
+  do not set ProcessType=Background; it throttled Python import I/O and made
+  the dashboard appear unbound/dead on 2026-06-08
 
 com.jonathan.trading-intelligence.digital-intern
   127.0.0.1:8080
   dashboard.web_server.run_server(None)
   standalone ArticleNet web/API only; does not start daemon collectors/trainers
+  chat LLM env: DIGITAL_INTERN_LLM_MODEL=gpt-5.5,
+    DIGITAL_INTERN_CODEX_REASONING_EFFORT=xhigh,
+    DIGITAL_INTERN_CHAT_LLM_TIMEOUT=45,
+    PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 com.jonathan.trading-intelligence.paper-trader
   127.0.0.1:8090
@@ -158,23 +165,68 @@ Chrome. Main routes rendered without application errors:
 /ops/, /system/, /strategy-lab, /journal, /personas, /tape, /pulse
 ```
 
-Tailscale state on 2026-06-08:
+Focused Playwright verification on 2026-06-08 also passed through the active
+Tailscale URL:
 
 ```text
-/Applications/Tailscale.app/Contents/MacOS/Tailscale status -> Logged out.
-/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 -> NeedsLogin
-/Applications/Tailscale.app/Contents/MacOS/Tailscale serve status -> No serve config
+http://your-macbook-5.tailaa3a85.ts.net:8765/
+Command Center total: 2,354,661 articles
+Chat UI: returned "The trading chat LLM is online." from gpt-5.5
 ```
 
-`tailscale up --timeout=10s` produced a browser login URL and timed out waiting
-for auth. Do not repeatedly force login/logout; that risks creating more
-tailnet devices. Once Jonathan authenticates this Mac in the Tailscale app or
-with the CLI URL, verify:
+The chat page is served by Digital Intern on `8080`, proxied through the
+unified dashboard under `/intern/chat`. If it returns
+`LLM backends are unavailable`, check these first:
+
+```bash
+launchctl print "gui/$(id -u)/com.jonathan.trading-intelligence.digital-intern" | sed -n '25,70p'
+/Users/jonathan/trading-intelligence/.venv/bin/python - <<'PY'
+from pathlib import Path
+import os, sys
+sys.path.insert(0, "/Users/jonathan/trading-intelligence/digital-intern")
+from core.claude_cli import claude_call
+print(claude_call("Reply with exactly: chat online", model="gpt-5.5", timeout=45))
+PY
+```
+
+The 2026-06-08 root cause was launchd's default PATH excluding
+`/usr/local/bin`, so `shutil.which("codex")` failed inside the service even
+though terminal shells could run Codex. `core/claude_cli.py` now has an
+absolute fallback for `/usr/local/bin/codex`, and the Digital Intern plist sets
+the PATH explicitly.
+
+Tailscale state on 2026-06-08 after relogin/restart:
+
+```text
+active device: your-macbook-5
+tailnet IPv4: 100.85.188.30
+working URL: http://your-macbook-5.tailaa3a85.ts.net:8765/
+old URL: http://your-macbook-3.tailaa3a85.ts.net:8765/ is offline/stale
+```
+
+Tailscale was restarted with `Tailscale down` then `Tailscale up`, without
+logging out. Do not repeatedly force login/logout; that risks creating more
+tailnet devices. Verify the current active device before advertising a URL:
 
 ```bash
 /Applications/Tailscale.app/Contents/MacOS/Tailscale status
 /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4
-curl -I http://your-macbook-3.tailaa3a85.ts.net:8765/
+curl -m 8 -fsS http://your-macbook-5.tailaa3a85.ts.net:8765/ >/dev/null
+curl -m 15 -fsS http://your-macbook-5.tailaa3a85.ts.net:8765/api/command-center
+```
+
+The dashboard exposure is a local raw TCP tailnet proxy:
+
+```text
+com.jonathan.trading-intelligence.unified-dashboard-tailnet-proxy
+100.85.188.30:8765 -> 127.0.0.1:8765
+```
+
+If the API works but `/` hangs, check both listeners:
+
+```bash
+lsof -nP -iTCP:8765 -sTCP:LISTEN
+tail -40 /Users/jonathan/trading-intelligence/logs/unified-dashboard.launchd.err.log
 ```
 
 ## Critical Safety Constraints
@@ -1061,8 +1113,8 @@ http://127.0.0.1:8765/
 Tailnet URL:
 
 ```text
-http://your-macbook-3.tailaa3a85.ts.net:8765/
-http://100.125.75.25:8765/
+http://your-macbook-5.tailaa3a85.ts.net:8765/
+http://100.85.188.30:8765/
 ```
 
 Use the explicit `http://...:8765/` URL. As of 2026-06-07 local time,
@@ -1080,13 +1132,13 @@ Tailscale without binding the unauthenticated dashboard to the whole LAN.
 ```text
 LaunchAgent: com.jonathan.trading-intelligence.unified-dashboard
 Plist: /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.unified-dashboard.plist
-Command: /Users/jonathan/trading-intelligence/.venv/bin/python -m uvicorn dashboard.server:app --host 127.0.0.1 --port 8765
+Command: /Users/jonathan/trading-intelligence/launchd/run_unified_dashboard.sh
 
 LaunchAgent: com.jonathan.trading-intelligence.unified-dashboard-tailnet-proxy
 Plist: /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.unified-dashboard-tailnet-proxy.plist
 Script: /Users/jonathan/.openclaw/service-env/trading-unified-dashboard-tailnet-proxy.js
-Proxy: 100.125.75.25:8765 -> 127.0.0.1:8765
-Proxy: [fd7a:115c:a1e0::d93a:4b1a]:8765 -> 127.0.0.1:8765
+Proxy: 100.85.188.30:8765 -> 127.0.0.1:8765
+Proxy: [fd7a:115c:a1e0::493a:bc1f]:8765 -> 127.0.0.1:8765
 Logs:
   /Users/jonathan/trading-intelligence/logs/unified-dashboard.launchd.log
   /Users/jonathan/trading-intelligence/logs/unified-dashboard.launchd.err.log
@@ -1101,16 +1153,16 @@ launchctl print gui/$(id -u)/com.jonathan.trading-intelligence.unified-dashboard
 launchctl print gui/$(id -u)/com.jonathan.trading-intelligence.unified-dashboard-tailnet-proxy
 lsof -nP -iTCP:8765 -sTCP:LISTEN
 curl -i http://127.0.0.1:8765/ | head
-curl -i http://your-macbook-3.tailaa3a85.ts.net:8765/ | head
-curl -fsS http://your-macbook-3.tailaa3a85.ts.net:8765/api/command-center
+curl -i http://your-macbook-5.tailaa3a85.ts.net:8765/ | head
+curl -fsS http://your-macbook-5.tailaa3a85.ts.net:8765/api/command-center
 ```
 
 Expected listeners include the FastAPI dashboard on `127.0.0.1:8765` and the
-tailnet proxy on `100.125.75.25:8765`. The proxy also tries to bind the current
-Tailscale IPv6 address. On 2026-06-07 local time the socket was visible on
-`[fd7a:115c:a1e0::d93a:4b1a]:8765`, but local direct TCP to that IPv6 address
-timed out. The tested, working user-facing path is still the MagicDNS/IPv4 URL:
-`http://your-macbook-3.tailaa3a85.ts.net:8765/`.
+tailnet proxy on `100.85.188.30:8765`. The proxy also tries to bind the current
+Tailscale IPv6 address. On 2026-06-08 local time the socket was visible on
+`[fd7a:115c:a1e0::493a:bc1f]:8765`. The tested, working user-facing path is
+the MagicDNS/IPv4 URL:
+`http://your-macbook-5.tailaa3a85.ts.net:8765/`.
 
 Unified-dashboard route behavior:
 
@@ -1147,11 +1199,11 @@ shape when `digital-intern/data/portfolio_pl.json` is absent. That keeps the
 intern dashboard's P/L panel and edit controls usable without starting the
 continuous worker stack.
 
-Browser verification performed on 2026-06-07 local time with Playwright and
+Browser verification performed on 2026-06-08 local time with Playwright and
 Google Chrome against:
 
 ```text
-http://your-macbook-3.tailaa3a85.ts.net:8765/
+http://your-macbook-5.tailaa3a85.ts.net:8765/
 ```
 
 Passed checks:
@@ -1180,42 +1232,42 @@ mode/range buttons, and backtest section/filter buttons. They also verified the
 relevant `/api/command-center`, `/api/action-queue`, `/intern/api/*`,
 `/ops/api/*`, and `/trader/api/*` routes returned non-error HTTP statuses.
 The latest stable-page pass opened every visible route over
-`http://your-macbook-3.tailaa3a85.ts.net:8765/` with Google Chrome and found
-no console or request failures while each page was held open.
-The latest populated-button pass opened 13 direct routes, clicked 13 top-nav
-routes, and clicked 4 generated service-card links through the same MagicDNS
-URL. It required Command Center ArticleNet totals to render and each unified
-section page to load real cards instead of placeholders. It also verified that
-the Ops worker summary renders intentionally stopped workers as `off` while the
-LaunchAgent is in `DIGITAL_INTERN_WORKERS=web_server` mode.
+`http://your-macbook-5.tailaa3a85.ts.net:8765/` with Google Chrome. The
+focused 2026-06-08 pass also verified `/intern/chat` returns a real
+`gpt-5.5` response, not the degraded fallback. The populated-button pass
+opened 13 direct routes, clicked 13 top-nav routes, and clicked 4 generated
+service-card links through the same MagicDNS URL. It required Command Center
+ArticleNet totals to render and each unified section page to load real cards
+instead of placeholders. It also verified that the Ops worker summary renders
+intentionally stopped workers as `off` while the LaunchAgent is in
+`DIGITAL_INTERN_WORKERS=web_server` mode.
 
 ## Other Trading Dashboard Links Over Tailscale
 
-Current Tailscale node observed on 2026-06-07:
+Current Tailscale node observed on 2026-06-08:
 
 ```text
-DNS: your-macbook-3.tailaa3a85.ts.net
-IPv4: 100.125.75.25
+DNS: your-macbook-5.tailaa3a85.ts.net
+IPv4: 100.85.188.30
 ```
 
-These are separate trading service dashboards, not the unified dashboard.
-They listen on `0.0.0.0`, so they are reachable directly over the tailnet:
+These raw service ports are not the unified dashboard. The current Mac-safe
+steady state binds Digital Intern and Paper Trader to loopback, then exposes
+them under the unified `:8765` proxy:
 
 ```text
 Digital Intern / ArticleNet dashboard:
-http://your-macbook-3.tailaa3a85.ts.net:8080/
-http://100.125.75.25:8080/
+http://your-macbook-5.tailaa3a85.ts.net:8765/intern/
 
 Paper Trader dashboard:
-http://your-macbook-3.tailaa3a85.ts.net:8090/
-http://100.125.75.25:8090/
+http://your-macbook-5.tailaa3a85.ts.net:8765/trader/
 ```
 
 Health probes that passed:
 
 ```bash
-curl http://your-macbook-3.tailaa3a85.ts.net:8080/healthz
-curl http://your-macbook-3.tailaa3a85.ts.net:8090/api/healthz
+curl http://your-macbook-5.tailaa3a85.ts.net:8765/intern/api/health
+curl http://your-macbook-5.tailaa3a85.ts.net:8765/trader/api/healthz
 ```
 
 `tailscale serve --bg --yes 8080` and the later unified-dashboard Serve forms
