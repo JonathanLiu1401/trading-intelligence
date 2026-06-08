@@ -343,10 +343,14 @@ class Store:
                         expiry: str | None = None, strike: float | None = None,
                         stop_loss_price: float | None = None,
                         take_profit_price: float | None = None) -> None:
-        """Apply a position delta. ``qty=0`` is the metadata-only mode used by
-        the BUY path to set ``stop_loss_price`` / ``take_profit_price`` on an
-        existing open lot without changing its size — only fields explicitly
-        passed (non-None) are written; everything else is preserved."""
+        """Apply a signed position delta.
+
+        Stock lots use signed quantities: ``qty > 0`` is long exposure and
+        ``qty < 0`` is short exposure. ``qty=0`` is the metadata-only mode used
+        by the BUY/SHORT path to set ``stop_loss_price`` / ``take_profit_price``
+        on an existing open lot without changing its size — only fields
+        explicitly passed (non-None) are written; everything else is preserved.
+        """
         with self._lock:
             existing = self.conn.execute(
                 "SELECT id, qty, avg_cost FROM positions "
@@ -355,18 +359,34 @@ class Store:
                 (ticker, type_, expiry, strike),
             ).fetchone()
             if existing:
-                new_qty = existing["qty"] + qty
-                if new_qty <= 0.0001:
+                old_qty = float(existing["qty"] or 0.0)
+                delta_qty = float(qty or 0.0)
+                new_qty = old_qty + delta_qty
+                if abs(new_qty) <= 0.0001:
                     self.conn.execute(
                         "UPDATE positions SET qty=0, closed_at=? WHERE id=?",
                         (_now(), existing["id"]),
                     )
                 else:
-                    blended = (existing["qty"] * existing["avg_cost"] + qty * avg_cost) / new_qty if qty > 0 else existing["avg_cost"]
+                    old_avg = float(existing["avg_cost"] or 0.0)
+                    # Adding to the same side blends cost by absolute exposure.
+                    # Reducing keeps the original entry cost. If a trade flips
+                    # through zero, the residual exposure starts at this trade's
+                    # price because the old side has been fully closed.
+                    if abs(delta_qty) <= 0.0001:
+                        blended = old_avg
+                    elif old_qty * delta_qty > 0:
+                        blended = (
+                            abs(old_qty) * old_avg + abs(delta_qty) * avg_cost
+                        ) / abs(new_qty)
+                    elif old_qty * new_qty > 0:
+                        blended = old_avg
+                    else:
+                        blended = avg_cost
                     # qty=0 is the metadata-only path — preserve qty/avg_cost.
-                    if qty == 0:
+                    if abs(delta_qty) <= 0.0001:
                         # Only touch SL/TP when explicitly supplied; this is
-                        # the post-BUY "stamp the hard exits on the just-
+                        # the post-entry "stamp the hard exits on the just-
                         # opened lot" call from strategy._execute.
                         set_clauses = []
                         params: list = []
@@ -397,7 +417,7 @@ class Store:
                             params,
                         )
             else:
-                if qty > 0:
+                if abs(qty) > 0.0001:
                     # No open lot for this key. A prior fully-closed lot with
                     # the SAME (ticker,type,expiry,strike) still occupies its
                     # row, and the table-wide UNIQUE(ticker,type,expiry,strike)
@@ -436,13 +456,16 @@ class Store:
         Read-only; pure SQL on the positions table. Skips options (only stock
         type is hard-exited), zero-qty lots, lots without SL set, and lots with
         no fresh mark (current_price > 0 is the snapshot freshness proxy).
+        Long lots stop out when price falls to/below the threshold; short lots
+        stop out when price rises to/above it.
         Take-profit levels are advisory context now, not forced exits."""
         with self._lock:
             cur = self.conn.execute(
                 "SELECT * FROM positions WHERE closed_at IS NULL AND type='stock' "
-                "AND qty > 0 AND stop_loss_price IS NOT NULL "
+                "AND ABS(qty) > 0.0001 AND stop_loss_price IS NOT NULL "
                 "AND current_price > 0 "
-                "AND current_price <= stop_loss_price"
+                "AND ((qty > 0 AND current_price <= stop_loss_price) "
+                "OR (qty < 0 AND current_price >= stop_loss_price))"
             )
             rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -458,7 +481,8 @@ class Store:
     def open_positions(self) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM positions WHERE closed_at IS NULL AND qty > 0 ORDER BY opened_at DESC"
+                "SELECT * FROM positions WHERE closed_at IS NULL "
+                "AND ABS(qty) > 0.0001 ORDER BY opened_at DESC"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -522,11 +546,17 @@ class Store:
                         q = float(t["qty"] or 0.0)
                     except (TypeError, ValueError):
                         q = 0.0
-                    if act.startswith("BUY"):
+                    if act.startswith(("BUY", "COVER")):
                         if abs(held) < 1e-6:
                             start_idx = i
                         held += q
-                    elif act.startswith("SELL"):
+                        if abs(held) < 1e-6:
+                            round_trips.append(
+                                (start_idx, i, t["timestamp"] or "")
+                            )
+                    elif act.startswith(("SELL", "SHORT")):
+                        if abs(held) < 1e-6:
+                            start_idx = i
                         held -= q
                         if abs(held) < 1e-6:
                             round_trips.append(
@@ -550,14 +580,21 @@ class Store:
                 n_trades = 0
                 if chosen is not None:
                     lo, hi, _ts = chosen
+                    first_action = (
+                        all_trades[lo]["action"] or ""
+                    ).upper() if lo < len(all_trades) else ""
+                    short_trip = first_action.startswith(("SELL", "SHORT"))
                     for t in all_trades[lo:hi + 1]:
                         act = (t["action"] or "").upper()
                         val = float(t["value"] or 0.0)
-                        if act.startswith("SELL"):
+                        if act.startswith(("SELL", "SHORT")):
                             proceeds += val
                             realized += val
-                        elif act.startswith("BUY"):
-                            cost += val
+                            if short_trip:
+                                cost += val
+                        elif act.startswith(("BUY", "COVER")):
+                            if not short_trip:
+                                cost += val
                             realized -= val
                         n_trades += 1
                 d["realized_pl"] = round(realized, 2)

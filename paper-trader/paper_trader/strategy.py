@@ -261,6 +261,7 @@ the source of truth for account size.
 Your ONLY goal is maximum profit. You have complete freedom over position sizing,
 risk, leverage, and timing. There are NO enforced limits. You can:
 - Put 100% of portfolio into one trade if you have high conviction
+- Short stocks when the evidence is bearish
 - Hold options through expiry if you believe in the thesis
 - Go all-in on a single ticker
 - Let losers run if you expect reversal
@@ -284,18 +285,19 @@ THINK LIKE A HEDGE FUND MANAGER WHO WANTS ASYMMETRIC RETURNS.
 Small, safe trades will not outperform. Take calculated risks.
 High conviction = large size. Low conviction = stay cash.
 
-HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New stock positions you open
-are automatically sold only during the regular market session when price falls
-5% below entry price (10% for leveraged ETFs) → stop-loss. The 15% / 25%
-take-profit level is advisory context only: when a position reaches that level,
-decide dynamically from the stock's thesis, momentum, news, and prior trade
-history whether to hold, trim, or sell. Do not dump winners just because a
-static take-profit marker was hit.
+HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New long stock positions are
+automatically sold only during the regular market session when price falls 5%
+below entry price (10% for leveraged ETFs). New short stock positions are
+automatically covered when price rises 5% above entry (10% for leveraged ETFs).
+The 15% / 25% take-profit level is advisory context only: when a position reaches
+that level, decide dynamically from the stock's thesis, momentum, news, and prior
+trade history whether to hold, trim, cover, or sell. Do not dump winners just
+because a static take-profit marker was hit.
 
 Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 
 {
-  "action": "BUY" | "SELL" | "BUY_CALL" | "BUY_PUT" | "SELL_CALL" | "SELL_PUT" | "HOLD" | "REBALANCE",
+  "action": "BUY" | "SELL" | "SHORT" | "COVER" | "BUY_CALL" | "BUY_PUT" | "SELL_CALL" | "SELL_PUT" | "HOLD" | "REBALANCE",
   "ticker": "NVDA",
   "qty": 0.5,
   "leverage": 1,               // optional for BUY stock only, 1-20x; effective exposure = qty * leverage
@@ -310,7 +312,11 @@ For BUY on regular stocks, you may set "leverage" from 1x to 20x. The paper
 trader applies the leverage to stock exposure only: qty=2, leverage=5 buys
 10 effective shares. Buying power includes cash plus 50% margin on current
 portfolio net worth.
-For SELL/SELL_CALL/SELL_PUT, ticker must match an open position (and strike/expiry for options).
+For SHORT, qty is the positive share count to sell short; it opens or adds to
+a short stock position and uses the same stock buying-power field as BUY.
+For SELL, ticker must match an open long stock position. For COVER, ticker
+must match an open short stock position. For SELL_CALL/SELL_PUT, ticker must
+match an open option position (and strike/expiry for options).
 
 TECHNICAL SIGNAL INTERPRETATION (use alongside news, not in isolation):
 - RSI > 70 = overbought — avoid new longs, consider reducing; RSI < 30 = oversold — potential
@@ -1102,13 +1108,18 @@ def _mark_to_market(
         # `is not None`, not `or`: a legitimate 0.0 (expired worthless option)
         # must survive — `cur or avg_cost` would clobber it back to premium.
         cur = cur if cur is not None else p["avg_cost"]
-        pl = (cur - p["avg_cost"]) * p["qty"] * multiplier
-        pl_pct = ((cur - p["avg_cost"]) / p["avg_cost"]) * 100 if p["avg_cost"] else 0.0
+        qty = float(p["qty"] or 0.0)
+        pl = (cur - p["avg_cost"]) * qty * multiplier
+        if p["avg_cost"]:
+            direction = -1.0 if qty < 0 else 1.0
+            pl_pct = ((cur - p["avg_cost"]) / p["avg_cost"]) * 100 * direction
+        else:
+            pl_pct = 0.0
         marks[p["id"]] = (cur, pl)
         enriched.append({**p, "current_price": cur, "unrealized_pl": pl, "pl_pct": pl_pct,
-                         "market_value": cur * p["qty"] * multiplier,
+                         "market_value": cur * qty * multiplier,
                          "stale_mark": stale})
-        open_value += cur * p["qty"] * multiplier
+        open_value += cur * qty * multiplier
 
     return enriched, open_value, marks
 
@@ -1487,9 +1498,11 @@ def _check_and_execute_hard_exits(
 
     Surveys ``store.positions_needing_hard_exit()`` (open stock lots whose
     last-marked current_price has breached the per-lot stop_loss_price set when
-    the lot was opened). For each breached lot: records a SELL at the current
-    marked price, decrements the position via ``upsert_position`` (negative qty
-    closes the lot), and credits cash.
+    the lot was opened). For each breached long lot: records a SELL at the
+    current marked price, decrements the position via ``upsert_position``
+    (negative qty closes the lot), and credits cash. For each breached short
+    lot: records a COVER, increments the signed position toward zero, and
+    debits cash.
     Updates ``snap['cash']`` in place so any caller that already has the
     pre-exit snapshot in hand sees the post-exit cash for sizing logic; the
     caller still re-snapshots when ``hard_exits`` is non-empty so positions
@@ -1518,17 +1531,25 @@ def _check_and_execute_hard_exits(
             except (TypeError, ValueError) as e:
                 print(f"[strategy] hard-exit: non-numeric row for {ticker}: {e}")
                 continue
-            if qty <= 0 or price <= 0:
+            if abs(qty) <= 0.0001 or price <= 0:
                 continue
-            if price > sl:
+            if qty > 0 and price > sl:
                 continue
-            reason = f"HARD_SL: price {price:.2f} <= threshold {sl:.2f}"
+            if qty < 0 and price < sl:
+                continue
+            side = "SELL" if qty > 0 else "COVER"
+            close_qty = abs(qty)
+            comparator = "<=" if qty > 0 else ">="
+            reason = (
+                f"HARD_SL: price {price:.2f} {comparator} threshold {sl:.2f}"
+            )
             cash = float(snap.get("cash", 0) or 0.0)
             total_value = float(snap.get("total_value", 0) or 0.0)
-            notional = price * qty
-            store.record_trade(ticker, "SELL", qty, price, reason)
-            store.upsert_position(ticker, "stock", -qty, price)
-            new_cash = cash + notional
+            notional = price * close_qty
+            store.record_trade(ticker, side, close_qty, price, reason)
+            delta = -close_qty if qty > 0 else close_qty
+            store.upsert_position(ticker, "stock", delta, price)
+            new_cash = cash + notional if qty > 0 else cash - notional
             store.update_portfolio(new_cash, total_value)
             snap["cash"] = new_cash
             exits.append(ticker)
@@ -1539,8 +1560,8 @@ def _check_and_execute_hard_exits(
 
 
 def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
-    """Basic sanity only — can't sell more than you own. No position/option/cash caps."""
-    action = decision.get("action", "HOLD")
+    """Basic sanity only — can't close more than is open. No broad risk caps."""
+    action = (decision.get("action", "HOLD") or "HOLD").upper()
     if action == "HOLD":
         return True, ""
 
@@ -1559,7 +1580,31 @@ def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
     if qty <= 0 and action != "REBALANCE":
         return False, "qty must be > 0"
 
-    if action in ("SELL", "SELL_CALL", "SELL_PUT"):
+    if action == "SELL":
+        matches = [
+            p for p in snapshot["positions"]
+            if p["ticker"] == ticker and p["type"] == "stock"
+            and float(p.get("qty") or 0.0) > 0
+        ]
+        if not matches:
+            return False, f"no open long stock position in {ticker} to close"
+        held = sum(float(p.get("qty") or 0.0) for p in matches)
+        if qty > held + 1e-6:
+            return False, f"sell qty {qty} exceeds held long {held} for {ticker} stock"
+
+    if action == "COVER":
+        matches = [
+            p for p in snapshot["positions"]
+            if p["ticker"] == ticker and p["type"] == "stock"
+            and float(p.get("qty") or 0.0) < 0
+        ]
+        if not matches:
+            return False, f"no open short stock position in {ticker} to cover"
+        held_short = sum(abs(float(p.get("qty") or 0.0)) for p in matches)
+        if qty > held_short + 1e-6:
+            return False, f"cover qty {qty} exceeds held short {held_short} for {ticker} stock"
+
+    if action in ("SELL_CALL", "SELL_PUT"):
         opt_type = "call" if action == "SELL_CALL" else "put" if action == "SELL_PUT" else "stock"
         matches = [
             p for p in snapshot["positions"]
@@ -1599,7 +1644,7 @@ def _stock_buying_power(snapshot: dict) -> float:
 
 def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
     """Apply the decision against the paper book. Returns (status, detail)."""
-    action = decision.get("action", "HOLD")
+    action = (decision.get("action", "HOLD") or "HOLD").upper()
     if action == "HOLD":
         return "HOLD", decision.get("reasoning", "")
 
@@ -1622,7 +1667,7 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
     if not ok:
         return "BLOCKED", why
 
-    if action in ("BUY", "SELL"):
+    if action in ("BUY", "SELL", "SHORT", "COVER"):
         price = market.get_price(ticker)
         try:
             price = float(price)
@@ -1681,12 +1726,44 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
                 if leverage != STOCK_BUY_MIN_LEVERAGE else ""
             )
             return "FILLED", f"BUY {effective_qty:g} {ticker} @ {price:.2f}{suffix}"
-        else:
+        if action == "SELL":
             notional = price * qty
             store.record_trade(ticker, "SELL", qty, price, reason)
             store.upsert_position(ticker, "stock", -qty, price)
             store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
             return "FILLED", f"SELL {qty} {ticker} @ {price:.2f}"
+
+        if action == "SHORT":
+            notional = price * qty
+            shorting_power = _stock_buying_power(snapshot)
+            if shorting_power - notional < -1e-6:
+                return (
+                    "BLOCKED",
+                    f"insufficient shorting power (cash ${snapshot['cash']:.2f}, "
+                    f"margin ${max(0.0, float(snapshot.get('total_value') or 0.0) * STOCK_MARGIN_NET_WORTH_PCT):.2f}, "
+                    f"available ${shorting_power:.2f}, need ${notional:.2f})",
+                )
+            _sl_pct = (_SL_PCT_LEVERAGED if ticker in _LEVERAGED_ETFS_SL
+                       else _SL_PCT_STANDARD)
+            _tp_pct = (_TP_PCT_LEVERAGED if ticker in _LEVERAGED_ETFS_SL
+                       else _TP_PCT_STANDARD)
+            _sl_price = round(price * (1 + _sl_pct), 4)
+            _tp_price = round(price * (1 - _tp_pct), 4)
+            store.record_trade(ticker, "SHORT", qty, price, reason)
+            store.upsert_position(
+                ticker, "stock", -qty, price,
+                stop_loss_price=_sl_price,
+                take_profit_price=_tp_price,
+            )
+            store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
+            return "FILLED", f"SHORT {qty:g} {ticker} @ {price:.2f}"
+
+        if action == "COVER":
+            notional = price * qty
+            store.record_trade(ticker, "COVER", qty, price, reason)
+            store.upsert_position(ticker, "stock", qty, price)
+            store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
+            return "FILLED", f"COVER {qty:g} {ticker} @ {price:.2f}"
 
     if action in ("BUY_CALL", "BUY_PUT"):
         otype = "call" if action == "BUY_CALL" else "put"

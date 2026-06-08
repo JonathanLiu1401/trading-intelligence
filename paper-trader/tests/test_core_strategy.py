@@ -788,6 +788,34 @@ class TestEnforceRiskPreTrade:
             {"action": "SELL", "ticker": "NVDA", "qty": 5}, snap)
         assert ok is True
 
+    def test_short_allowed_without_position(self):
+        snap = {"positions": []}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": "SHORT", "ticker": "NVDA", "qty": 2}, snap)
+        assert ok is True
+        assert why == ""
+
+    def test_cover_requires_short_position(self):
+        snap = {"positions": [{"ticker": "NVDA", "type": "stock", "qty": 5}]}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": "COVER", "ticker": "NVDA", "qty": 1}, snap)
+        assert ok is False
+        assert "no open short" in why.lower()
+
+    def test_cover_exceeding_short_qty_blocked(self):
+        snap = {"positions": [{"ticker": "NVDA", "type": "stock", "qty": -3}]}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": "COVER", "ticker": "NVDA", "qty": 4}, snap)
+        assert ok is False
+        assert "exceeds held short" in why.lower()
+
+    def test_cover_within_short_qty_allowed(self):
+        snap = {"positions": [{"ticker": "NVDA", "type": "stock", "qty": -3}]}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": "COVER", "ticker": "NVDA", "qty": 2}, snap)
+        assert ok is True
+        assert why == ""
+
     def test_non_numeric_qty_blocks_cleanly_not_crashes(self):
         # Regression: a Claude decision with qty="all" / "half" used to raise
         # ValueError inside _enforce_risk_pre_trade — the unguarded float()
@@ -986,6 +1014,40 @@ class TestExecuteSell:
         # 500 cash + 5*120 = 1100
         assert pf["cash"] == 1100.0
         # Position fully closed.
+        assert fresh_store.open_positions() == []
+
+
+class TestExecuteShort:
+    def test_short_increases_cash_and_creates_negative_position(
+        self, fresh_store, monkeypatch
+    ):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {"cash": 1000.0, "total_value": 1000.0,
+                "stock_buying_power": 1500.0, "positions": []}
+        decision = {"action": "SHORT", "ticker": "AMD", "qty": 3,
+                    "reasoning": "bearish"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert detail.startswith("SHORT 3")
+        pf = fresh_store.get_portfolio()
+        assert pf["cash"] == pytest.approx(1300.0)
+        pos = fresh_store.open_positions()[0]
+        assert pos["ticker"] == "AMD"
+        assert pos["qty"] == pytest.approx(-3.0)
+        assert pos["stop_loss_price"] == pytest.approx(105.0)
+        assert pos["take_profit_price"] == pytest.approx(85.0)
+
+    def test_cover_decreases_cash_and_closes_short(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 90.0)
+        fresh_store.upsert_position("AMD", "stock", qty=-3, avg_cost=100.0)
+        snap = {"cash": 1300.0, "total_value": 1000.0,
+                "positions": [{"ticker": "AMD", "type": "stock", "qty": -3}]}
+        decision = {"action": "COVER", "ticker": "AMD", "qty": 3,
+                    "reasoning": "take gain"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert detail.startswith("COVER 3")
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(1030.0)
         assert fresh_store.open_positions() == []
 
 
@@ -1333,6 +1395,23 @@ class TestPortfolioSnapshotSummation:
         snap = strategy._portfolio_snapshot(fresh_store)
         assert snap["open_value"] == 0.0
         assert snap["total_value"] == pytest.approx(snap["cash"])
+
+    def test_short_stock_mark_is_negative_value_with_positive_pl_on_drop(
+        self, fresh_store, monkeypatch
+    ):
+        monkeypatch.setattr(market, "get_prices", lambda tks: {"AMD": 80.0})
+        fresh_store.upsert_position("AMD", "stock", qty=-3, avg_cost=100.0)
+        fresh_store.update_portfolio(cash=1300.0, total_value=1000.0)
+
+        snap = strategy._portfolio_snapshot(fresh_store)
+
+        pos = snap["positions"][0]
+        assert pos["qty"] == pytest.approx(-3.0)
+        assert pos["market_value"] == pytest.approx(-240.0)
+        assert pos["unrealized_pl"] == pytest.approx(60.0)
+        assert pos["pl_pct"] == pytest.approx(20.0)
+        assert snap["open_value"] == pytest.approx(-240.0)
+        assert snap["total_value"] == pytest.approx(1060.0)
 
 
 class TestPortfolioSnapshotExpiredOptions:

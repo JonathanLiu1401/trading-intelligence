@@ -220,10 +220,9 @@ class TestExecuteDecisionBoundaries:
         assert pf.cash == pytest.approx(3 * price)  # only 3 shares' proceeds
         assert "3" in detail                      # clamped qty echoed in detail
 
-    def test_sell_with_no_position_is_blocked(self, synthetic_prices,
-                                              tmp_path):
-        """NVDA has a price in the fixture but is not held → the SELL must
-        be rejected by the no-position guard, not the no-price guard."""
+    def test_sell_with_no_position_opens_short(self, synthetic_prices,
+                                               tmp_path):
+        """A bearish SELL signal with no long now opens a short in backtests."""
         engine = _engine_with_prices(synthetic_prices, tmp_path)
         d0 = synthetic_prices.trading_days[0]
         assert synthetic_prices.price_on("NVDA", d0) is not None
@@ -236,6 +235,27 @@ class TestExecuteDecisionBoundaries:
             portfolio=pf,
         )
 
-        assert status == "BLOCKED"
-        assert detail == "no open position in NVDA"
-        assert pf.cash == pytest.approx(1000.0)
+        assert status == "FILLED"
+        assert detail.startswith("SHORT 1")
+        assert pf.positions["NVDA"]["qty"] == pytest.approx(-1.0)
+        assert pf.cash == pytest.approx(1000.0 + synthetic_prices.price_on("NVDA", d0))
+
+    def test_cover_short_is_clamped_to_open_short(self, synthetic_prices,
+                                                  tmp_path):
+        engine = _engine_with_prices(synthetic_prices, tmp_path)
+        d0 = synthetic_prices.trading_days[0]
+        price = synthetic_prices.price_on("SPY", d0)
+        pf = SimPortfolio(cash=1000.0)
+        pf.positions["SPY"] = {"qty": -3, "avg_cost": 110.0,
+                               "stop_loss": None, "take_profit": None}
+
+        status, detail = engine._execute_decision(
+            run_id=1, sim_date=d0,
+            decision={"action": "COVER", "ticker": "SPY", "qty": 10,
+                      "reasoning": "risk off"},
+            portfolio=pf,
+        )
+
+        assert status == "FILLED", detail
+        assert "SPY" not in pf.positions
+        assert pf.cash == pytest.approx(1000.0 - 3 * price)

@@ -20,12 +20,14 @@ from paper_trader.backtest import (
     _article_sentiment,
     _buy,
     _compute_technical_indicators,
+    _cover,
     _ema,
     _enforce_risk_exits,
     _ml_decide,
     _parse_decision,
     _rsi,
     _sell,
+    _short,
     persona_for,
     score_article,
 )
@@ -177,6 +179,30 @@ class TestSimPortfolio:
         # Total = cash 500 + 5*150 = 1250.
         assert val == pytest.approx(1250.0)
 
+    def test_short_records_negative_position_and_marks_profit(self, synthetic_prices):
+        p = SimPortfolio(cash=1000.0)
+        _short(p, "SPY", 2.0, 150.0, stop_loss=165.0, take_profit=120.0)
+        assert p.cash == pytest.approx(1300.0)
+        assert p.positions["SPY"]["qty"] == pytest.approx(-2.0)
+        d0 = synthetic_prices.trading_days[0]  # SPY = 100
+        # Equity = cash 1300 - liability 2*100 = 1100, a $100 profit.
+        assert p.total_value(synthetic_prices, d0) == pytest.approx(1100.0)
+
+    def test_cover_short_reduces_negative_position(self):
+        p = SimPortfolio(cash=1300.0)
+        _short(p, "NVDA", 3.0, 100.0, stop_loss=None, take_profit=None)
+        cost = _cover(p, "NVDA", 2.0, 90.0)
+        assert cost == pytest.approx(180.0)
+        assert p.positions["NVDA"]["qty"] == pytest.approx(-1.0)
+        assert p.cash == pytest.approx(1300.0 + 300.0 - 180.0)
+
+    def test_cover_caps_at_short_qty(self):
+        p = SimPortfolio(cash=1000.0)
+        _short(p, "NVDA", 3.0, 100.0, stop_loss=None, take_profit=None)
+        cost = _cover(p, "NVDA", 999.0, 90.0)
+        assert cost == pytest.approx(270.0)
+        assert "NVDA" not in p.positions
+
 
 # ─────────────────────── _enforce_risk_exits ───────────────────────────
 
@@ -290,6 +316,24 @@ class TestRiskExits:
         assert price == pytest.approx(101.0)        # days[1], NOT days[0]==100
         assert sim_date == days[1].isoformat()
         assert p.cash == pytest.approx(901.0)       # 800 + 1*101
+
+    def test_short_take_profit_covers_at_exact_close(self, synthetic_prices):
+        p = SimPortfolio(cash=1000.0)
+        _short(p, "SPY", 2.0, 150.0, stop_loss=180.0, take_profit=120.0)
+        assert p.cash == pytest.approx(1300.0)
+        store = MagicMock()
+        days = synthetic_prices.trading_days
+        n_exits = _enforce_risk_exits(p, synthetic_prices, days[0], days[-1],
+                                      run_id=1, store=store)
+        assert n_exits == 1
+        assert "SPY" not in p.positions
+        _rid, sim_date, _tk, action, qty, price, _r = \
+            store.record_trade.call_args[0]
+        assert action == "COVER"
+        assert qty == pytest.approx(2.0)
+        assert price == pytest.approx(101.0)
+        assert sim_date == days[1].isoformat()
+        assert p.cash == pytest.approx(1300.0 - 2 * 101.0)
 
 
 # ─────────────────────── Buy-and-hold sanity ───────────────────────────
@@ -811,7 +855,22 @@ class TestMlDecide:
         d = synthetic_prices.trading_days[-1]
         decision = _ml_decide(d, p, articles, synthetic_prices, run_id=1, rng=rng)
         # Should be either BUY or HOLD depending on regime; must not crash.
-        assert decision["action"] in {"BUY", "HOLD", "SELL"}
+        assert decision["action"] in {"BUY", "HOLD", "SELL", "SHORT", "COVER"}
+
+    def test_bearish_news_can_trigger_short(self, synthetic_prices):
+        p = SimPortfolio(cash=1000.0)
+        rng = random.Random(42)
+        articles = [{
+            "title": "Nvidia downgrade guidance cut investigation selloff crash",
+            "score": 4.0,
+            "tickers": ["NVDA"],
+        }]
+        d = synthetic_prices.trading_days[-1]
+        decision = _ml_decide(d, p, articles, synthetic_prices, run_id=1, rng=rng)
+        assert decision["action"] in {"SHORT", "HOLD"}
+        if decision["action"] == "SHORT":
+            assert decision["ticker"] == "NVDA"
+            assert decision["qty"] > 0
 
     def test_low_score_articles_filtered(self, synthetic_prices):
         p = SimPortfolio()

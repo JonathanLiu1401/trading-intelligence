@@ -151,15 +151,20 @@ class TestUpsertPosition:
     def test_full_sell_closes_position(self, fresh_store):
         fresh_store.upsert_position("AMD", "stock", qty=10, avg_cost=100.0)
         fresh_store.upsert_position("AMD", "stock", qty=-10, avg_cost=110.0)
-        # open_positions() filters closed_at IS NULL AND qty > 0; this should be empty.
+        # open_positions() filters closed_at IS NULL and nonzero signed qty.
         assert fresh_store.open_positions() == []
 
-    def test_overselling_closes_position(self, fresh_store):
-        # Defensive: even if we slip past the pre-trade check, an oversell
-        # should NOT leave a negative quantity dangling.
+    def test_crossing_through_zero_flips_to_short(self, fresh_store):
+        # Signed stock quantities support shorts. A direct store delta that
+        # crosses through zero closes the long and opens residual short exposure
+        # at the crossing trade price. The live SELL path still blocks accidental
+        # oversells before they reach this lower-level primitive.
         fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
         fresh_store.upsert_position("AMD", "stock", qty=-10, avg_cost=110.0)
-        assert fresh_store.open_positions() == []
+        pos = fresh_store.open_positions()
+        assert len(pos) == 1
+        assert pos[0]["qty"] == pytest.approx(-5.0)
+        assert pos[0]["avg_cost"] == pytest.approx(110.0)
 
     def test_options_and_stock_are_separate_positions(self, fresh_store):
         # Same ticker, different type → distinct rows.

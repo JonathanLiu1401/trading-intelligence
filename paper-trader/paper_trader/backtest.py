@@ -2170,16 +2170,23 @@ def _ml_decide(
 
     _excl = exclude_tickers or set()
 
-    # 4. Sell: worst-scoring held position with negative signal
+    # 4. Exit stale exposure: sell weak longs, cover shorts whose signal turns
+    # positive against the short thesis.
     sell_ticker = None
     worst_score = -0.8
-    for tk in portfolio.positions:
+    cover_ticker = None
+    cover_score = 0.8
+    for tk, pos in portfolio.positions.items():
         if tk in _excl:
             continue
         s = ticker_scores.get(tk, 0.0) * regime_mult
-        if s < worst_score:
+        q = float(pos.get("qty", 0.0))
+        if q > 0 and s < worst_score:
             worst_score = s
             sell_ticker = tk
+        elif q < 0 and s > cover_score:
+            cover_score = s
+            cover_ticker = tk
 
     # 5. Persona-seeded bias — each persona boosts its preferred sector tickers
     # so runs explore different parts of the market, not just tech/semis.
@@ -2209,6 +2216,26 @@ def _ml_decide(
         if adj_s > best_score and prices.price_on(tk, sim_date):
             best_score = adj_s
             buy_ticker = tk
+
+    # Short pick: lowest-scoring non-held watchlist ticker. Bear regimes make
+    # bearish evidence more actionable; bull regimes require a stronger signal.
+    short_ticker = None
+    short_score = -1.25
+    if regime == "bear":
+        short_regime_mult = 1.0
+    elif regime == "sideways":
+        short_regime_mult = 0.6
+    else:
+        short_regime_mult = 0.35
+    for tk, s in ticker_scores.items():
+        if tk in _excl or tk in portfolio.positions:
+            continue
+        if ticker_article_count.get(tk, 0) <= 0:
+            continue
+        adj_s = s * short_regime_mult
+        if adj_s < short_score and prices.price_on(tk, sim_date):
+            short_score = adj_s
+            short_ticker = tk
 
     # Sector concentration guard: if portfolio is >60% single-stock tech, penalise those buys.
     # Leveraged ETFs (SOXL, TQQQ, TECL, etc.) are excluded from this penalty — they are
@@ -2272,6 +2299,20 @@ def _ml_decide(
             sell_ticker, buy_ticker = buy_ticker, None
             sell_score = best_score
 
+    if cover_ticker and portfolio.positions.get(cover_ticker):
+        pos = portfolio.positions[cover_ticker]
+        cover_qty = round(abs(pos["qty"]) * 0.5, 4)
+        c_news_count = ticker_article_count.get(cover_ticker, 0)
+        c_news_urg = ticker_max_urgency.get(cover_ticker, 0.0)
+        return {
+            "action": "COVER", "ticker": cover_ticker, "qty": cover_qty,
+            "reasoning": (
+                f"ML+quant: {cover_ticker} score={cover_score:.2f} regime={regime} "
+                f"RSI={quant.get(cover_ticker, {}).get('rsi', 'N/A')} "
+                f"news_count={c_news_count} news_urg={c_news_urg:.1f} — covering short"
+            ),
+        }
+
     if sell_ticker and portfolio.positions.get(sell_ticker):
         pos = portfolio.positions[sell_ticker]
         sell_qty = round(pos["qty"] * 0.5, 4)
@@ -2285,6 +2326,27 @@ def _ml_decide(
                 f"news_count={s_news_count} news_urg={s_news_urg:.1f} — reducing"
             ),
         }
+
+    if short_ticker and (not buy_ticker or abs(short_score) > best_score * 1.1):
+        price = prices.price_on(short_ticker, sim_date) or 1.0
+        conviction = min(0.30 if regime == "bear" else 0.18,
+                         abs(short_score) / 18.0)
+        short_notional = min(total_val * conviction, max(total_val, portfolio.cash) * 0.95)
+        qty = round(short_notional / price, 4)
+        if qty >= 0.01:
+            s_news_count = ticker_article_count.get(short_ticker, 0)
+            s_news_urg = ticker_max_urgency.get(short_ticker, 0.0)
+            return {
+                "action": "SHORT", "ticker": short_ticker, "qty": qty,
+                "stop_loss": round(price * 1.08, 2),
+                "take_profit": round(price * 0.85, 2),
+                "reasoning": (
+                    f"ML+quant: {short_ticker} bearish score={short_score:.2f} "
+                    f"regime={regime} RSI={quant.get(short_ticker, {}).get('rsi', 'N/A')} "
+                    f"news_count={s_news_count} news_urg={s_news_urg:.1f} "
+                    f"conviction={conviction:.0%}"
+                ),
+            }
 
     if buy_ticker:
         price = prices.price_on(buy_ticker, sim_date) or 1.0
@@ -2446,6 +2508,7 @@ def _ml_decide(
 class SimPortfolio:
     cash: float = INITIAL_CASH
     # ticker -> {qty, avg_cost, stop_loss, take_profit, peak_pct}
+    # qty is signed for stock exposure: positive is long, negative is short.
     positions: dict[str, dict] = field(default_factory=dict)
 
     def total_value(self, prices: PriceCache, d: date) -> float:
@@ -2469,8 +2532,19 @@ def _buy(portfolio: SimPortfolio, ticker: str, qty: float, price: float,
     portfolio.cash -= notional
     existing = portfolio.positions.get(ticker)
     if existing:
-        new_qty = existing["qty"] + qty
-        blended = (existing["qty"] * existing["avg_cost"] + qty * price) / new_qty
+        old_qty = float(existing["qty"])
+        new_qty = old_qty + qty
+        if abs(new_qty) <= 1e-6:
+            del portfolio.positions[ticker]
+            return
+        if old_qty * qty > 0:
+            blended = (
+                abs(old_qty) * existing["avg_cost"] + abs(qty) * price
+            ) / abs(new_qty)
+        elif old_qty * new_qty > 0:
+            blended = existing["avg_cost"]
+        else:
+            blended = price
         existing["qty"] = new_qty
         existing["avg_cost"] = blended
         # Truthiness check would silently drop an explicit `stop_loss=0.0` (or
@@ -2495,7 +2569,7 @@ def _buy(portfolio: SimPortfolio, ticker: str, qty: float, price: float,
 
 def _sell(portfolio: SimPortfolio, ticker: str, qty: float, price: float) -> float:
     pos = portfolio.positions.get(ticker)
-    if not pos:
+    if not pos or pos["qty"] <= 0:
         return 0.0
     qty = min(qty, pos["qty"])
     proceeds = qty * price
@@ -2504,6 +2578,52 @@ def _sell(portfolio: SimPortfolio, ticker: str, qty: float, price: float) -> flo
     if pos["qty"] <= 1e-6:
         del portfolio.positions[ticker]
     return proceeds
+
+
+def _short(portfolio: SimPortfolio, ticker: str, qty: float, price: float,
+           stop_loss: float | None, take_profit: float | None) -> None:
+    proceeds = qty * price
+    portfolio.cash += proceeds
+    existing = portfolio.positions.get(ticker)
+    if existing:
+        old_qty = float(existing["qty"])
+        delta = -qty
+        new_qty = old_qty + delta
+        if abs(new_qty) <= 1e-6:
+            del portfolio.positions[ticker]
+            return
+        if old_qty * delta > 0:
+            blended = (
+                abs(old_qty) * existing["avg_cost"] + abs(delta) * price
+            ) / abs(new_qty)
+        elif old_qty * new_qty > 0:
+            blended = existing["avg_cost"]
+        else:
+            blended = price
+        existing["qty"] = new_qty
+        existing["avg_cost"] = blended
+        if stop_loss is not None:
+            existing["stop_loss"] = stop_loss
+        if take_profit is not None:
+            existing["take_profit"] = take_profit
+    else:
+        portfolio.positions[ticker] = {
+            "qty": -qty, "avg_cost": price,
+            "stop_loss": stop_loss, "take_profit": take_profit,
+        }
+
+
+def _cover(portfolio: SimPortfolio, ticker: str, qty: float, price: float) -> float:
+    pos = portfolio.positions.get(ticker)
+    if not pos or pos["qty"] >= 0:
+        return 0.0
+    qty = min(qty, abs(pos["qty"]))
+    cost = qty * price
+    portfolio.cash -= cost
+    pos["qty"] += qty
+    if abs(pos["qty"]) <= 1e-6:
+        del portfolio.positions[ticker]
+    return cost
 
 
 def _enforce_risk_exits(portfolio: SimPortfolio, prices: PriceCache,
@@ -2533,18 +2653,32 @@ def _enforce_risk_exits(portfolio: SimPortfolio, prices: PriceCache,
                 continue
             sl = pos.get("stop_loss")
             tp = pos.get("take_profit")
-            if sl and px <= sl:
-                qty = pos["qty"]
-                _sell(portfolio, ticker, qty, px)
-                store.record_trade(run_id, cur.isoformat(), ticker, "SELL", qty, px,
-                                   f"stop-loss @ {sl} (close {px:.2f})")
-                n += 1
-            elif tp and px >= tp:
-                qty = pos["qty"]
-                _sell(portfolio, ticker, qty, px)
-                store.record_trade(run_id, cur.isoformat(), ticker, "SELL", qty, px,
-                                   f"take-profit @ {tp} (close {px:.2f})")
-                n += 1
+            qty = float(pos["qty"])
+            if qty > 0:
+                if sl and px <= sl:
+                    _sell(portfolio, ticker, qty, px)
+                    store.record_trade(run_id, cur.isoformat(), ticker, "SELL", qty, px,
+                                       f"stop-loss @ {sl} (close {px:.2f})")
+                    n += 1
+                elif tp and px >= tp:
+                    _sell(portfolio, ticker, qty, px)
+                    store.record_trade(run_id, cur.isoformat(), ticker, "SELL", qty, px,
+                                       f"take-profit @ {tp} (close {px:.2f})")
+                    n += 1
+            elif qty < 0:
+                close_qty = abs(qty)
+                if sl and px >= sl:
+                    _cover(portfolio, ticker, close_qty, px)
+                    store.record_trade(run_id, cur.isoformat(), ticker, "COVER",
+                                       close_qty, px,
+                                       f"short stop-loss @ {sl} (close {px:.2f})")
+                    n += 1
+                elif tp and px <= tp:
+                    _cover(portfolio, ticker, close_qty, px)
+                    store.record_trade(run_id, cur.isoformat(), ticker, "COVER",
+                                       close_qty, px,
+                                       f"short take-profit @ {tp} (close {px:.2f})")
+                    n += 1
         cur += timedelta(days=1)
     return n
 
@@ -2556,6 +2690,7 @@ This is a HISTORICAL backtest — you are deciding trades for a specific past da
 Your ONLY goal is maximum profit over a 1-year horizon. You have complete freedom over position
 sizing, risk, and timing. There are NO enforced limits. You can:
 - Put 100% of portfolio into one trade if you have high conviction
+- Short stocks when the evidence is bearish
 - Go all-in on a single ticker
 - Let losers run if you expect reversal
 
@@ -2583,7 +2718,7 @@ POSITION SIZING GUIDANCE (committee should consider):
 Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 
 {
-  "action": "BUY" | "SELL" | "HOLD",
+  "action": "BUY" | "SELL" | "SHORT" | "COVER" | "HOLD",
   "ticker": "NVDA",
   "qty": 0.5,
   "confidence": 0.85,
@@ -2592,9 +2727,12 @@ Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
   "take_profit": 950.0      // optional — only honored if set
 }
 
-- For SELL, ticker must match an open position.
+- For SELL, ticker must match an open long position.
+- For SHORT, qty is the positive share count to sell short.
+- For COVER, ticker must match an open short position.
 - Fractional shares are allowed (qty can be e.g. 0.5).
-- If you set stop_loss / take_profit, they will fire on daily closes.
+- If you set stop_loss / take_profit, they will fire on daily closes. Long
+  stops fire below entry; short stops fire above entry.
 
 Return JSON ONLY.
 """
@@ -2643,7 +2781,7 @@ THE 10 COMMITTEE MEMBERS:
 10. SPECULATOR — Concentrated asymmetric bets; full-size when setup is right
 
 PROCESS:
-  (a) Each member proposes one trade (BUY/SELL/HOLD).
+  (a) Each member proposes one trade (BUY/SELL/SHORT/COVER/HOLD).
   (b) Members vote — weighted by conviction and by how well the proposal fits today's signals.
   (c) Output the SINGLE consensus trade as JSON.
 
@@ -2660,7 +2798,8 @@ def _build_prompt(run_id: int, seed: int, sim_date: date, portfolio: SimPortfoli
     pos_lines = []
     for ticker, p in portfolio.positions.items():
         px = prices.price_on(ticker, sim_date) or p["avg_cost"]
-        pl_pct = (px - p["avg_cost"]) / p["avg_cost"] * 100
+        direction = -1.0 if float(p.get("qty", 0.0)) < 0 else 1.0
+        pl_pct = (px - p["avg_cost"]) / p["avg_cost"] * 100 * direction
         pos_lines.append(f"  {ticker}: qty={p['qty']} avg=${p['avg_cost']:.2f} "
                          f"now=${px:.2f} P/L={pl_pct:+.1f}%")
 
@@ -3241,14 +3380,44 @@ class BacktestEngine:
 
         if action == "SELL":
             pos = portfolio.positions.get(ticker)
-            if not pos:
-                return "BLOCKED", f"no open position in {ticker}"
+            if not pos or pos["qty"] <= 0:
+                sl = decision.get("stop_loss")
+                tp = decision.get("take_profit")
+                _short(portfolio, ticker, qty, price,
+                       float(sl) if isinstance(sl, (int, float)) else round(price * 1.08, 2),
+                       float(tp) if isinstance(tp, (int, float)) else round(price * 0.85, 2))
+                self.store.record_trade(run_id, sim_date.isoformat(), ticker, "SHORT",
+                                        qty, price,
+                                        decision.get("reasoning", "")[:200])
+                return "FILLED", f"SHORT {qty} {ticker} @ {price:.2f}"
             sell_qty = min(qty, pos["qty"])
             _sell(portfolio, ticker, sell_qty, price)
             self.store.record_trade(run_id, sim_date.isoformat(), ticker, "SELL",
                                     sell_qty, price,
                                     decision.get("reasoning", "")[:200])
             return "FILLED", f"SELL {sell_qty} {ticker} @ {price:.2f}"
+
+        if action == "SHORT":
+            sl = decision.get("stop_loss")
+            tp = decision.get("take_profit")
+            _short(portfolio, ticker, qty, price,
+                   float(sl) if isinstance(sl, (int, float)) else round(price * 1.08, 2),
+                   float(tp) if isinstance(tp, (int, float)) else round(price * 0.85, 2))
+            self.store.record_trade(run_id, sim_date.isoformat(), ticker, "SHORT",
+                                    qty, price,
+                                    decision.get("reasoning", "")[:200])
+            return "FILLED", f"SHORT {qty} {ticker} @ {price:.2f}"
+
+        if action == "COVER":
+            pos = portfolio.positions.get(ticker)
+            if not pos or pos["qty"] >= 0:
+                return "BLOCKED", f"no open short position in {ticker}"
+            cover_qty = min(qty, abs(pos["qty"]))
+            _cover(portfolio, ticker, cover_qty, price)
+            self.store.record_trade(run_id, sim_date.isoformat(), ticker, "COVER",
+                                    cover_qty, price,
+                                    decision.get("reasoning", "")[:200])
+            return "FILLED", f"COVER {cover_qty} {ticker} @ {price:.2f}"
 
         return "BLOCKED", f"unsupported action {action}"
 
