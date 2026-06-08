@@ -8469,8 +8469,9 @@ def portfolio_api():
       * ``last_updated`` — ISO timestamp of the most recent mark-to-market
         write (``store.update_portfolio``'s own clock). Lets a polling caller
         detect "the trader has stopped writing" without re-reading equity_curve.
-      * ``pnl_vs_start`` / ``pnl_vs_start_pct`` — absolute and % delta from
-        the $1000 baseline (``INITIAL_CASH``, invariant #12; never a literal).
+      * ``pnl_vs_start`` / ``pnl_vs_start_pct`` — deposit-adjusted absolute
+        and % P/L. External cash flows raise/lower capital basis; they are
+        never presented as trading profit.
 
     Pure read, never raises: every derivation is wrapped so a malformed
     ``positions_json`` (defensive — ``get_portfolio`` already falls it back
@@ -8530,12 +8531,14 @@ def portfolio_api():
     pnl_vs_start = capital["deposit_adjusted_pnl"]
     pnl_vs_start_pct = capital["deposit_adjusted_return_pct"]
     if total_value is not None:
-        pnl_vs_initial = round(total_value - INITIAL_CASH, 2)
-        pnl_vs_initial_pct = (round((total_value / INITIAL_CASH - 1.0) * 100.0, 2)
-                              if INITIAL_CASH > 0 else None)
+        raw_pnl_including_deposits = round(total_value - INITIAL_CASH, 2)
+        raw_pnl_including_deposits_pct = (
+            round((total_value / INITIAL_CASH - 1.0) * 100.0, 2)
+            if INITIAL_CASH > 0 else None
+        )
     else:
-        pnl_vs_initial = None
-        pnl_vs_initial_pct = None
+        raw_pnl_including_deposits = None
+        raw_pnl_including_deposits_pct = None
 
     return jsonify({
         "total_value": total_value,
@@ -8550,8 +8553,10 @@ def portfolio_api():
         "last_updated": pf.get("last_updated"),
         "pnl_vs_start": pnl_vs_start,
         "pnl_vs_start_pct": pnl_vs_start_pct,
-        "pnl_vs_initial": pnl_vs_initial,
-        "pnl_vs_initial_pct": pnl_vs_initial_pct,
+        "pnl_vs_initial": pnl_vs_start,
+        "pnl_vs_initial_pct": pnl_vs_start_pct,
+        "raw_pnl_including_deposits": raw_pnl_including_deposits,
+        "raw_pnl_including_deposits_pct": raw_pnl_including_deposits_pct,
     })
 
 
