@@ -255,7 +255,9 @@ _TP_PCT_STANDARD = 0.15
 _SL_PCT_LEVERAGED = 0.10
 _TP_PCT_LEVERAGED = 0.25
 
-SYSTEM_PROMPT = """You are managing a paper trading portfolio with $1000 starting capital.
+SYSTEM_PROMPT = """You are managing a paper trading portfolio. Use the live
+portfolio value, cash balance, positions, and buying-power fields in CONTEXT as
+the source of truth for account size.
 Your ONLY goal is maximum profit. You have complete freedom over position sizing,
 risk, leverage, and timing. There are NO enforced limits. You can:
 - Put 100% of portfolio into one trade if you have high conviction
