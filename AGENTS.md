@@ -50,9 +50,21 @@ Hard rules for this machine:
   `digital-intern/dashboard/server.py` on port `8765`, exposed over Tailscale
   by `com.jonathan.trading-intelligence.unified-dashboard-tailnet-proxy`.
   The tested user-facing URL is
-  `http://your-macbook-3.tailaa3a85.ts.net:8765/`, not the no-port HTTPS URL.
+  `http://your-macbook-5.tailaa3a85.ts.net:8765/`, not the no-port HTTPS URL.
   OpenClaw Control `18789`, ArticleNet `8080`, and Paper Trader `8090` are not
   the unified trading dashboard.
+- The installed unified dashboard LaunchAgent uses
+  `launchd/run_unified_dashboard.sh` and must not be marked
+  `ProcessType=Background`. On 2026-06-08, launchd background I/O throttling
+  made Python import startup take long enough that the dashboard appeared dead.
+  The wrapper logs one startup line, then execs uvicorn. If `lsof` shows only
+  the tailnet proxy on `100.85.188.30:8765` but no `127.0.0.1:8765` Python
+  listener, reload the LaunchAgent and check
+  `logs/unified-dashboard.launchd.err.log`.
+- The unified dashboard serves HTML with `HTMLResponse`, and proxy/DB-backed
+  routes run blocking work via `asyncio.to_thread`. Do not revert these to
+  synchronous `urllib` or direct SQLite scans inside async handlers; one slow
+  page or stats request can otherwise freeze every dashboard button.
 - Do not rely on Tailscale Serve for this dashboard unless it has been fixed
   and retested. On 2026-06-07, `tailscale serve` printed the HTTPS URL but
   failed to persist config because the network extension could not add
@@ -87,7 +99,7 @@ Hard rules for this machine:
   Google News, Yahoo, press-release, and blog collectors. Backfill is expected
   to progress over multiple passes; do not restart it repeatedly just because
   the first pass is still fetching or de-duplicating.
-- Browser checks against `http://your-macbook-3.tailaa3a85.ts.net:8765/`
+- Browser checks against `http://your-macbook-5.tailaa3a85.ts.net:8765/`
   passed for Command Center, all visible nav routes, and stable page loads:
   `PLAYWRIGHT_MAGICDNS_COMMAND_CENTER_OK`, `PLAYWRIGHT_NAV_STATUS_OK`, and
   `PLAYWRIGHT_STABLE_PAGES_OK`. The populated unified dashboard/button pass
@@ -95,6 +107,15 @@ Hard rules for this machine:
   13 nav clicks, and 4 service-card links. That check also verifies the
   Command Center worker summary reports intentionally stopped workers as `off`
   in `DIGITAL_INTERN_WORKERS=web_server` mode.
+- `/intern/chat` is served by the Digital Intern `8080` service. Its
+  LaunchAgent must include `PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+  `DIGITAL_INTERN_LLM_MODEL=gpt-5.5`,
+  `DIGITAL_INTERN_CODEX_REASONING_EFFORT=xhigh`, and
+  `DIGITAL_INTERN_CHAT_LLM_TIMEOUT=45`. The helper
+  `digital-intern/core/claude_cli.py` also resolves `/usr/local/bin/codex`
+  directly because launchd's default PATH does not include it. A focused
+  Playwright test on 2026-06-08 verified the chat UI returns a real
+  `gpt-5.5` response through the Tailscale URL, not the degraded fallback.
 - Never print, paste, commit, or summarize tokens, API keys, OAuth payloads,
   credential files, or raw auth/profile JSON.
 
