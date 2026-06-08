@@ -10,16 +10,31 @@ Hard rules for this machine:
 - Do not run `paper-trader/run_continuous_backtests.py` unless Jonathan
   explicitly reverses the instruction. This Mac is not meant to run the
   continuous backtest/training loop.
-- Current Mac-safe steady state is dashboard/API only:
+- Current requested 2026-06-08 state is live Paper Trader plus dashboards:
   `com.jonathan.trading-intelligence.digital-intern` runs
   `dashboard.web_server.run_server(None)` on `127.0.0.1:8080`, and
   `com.jonathan.trading-intelligence.paper-trader` runs
-  `paper_trader.dashboard.run()` on `127.0.0.1:8090`.
-- Do not start `digital-intern/daemon.py` or `paper-trader/runner.py` as the
-  steady state on this Mac unless Jonathan explicitly asks for live collector
-  or trader loops. If `digital-intern/daemon.py` is used for a short supervised
-  refresh, set `DIGITAL_INTERN_CONTINUOUS_TRAINER=0` and return to the
-  dashboard-only LaunchAgent afterward.
+  `paper-trader/runner.py` on `127.0.0.1:8090`. The runner keeps the
+  dashboard/API up and sleeps during closed-market quiet windows. Watch memory
+  before changing its mode.
+- When Jonathan explicitly asks for article collection, use only the tracked
+  capped ArticleNet collector service:
+  `launchd/com.jonathan.trading-intelligence.article-aggregation.plist`.
+  It runs `digital-intern/article_aggregation_daemon.py` at low priority with
+  `DIGITAL_INTERN_CONTINUOUS_TRAINER=0`, no embedded web server, no scorer, no
+  alert worker, no paper-trading worker, and no backtest worker. Jonathan
+  later explicitly allowed the ArticleNet `ml_trainer`; it is allowed only in
+  this lightweight daemon, with `ML_TRAIN_BOOT_DELAY=600`,
+  `ML_TRAIN_INTERVAL=3600`, and `ML_TRAIN_MIN_FREE_PERCENT=55`. This is not
+  the heavier `continuous_trainer`.
+  This is not the full `digital-intern/daemon.py` training setup.
+  It sets `ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION=1` because the USB
+  recovered 2.35M-row DB already has the current schema/indexes, and the old
+  label cleanup can otherwise full-scan the table before workers start.
+- Do not start the full uncapped `digital-intern/daemon.py` worker set on this
+  Mac. If it is used for a short supervised diagnostic, set
+  `DIGITAL_INTERN_CONTINUOUS_TRAINER=0` and return to the lightweight
+  `article_aggregation_daemon.py` collector afterward.
 - Use `/Users/jonathan/trading-intelligence/.venv/bin/python`, created with
   Homebrew Python 3.12. Do not use the system `python3`.
 - Keep `numpy<2` for ArticleNet/Torch stability. `kokoro-onnx` has a metadata
@@ -62,6 +77,15 @@ Hard rules for this machine:
 - The recovered ArticleNet database has millions of rows. Keep
   `/api/articles` recency-indexed on `first_seen`; score-sorting the whole
   table blocked the unified dashboard after USB recovery.
+- On 2026-06-08, recovered `articles.db` had 2,352,913 rows, with newest
+  `first_seen` at `2026-06-04T22:22:57.771833+00:00` and zero articles from
+  the previous 72 hours. The recovery target is continuous article aggregation
+  only. Do not fill this gap by starting continuous training or continuous
+  backtests on this Mac. The Mac launchd ArticleNet service rotates 48 of 259
+  GDELT seven-day queries every 5 minutes with one worker, plus capped RSS,
+  Google News, Yahoo, press-release, and blog collectors. Backfill is expected
+  to progress over multiple passes; do not restart it repeatedly just because
+  the first pass is still fetching or de-duplicating.
 - Browser checks against `http://your-macbook-3.tailaa3a85.ts.net:8765/`
   passed for Command Center, all visible nav routes, and stable page loads:
   `PLAYWRIGHT_MAGICDNS_COMMAND_CENTER_OK`, `PLAYWRIGHT_NAV_STATUS_OK`, and
@@ -81,3 +105,7 @@ ps -ax -o pid,ppid,state,%cpu,%mem,etime,command | sort -k4 -nr | sed -n '1,20p'
 ```
 
 If load is still high, wait. Do not force service startup into a hot machine.
+On this Mac, memory pressure matters more than raw CPU load. Check
+`memory_pressure`, `vm_stat`, and per-process RSS/%MEM before and after
+starting collectors; stop the collector if memory pressure becomes elevated or
+swap activity starts climbing.

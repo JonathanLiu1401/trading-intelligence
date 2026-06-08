@@ -1,5 +1,6 @@
 """Per-ticker news scraper using yfinance."""
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -8,7 +9,7 @@ import yfinance as yf
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WATCHLIST_PATH = BASE_DIR / "config" / "watchlist.json"
-MAX_WORKERS = 15
+MAX_WORKERS = int(os.environ.get("TICKER_NEWS_MAX_WORKERS", "15"))
 
 
 def _load_all_tickers() -> list:

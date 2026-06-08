@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -68,6 +69,43 @@ def _sleep(seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, seconds)
     while _running and time.monotonic() < deadline:
         time.sleep(min(1.0, deadline - time.monotonic()))
+
+
+def _memory_free_percent() -> int | None:
+    try:
+        proc = subprocess.run(
+            ["memory_pressure"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    for line in proc.stdout.splitlines():
+        if "System-wide memory free percentage:" not in line:
+            continue
+        try:
+            return int(line.rsplit(":", 1)[1].strip().rstrip("%"))
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def _memory_allows_training() -> bool:
+    min_free = int(os.environ.get("ML_TRAIN_MIN_FREE_PERCENT", "55") or "55")
+    free_pct = _memory_free_percent()
+    if free_pct is None:
+        log.warning("[ml_trainer] memory check unavailable; skipping this cycle")
+        return False
+    if free_pct < min_free:
+        log.warning(
+            "[ml_trainer] skipping cycle; memory free percentage %s%% below %s%%",
+            free_pct,
+            min_free,
+        )
+        return False
+    return True
 
 
 def _handle_signal(_sig, _frame) -> None:
@@ -190,6 +228,42 @@ def _purge_worker(store: ArticleStore) -> None:
         _sleep(300)
 
 
+def _ml_trainer_worker(store: ArticleStore) -> None:
+    interval = _env_seconds("ML_TRAIN_INTERVAL", 3600)
+    boot_delay = _env_seconds("ML_TRAIN_BOOT_DELAY", 600)
+    log.info("[ml_trainer] started interval=%ss boot_delay=%ss", interval, boot_delay)
+
+    _sleep(boot_delay)
+    while _running:
+        started = time.monotonic()
+        try:
+            if not _memory_allows_training():
+                _sleep(interval)
+                continue
+            from ml.trainer import train as _ml_train
+
+            log.info("[ml_trainer] training ArticleNet...")
+            metrics = _ml_train(store)
+            status = metrics.get("status") if isinstance(metrics, dict) else None
+            elapsed = time.monotonic() - started
+            if status == "ok":
+                _worker_last_ok["ml_trainer"] = time.time()
+                log.info(
+                    "[ml_trainer] done status=%s n=%s val_loss=%s elapsed=%.1fs",
+                    status,
+                    metrics.get("n"),
+                    metrics.get("val_loss"),
+                    elapsed,
+                )
+            else:
+                log.warning("[ml_trainer] result=%s elapsed=%.1fs", metrics, elapsed)
+        except MemoryError:
+            log.warning("[ml_trainer] MemoryError; backing off")
+        except Exception as e:
+            log.warning("[ml_trainer] error: %s", e)
+        _sleep(interval)
+
+
 def main() -> None:
     lock_fd = _acquire_singleton_lock()
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -240,7 +314,7 @@ def main() -> None:
         ),
     ]
 
-    known_workers = {name for name, *_ in workers} | {"stats", "purge"}
+    known_workers = {name for name, *_ in workers} | {"stats", "purge", "ml_trainer"}
     unknown_workers = sorted(requested - known_workers)
     if unknown_workers:
         log.warning("[article_aggregation] unknown DIGITAL_INTERN_WORKERS ignored: %s", unknown_workers)
@@ -259,7 +333,7 @@ def main() -> None:
         t.start()
         threads.append(t)
 
-    utility_workers = [("stats", _stats_worker), ("purge", _purge_worker)]
+    utility_workers = [("stats", _stats_worker), ("purge", _purge_worker), ("ml_trainer", _ml_trainer_worker)]
     if requested:
         utility_workers = [(name, fn) for name, fn in utility_workers if name in requested]
     for name, fn in utility_workers:

@@ -6,6 +6,7 @@ data/google_news_cursor.json so progress survives restarts. The full universe
 gets covered over ``len(tickers) / BATCH`` passes.
 """
 import hashlib
+import os
 import json
 import sqlite3
 import time
@@ -23,7 +24,7 @@ CURSOR_PATH = BASE_DIR / "data" / "google_news_cursor.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 
 # How many tickers to fetch per call.
-BATCH_PER_PASS = 64
+BATCH_PER_PASS = int(os.environ.get("GOOGLE_NEWS_BATCH_PER_PASS", "64"))
 # Skip a ticker if we polled it within this many seconds (prevents thrash on restart).
 PER_TICKER_COOLDOWN_SEC = 10
 USER_AGENT = "Mozilla/5.0 (Digital Intern Daemon)"
@@ -191,7 +192,8 @@ def collect_google_news(batch: int = BATCH_PER_PASS) -> list:
     # Fetch all selected tickers in parallel.
     raw_per_ticker: list[list] = []
     if selected:
-        with ThreadPoolExecutor(max_workers=min(len(selected), 16)) as ex:
+        max_workers = int(os.environ.get("GOOGLE_NEWS_MAX_WORKERS", "16"))
+        with ThreadPoolExecutor(max_workers=min(len(selected), max(1, max_workers))) as ex:
             futures = {ex.submit(_fetch_ticker_feed, t): t for t in selected}
             for fut in as_completed(futures):
                 try:

@@ -661,6 +661,14 @@ class ArticleStore:
                 _log.warning(
                     f"[article_store] title_source_fingerprint index migration skipped: {e}"
                 )
+            if os.environ.get("ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                _log.info("[article_store] label-cleanup migration skipped by environment")
+                return
             # One-time cleanup of training-label contamination: model predictions
             # that were written into ai_score (the column the trainer reads as
             # ground truth) created a feedback loop where the model trained on
