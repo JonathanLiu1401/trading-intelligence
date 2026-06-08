@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jonathan.trading-intelligence.article-aggregation</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/nice</string>
+    <string>-n</string>
+    <string>18</string>
+    <string>/Users/jonathan/trading-intelligence/.venv/bin/python</string>
+    <string>article_aggregation_daemon.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jonathan/trading-intelligence/digital-intern</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>.</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>DIGITAL_INTERN_CONTINUOUS_TRAINER</key>
+    <string>0</string>
+    <key>DIGITAL_INTERN_EMBEDDED_WEB</key>
+    <string>0</string>
+    <key>ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION</key>
+    <string>1</string>
+    <key>DIGITAL_INTERN_WORKERS</key>
+    <string>gdelt,rss,google_news,yahoo_ticker_rss,market_movers,yahoo_trending,benzinga_analyst,globenewswire,prnewswire,seekingalpha,financial_blogs,investment_research_blogs,ml_trainer,stats,purge</string>
+    <key>RSS_INTERVAL</key>
+    <string>300</string>
+    <key>RSS_MAX_WORKERS</key>
+    <string>4</string>
+    <key>GDELT_INTERVAL</key>
+    <string>300</string>
+    <key>GDELT_MAX_WORKERS</key>
+    <string>1</string>
+    <key>GDELT_QUERY_BATCH_PER_PASS</key>
+    <string>48</string>
+    <key>GOOGLE_NEWS_INTERVAL</key>
+    <string>300</string>
+    <key>GOOGLE_NEWS_BATCH_PER_PASS</key>
+    <string>6</string>
+    <key>GOOGLE_NEWS_MAX_WORKERS</key>
+    <string>2</string>
+    <key>YAHOO_TICKER_RSS_INTERVAL</key>
+    <string>600</string>
+    <key>MARKET_MOVERS_INTERVAL</key>
+    <string>600</string>
+    <key>YAHOO_TRENDING_INTERVAL</key>
+    <string>600</string>
+    <key>BENZINGA_INTERVAL</key>
+    <string>300</string>
+    <key>GLOBENEWSWIRE_INTERVAL</key>
+    <string>300</string>
+    <key>PRNEWSWIRE_INTERVAL</key>
+    <string>300</string>
+    <key>FINANCIAL_BLOGS_INTERVAL</key>
+    <string>600</string>
+    <key>INVESTMENT_RESEARCH_BLOGS_INTERVAL</key>
+    <string>900</string>
+    <key>FINVIZ_INTERVAL</key>
+    <string>600</string>
+    <key>SEEKINGALPHA_INTERVAL</key>
+    <string>600</string>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jonathan/trading-intelligence/logs/article-aggregation.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jonathan/trading-intelligence/logs/article-aggregation.launchd.err.log</string>
+</dict>
+</plist>
