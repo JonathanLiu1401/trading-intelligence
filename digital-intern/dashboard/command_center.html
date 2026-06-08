@@ -70,7 +70,7 @@ async function loadCommandCenter(){
   badge("deskState",text(desk.state,"UNKNOWN"),desk.state==="HEALTHY"?"ok":"warn");
   $("deskHeadline").textContent=text(desk.headline,"No desk pulse available.");
   $("mEquity").textContent=money(desk.money?.equity_usd??d.trader?.portfolio?.total_value);
-  $("mReturn").textContent=pct(desk.money?.total_return_pct??d.trader?.portfolio?.deposit_adjusted_return_pct);
+  $("mReturn").textContent=pct(desk.money?.deposit_adjusted_return_pct??d.trader?.portfolio?.deposit_adjusted_return_pct??desk.money?.total_return_pct);
   $("mOpen").textContent=num(desk.concentration?.n_open_positions??d.trader?.portfolio?.n_positions);
   $("mCode").textContent=text((desk.integrity?.status)||(d.trader?.build_info?.stale===false?"CURRENT":"STALE"));
   const plan=d.trader?.game_plan||{};
