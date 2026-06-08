@@ -628,6 +628,9 @@ GOOGLE_NEWS_MAX_WORKERS=2
 ML_TRAIN_BOOT_DELAY=600
 ML_TRAIN_INTERVAL=3600
 ML_TRAIN_MIN_FREE_PERCENT=55
+ML_TRAIN_STRONG_LIMIT=20000
+ML_TRAIN_KW_MAX_FRACTION=0.5
+ML_TRAIN_KW_MIN=2000
 YAHOO_TICKER_RSS_INTERVAL=600
 MARKET_MOVERS_INTERVAL=600
 YAHOO_TRENDING_INTERVAL=600
@@ -636,7 +639,10 @@ YAHOO_TRENDING_INTERVAL=600
 `ml_trainer` is allowed, but only after the 10-minute boot delay and only when
 `memory_pressure` reports at least 55% system-wide free memory. If memory is
 below the threshold, the trainer logs a skip and backs off for the configured
-interval. This is separate from `continuous_trainer`, which remains disabled.
+interval. The Mac plist also caps the strong-label query at 20,000 rows and
+the weak-label mix to 50% of that pool, with a 2,000-row minimum, so the trainer
+does not build the old 100k-row feature matrix on this 8 GB machine. This is
+separate from `continuous_trainer`, which remains disabled.
 
 GDELT uses a 7-day query window, so it should naturally recover much of the
 2026-06-04 through 2026-06-08 article gap. On this Mac the service rotates

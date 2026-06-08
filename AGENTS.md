@@ -25,8 +25,9 @@ Hard rules for this machine:
   alert worker, no paper-trading worker, and no backtest worker. Jonathan
   later explicitly allowed the ArticleNet `ml_trainer`; it is allowed only in
   this lightweight daemon, with `ML_TRAIN_BOOT_DELAY=600`,
-  `ML_TRAIN_INTERVAL=3600`, and `ML_TRAIN_MIN_FREE_PERCENT=55`. This is not
-  the heavier `continuous_trainer`.
+  `ML_TRAIN_INTERVAL=3600`, `ML_TRAIN_MIN_FREE_PERCENT=55`,
+  `ML_TRAIN_STRONG_LIMIT=20000`, `ML_TRAIN_KW_MAX_FRACTION=0.5`, and
+  `ML_TRAIN_KW_MIN=2000`. This is not the heavier `continuous_trainer`.
   This is not the full `digital-intern/daemon.py` training setup.
   It sets `ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION=1` because the USB
   recovered 2.35M-row DB already has the current schema/indexes, and the old

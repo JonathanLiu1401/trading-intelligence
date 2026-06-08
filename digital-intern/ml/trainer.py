@@ -273,11 +273,13 @@ def _fetch_training_data(
 
     # Strong labels: ground-truth LLM-sourced ai_score, plus synthetic
     # backtest/opus rows (legitimate fractional labels, score_source NULL).
+    strong_limit = max(1000, int(os.environ.get("ML_TRAIN_STRONG_LIMIT", "100000") or "100000"))
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
         f"WHERE {STRONG_LABEL_WHERE} "
-        "ORDER BY first_seen DESC LIMIT 100000"
+        "ORDER BY first_seen DESC LIMIT ?",
+        (strong_limit,),
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
@@ -298,8 +300,9 @@ def _fetch_training_data(
     # labels were < MIN_TRAIN_SAMPLES, which meant the trainer saw a near-flat
     # label distribution once Sonnet had labeled enough rows. Cap the kw pool
     # so it doesn't overwhelm the high-quality LLM signal.
-    KW_MAX_FRACTION = 0.5
-    kw_cap = max(2000, int(n_strong * KW_MAX_FRACTION))
+    kw_max_fraction = float(os.environ.get("ML_TRAIN_KW_MAX_FRACTION", "0.5") or "0.5")
+    kw_min = max(0, int(os.environ.get("ML_TRAIN_KW_MIN", "2000") or "2000"))
+    kw_cap = max(kw_min, int(n_strong * kw_max_fraction))
     cur2 = store.conn.execute(
         "SELECT title, full_text, kw_score, source, published "
         "FROM articles WHERE ai_score = 0 AND kw_score > 0 "
