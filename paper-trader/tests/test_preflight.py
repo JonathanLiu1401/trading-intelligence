@@ -10,6 +10,7 @@ requires argv[0] to be a python interpreter.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -174,15 +175,6 @@ class TestBuildPreflight:
         assert out["exit_code"] == 3
 
     def test_no_actionable_signal_when_all_green(self):
-        # Note: in current behaviour, all-HEALTHY constituents leave overall
-        # at the NO_DATA sentinel (HEALTHY and NO_DATA share rank 0 and
-        # _worse uses >=, so the initial NO_DATA "wins" any HEALTHY beat).
-        # This is benign — both map to exit_code 0 — but it means the
-        # operator sees the NO_DATA wording when in fact everything is fine.
-        # Locking the current behaviour so a future tightening (initialise
-        # level to HEALTHY, or promote HEALTHY above NO_DATA in the rank
-        # table) surfaces in this test rather than silently flipping a
-        # documented exit-code/payload contract.
         out = build_preflight(
             runner_pids=[12345],
             heartbeat={"verdict": "HEALTHY", "headline": "ok"},
@@ -191,13 +183,25 @@ class TestBuildPreflight:
                   "chosen_age_hours": 0.5},
             now=self.NOW,
         )
-        # Exit code 0 either way (HEALTHY and NO_DATA both map to 0).
+        assert out["overall"] == "HEALTHY"
         assert out["exit_code"] == 0
-        assert out["overall"] in ("HEALTHY", "NO_DATA")
         assert "alive (pid 12345)" in out["runner_process"]
         # No drivers when nothing tripped (any DEGRADED/DOWN would have
         # appended one).
         assert out["drivers"] == []
+
+    def test_insufficient_reliability_with_healthy_heartbeat_is_healthy(self):
+        out = build_preflight(
+            runner_pids=None,
+            heartbeat={"verdict": "HEALTHY", "headline": "last decision 8s ago"},
+            reliability={"state": "INSUFFICIENT", "headline": "sample 3 (<12)"},
+            feed={"split_brain": False, "stale": False,
+                  "chosen_age_hours": 0.5},
+            now=self.NOW,
+        )
+        assert out["overall"] == "HEALTHY"
+        assert out["exit_code"] == 0
+        assert "no decisions recorded" not in out["headline"]
 
     def test_heartbeat_stalled_drives_down(self):
         out = build_preflight(
@@ -287,8 +291,6 @@ class TestBuildPreflight:
 
     def test_runner_pids_none_does_not_drive_down(self):
         # ``None`` means probe unavailable (no /proc); must NOT trip DOWN.
-        # Overall stays at the all-HEALTHY (≡ NO_DATA sentinel, see
-        # test_no_actionable_signal_when_all_green) level, NOT DOWN.
         out = build_preflight(
             runner_pids=None,
             heartbeat={"verdict": "HEALTHY", "headline": "ok"},
@@ -296,7 +298,7 @@ class TestBuildPreflight:
             feed=None,
             now=self.NOW,
         )
-        assert out["overall"] in ("HEALTHY", "NO_DATA")
+        assert out["overall"] == "HEALTHY"
         assert out["exit_code"] == 0
         assert "probe unavailable" in out["runner_process"]
         # The "no runner found" driver must NOT be present — None ≠ [].
@@ -390,3 +392,42 @@ class TestScanProcLoop:
                 f"Scan returned pid {pid} but its cmdline does not "
                 f"pass the runner predicate: {cmdline!r}"
             )
+
+
+class TestCli:
+    def test_json_flag_emits_machine_readable_payload(self, monkeypatch, capsys):
+        from paper_trader import preflight as pf
+
+        payload = {
+            "overall": "HEALTHY",
+            "exit_code": 0,
+            "headline": "HEALTHY — ok",
+        }
+        monkeypatch.setattr(pf, "run_preflight", lambda: payload)
+
+        assert pf._cli(["--json"]) == 0
+        out = capsys.readouterr().out
+        assert json.loads(out) == payload
+        assert "=== paper-trader preflight ===" not in out
+
+    def test_human_mode_still_prints_report(self, monkeypatch, capsys):
+        from paper_trader import preflight as pf
+
+        payload = {
+            "as_of": "2026-05-24T12:00:00+00:00",
+            "overall": "NO_DATA",
+            "exit_code": 0,
+            "headline": "NO_DATA — no decisions recorded yet.",
+            "recommended_action": "Re-run later.",
+            "runner_process": "process probe unavailable",
+            "heartbeat": None,
+            "reliability": None,
+            "feed": None,
+            "drivers": [],
+        }
+        monkeypatch.setattr(pf, "run_preflight", lambda: payload)
+
+        assert pf._cli([]) == 0
+        out = capsys.readouterr().out
+        assert "=== paper-trader preflight ===" in out
+        assert "overall  : NO_DATA" in out

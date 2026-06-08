@@ -51,7 +51,9 @@ is worse than useless to a trader at the open).
 """
 from __future__ import annotations
 
+import argparse
 import glob
+import json
 import os
 import sqlite3
 import sys
@@ -209,6 +211,7 @@ def build_preflight(
 
     drivers: list[str] = []
     level = "NO_DATA"
+    saw_live_trader_data = False
 
     # ── runner process liveness (the offline-only fact) ──────────────────
     if runner_pids is None:
@@ -219,6 +222,7 @@ def build_preflight(
         drivers.append("runner process not running")
     else:
         proc_note = f"runner alive (pid {', '.join(map(str, runner_pids))})"
+        saw_live_trader_data = True
 
     # ── loop liveness (heartbeat builder, verbatim verdict) ──────────────
     if hb_verdict == "STALLED":
@@ -228,9 +232,12 @@ def build_preflight(
         level = _worse(level, "DEGRADED")
         drivers.append(f"heartbeat LAGGING: {(heartbeat or {}).get('headline','')}")
     elif hb_verdict == "HEALTHY":
+        saw_live_trader_data = True
         level = _worse(level, "HEALTHY")
 
     # ── NO_DECISION reliability (decision_reliability, verbatim state) ────
+    if rel_state != "NO_DATA":
+        saw_live_trader_data = True
     if rel_state in ("CRITICAL", "DEGRADED", "STALE_LEGACY_DOMINATED") or rel_restart:
         level = _worse(level, "DEGRADED")
         drivers.append(
@@ -254,6 +261,9 @@ def build_preflight(
                 else "feed stale: freshest live article is old")
         else:
             level = _worse(level, "HEALTHY")
+
+    if level == "NO_DATA" and saw_live_trader_data and not drivers:
+        level = "HEALTHY"
 
     headline, action = _summarize(level, drivers)
     return {
@@ -358,7 +368,21 @@ def _print_report(rep: dict) -> None:
     print(f"action : {rep['recommended_action']}")
 
 
-if __name__ == "__main__":
+def _cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Offline paper-trader preflight health check.")
+    parser.add_argument(
+        "--json", action="store_true",
+        help="emit the machine-readable preflight payload")
+    args = parser.parse_args(argv)
+
     report = run_preflight()
-    _print_report(report)
-    sys.exit(int(report.get("exit_code", 0)))
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        _print_report(report)
+    return int(report.get("exit_code", 0))
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())

@@ -972,6 +972,13 @@ class TestAgeHours:
 
 
 class TestFeedStatusAndWarn:
+    def test_default_local_db_points_at_repo_sibling_digital_intern(self):
+        expected = (
+            Path(__file__).resolve().parents[2]
+            / "digital-intern" / "data" / "articles.db"
+        )
+        assert signals.LOCAL_DB == expected
+
     def test_split_brain_flags_restart_needed(self, two_dbs):
         usb, local = two_dbs
         _make_db(usb, live_ago_h=30)           # what legacy resolver would pick
@@ -991,6 +998,15 @@ class TestFeedStatusAndWarn:
         assert st["legacy_choice"] == str(usb)
         assert st["split_brain"] is False      # legacy == chosen
         assert st["stale"] is True             # pipeline down — restart won't help
+
+    def test_missing_all_candidates_is_unavailable_not_ok(self, two_dbs):
+        _, local = two_dbs
+        st = signals.feed_status()
+        assert st["chosen"] == str(local)
+        assert st["chosen_age_hours"] is None
+        assert st["unavailable"] is True
+        assert st["stale"] is True
+        assert st["split_brain"] is False
 
     def test_warn_fires_once_then_dedups(self, two_dbs, capfd):
         usb, local = two_dbs
@@ -1049,6 +1065,12 @@ class TestCheckFreshnessCLI:
         rc = signals._print_freshness_report()
         assert rc == 2
         assert "STALE" in capsys.readouterr().out
+
+    def test_exit_2_on_unavailable_feed(self, two_dbs, capsys):
+        rc = signals._print_freshness_report()
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "no readable live article timestamp" in out
 
     def test_exit_0_when_fresh(self, two_dbs, capsys):
         usb, local = two_dbs
