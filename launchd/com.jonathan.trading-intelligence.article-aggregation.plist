@@ -54,6 +54,12 @@
     <string>3600</string>
     <key>ML_TRAIN_MIN_FREE_PERCENT</key>
     <string>55</string>
+    <key>ML_TRAIN_STRONG_LIMIT</key>
+    <string>20000</string>
+    <key>ML_TRAIN_KW_MAX_FRACTION</key>
+    <string>0.5</string>
+    <key>ML_TRAIN_KW_MIN</key>
+    <string>2000</string>
     <key>YAHOO_TICKER_RSS_INTERVAL</key>
     <string>600</string>
     <key>MARKET_MOVERS_INTERVAL</key>
