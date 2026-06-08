@@ -11,7 +11,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DIGITAL_INTERN = "/home/zeph/trading-intelligence/digital-intern"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_DIGITAL_INTERN = _REPO_ROOT / "digital-intern"
+DIGITAL_INTERN = os.environ.get("DIGITAL_INTERN_DIR", str(_DEFAULT_DIGITAL_INTERN))
 if DIGITAL_INTERN not in sys.path:
     sys.path.insert(0, DIGITAL_INTERN)
 
@@ -234,7 +236,8 @@ def feed_status() -> dict:
         "chosen_age_hours": chosen_age,
         "legacy_choice": str(legacy),
         "legacy_age_hours": legacy_age,
-        "stale": chosen_age is not None and chosen_age >= _STALE_FEED_WARN_HOURS,
+        "unavailable": chosen_age is None,
+        "stale": chosen_age is None or chosen_age >= _STALE_FEED_WARN_HOURS,
         "split_brain": bool(split_brain),
         "candidates": candidates,
     }
@@ -775,9 +778,14 @@ def _print_freshness_report() -> int:
               "paper trader to apply.")
         return 3
     if st["stale"]:
-        print(f"\nSTALE: the freshest copy anywhere is {castr} old "
-              f"(>= {_STALE_FEED_WARN_HOURS:.0f}h). The digital-intern pipeline "
-              "looks down — a trader restart will NOT help; fix the news daemon.")
+        if st.get("unavailable"):
+            print("\nSTALE: no readable live article timestamp was found in any "
+                  "candidate DB. The digital-intern feed path is unavailable or "
+                  "empty — a trader restart will NOT help; fix the news daemon.")
+        else:
+            print(f"\nSTALE: the freshest copy anywhere is {castr} old "
+                  f"(>= {_STALE_FEED_WARN_HOURS:.0f}h). The digital-intern pipeline "
+                  "looks down — a trader restart will NOT help; fix the news daemon.")
         return 2
     print("\nOK: the freshest feed is current and the legacy resolver agrees.")
     return 0
