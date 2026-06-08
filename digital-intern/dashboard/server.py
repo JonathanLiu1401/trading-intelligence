@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ _QUIET_WORKERS = {
 WORKER_TAG_RE = re.compile(r"\[([a-z_]+?)(?:_worker)?\]")
 
 SERVER_STARTED_AT = time.time()
+_HTTP_READ_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="dashboard-http")
 
 app = FastAPI(title="Digital Intern Dashboard", version="1.0")
 app.add_middleware(
@@ -435,6 +437,36 @@ def _read_http_json(port: int, path: str, timeout: float = 4.0) -> dict[str, Any
         return {"ok": False, "status": None, "data": None, "error": str(e)}
 
 
+def _read_many_http_json(
+    specs: dict[str, tuple[int, str, float]],
+    *,
+    global_timeout: float = 4.5,
+) -> dict[str, dict[str, Any]]:
+    futures = {
+        _HTTP_READ_POOL.submit(_read_http_json, port, path, timeout): (key, timeout)
+        for key, (port, path, timeout) in specs.items()
+    }
+    results: dict[str, dict[str, Any]] = {}
+    try:
+        for future in as_completed(futures, timeout=global_timeout):
+            key, _timeout = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                results[key] = {"ok": False, "status": None, "data": None, "error": str(e)}
+    except TimeoutError:
+        pass
+    for future, (key, timeout) in futures.items():
+        if key not in results:
+            results[key] = {
+                "ok": False,
+                "status": None,
+                "data": None,
+                "error": f"timed out after {timeout:.1f}s",
+            }
+    return results
+
+
 def _row_value(row: dict[str, Any], key: str) -> Any:
     value = row
     for part in key.split("."):
@@ -681,14 +713,27 @@ def _section_payload(section: str) -> dict[str, Any]:
 
 
 def _command_center_payload() -> dict[str, Any]:
-    intern_stats = _read_http_json(8080, "/api/stats", timeout=3.0)
-    intern_health = _read_http_json(8080, "/api/health", timeout=3.0)
-    trader_health = _read_http_json(8090, "/api/healthz", timeout=3.0)
-    trader_portfolio = _read_http_json(8090, "/api/portfolio", timeout=3.0)
-    trader_desk = _read_http_json(8090, "/api/desk-pulse", timeout=4.0)
-    trader_game = _read_http_json(8090, "/api/game-plan", timeout=5.0)
-    trader_session = _read_http_json(8090, "/api/session-delta?minutes=360", timeout=4.0)
-    trader_build = _read_http_json(8090, "/api/build-info", timeout=3.0)
+    upstream = _read_many_http_json(
+        {
+            "intern_stats": (8080, "/api/stats", 2.0),
+            "intern_health": (8080, "/api/health", 2.0),
+            "trader_health": (8090, "/api/healthz", 2.0),
+            "trader_portfolio": (8090, "/api/portfolio", 2.0),
+            "trader_desk": (8090, "/api/desk-pulse", 2.5),
+            "trader_game": (8090, "/api/game-plan", 3.0),
+            "trader_session": (8090, "/api/session-delta?minutes=360", 2.5),
+            "trader_build": (8090, "/api/build-info", 2.0),
+        },
+        global_timeout=4.0,
+    )
+    intern_stats = upstream["intern_stats"]
+    intern_health = upstream["intern_health"]
+    trader_health = upstream["trader_health"]
+    trader_portfolio = upstream["trader_portfolio"]
+    trader_desk = upstream["trader_desk"]
+    trader_game = upstream["trader_game"]
+    trader_session = upstream["trader_session"]
+    trader_build = upstream["trader_build"]
 
     workers = _worker_health()
     worker_counts = {
@@ -1006,13 +1051,13 @@ async def ops_dashboard():
 @app.get("/api/command-center")
 @app.get("/ops/api/command-center")
 async def api_command_center():
-    return JSONResponse(_command_center_payload())
+    return JSONResponse(await asyncio.to_thread(_command_center_payload))
 
 
 @app.get("/api/action-queue")
 @app.get("/ops/api/action-queue")
 async def api_action_queue():
-    payload = _command_center_payload()
+    payload = await asyncio.to_thread(_command_center_payload)
     return JSONResponse({
         "as_of": payload["as_of"],
         "items": payload["action_queue"],

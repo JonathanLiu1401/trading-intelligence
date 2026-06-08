@@ -1,5 +1,7 @@
 """GDELT 2.0 DOC API collector — 7-day window, parallel queries, SQLite deduplication."""
 import hashlib
+import json
+import os
 import requests
 import sqlite3
 import time
@@ -11,10 +13,12 @@ GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 MAX_RECORDS = 250       # GDELT API hard limit per query
 TIMESPAN = "10080"      # 7 days in minutes — maximise coverage; SQLite dedupes repeats
 REQUEST_TIMEOUT = 20
-MAX_WORKERS = 10  # throttled from 30 — USB DB can't handle 30 concurrent writers
+MAX_WORKERS = int(os.environ.get("GDELT_MAX_WORKERS", "10"))  # default throttled from 30
+QUERY_BATCH_PER_PASS = int(os.environ.get("GDELT_QUERY_BATCH_PER_PASS", "0") or "0")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
+CURSOR_PATH = BASE_DIR / "data" / "gdelt_query_cursor.json"
 
 # -------------------------------------------------------------------------
 # Query list — breadth > depth; each query returns up to 250 unique articles
@@ -252,6 +256,28 @@ MULTILANG_QUERIES = [
 ]
 
 
+def _select_queries() -> list[tuple[str, str | None, str]]:
+    queries = [(q, None, q) for q in QUERY_GROUPS]
+    queries.extend((q, lang, f"{q} [{lang}]") for q, lang in MULTILANG_QUERIES)
+    total = len(queries)
+    if QUERY_BATCH_PER_PASS <= 0 or QUERY_BATCH_PER_PASS >= total:
+        return queries
+
+    try:
+        cursor = json.loads(CURSOR_PATH.read_text()).get("offset", 0)
+    except Exception:
+        cursor = 0
+    cursor = int(cursor) % total
+    batch = [queries[(cursor + i) % total] for i in range(QUERY_BATCH_PER_PASS)]
+    next_cursor = (cursor + QUERY_BATCH_PER_PASS) % total
+    try:
+        CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CURSOR_PATH.write_text(json.dumps({"offset": next_cursor, "total": total}) + "\n")
+    except Exception:
+        pass
+    return batch
+
+
 def _ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # Hardened seen_articles.db connection — mirrors google_news._ensure_db /
@@ -309,10 +335,10 @@ def _fetch_query(keyword_query: str, sourcelang: str | None = None) -> list:
 
 def collect_gdelt() -> list:
     """Run all queries in parallel; skip already-seen articles via SQLite."""
+    selected_queries = _select_queries()
     total_queries = len(QUERY_GROUPS) + len(MULTILANG_QUERIES)
-    print(f"[gdelt] Starting {total_queries} parallel queries "
-          f"({len(QUERY_GROUPS)} EN + {len(MULTILANG_QUERIES)} multilang; "
-          f"7-day window, max {MAX_RECORDS} each)...")
+    print(f"[gdelt] Starting {len(selected_queries)}/{total_queries} queries "
+          f"(workers={MAX_WORKERS}, 7-day window, max {MAX_RECORDS} each)...")
     t0 = time.time()
 
     conn = _ensure_db()
@@ -320,9 +346,10 @@ def collect_gdelt() -> list:
     seen_urls: set[str] = set()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_query, q): q for q in QUERY_GROUPS}
-        for ml_q, lang in MULTILANG_QUERIES:
-            futures[executor.submit(_fetch_query, ml_q, lang)] = f"{ml_q} [{lang}]"
+        futures = {
+            executor.submit(_fetch_query, query, lang): label
+            for query, lang, label in selected_queries
+        }
         for future in as_completed(futures):
             for art in future.result():
                 url = art["link"]

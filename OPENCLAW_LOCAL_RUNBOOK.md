@@ -29,14 +29,59 @@ Current recovered runtime state:
 
 ```text
 digital-intern/data/articles.db: 2,352,913 articles
+  newest first_seen: 2026-06-04T22:22:57.771833+00:00
+  articles from last 24h on 2026-06-08: 0
+  articles from last 72h on 2026-06-08: 0
 digital-intern/data/seen_articles.db: recovered USB copy
 digital-intern/data/source_health.db: recovered USB copy
 digital-intern/data/paper_trader_signals.db: recovered USB copy
 digital-intern/ml and digital-intern/db/ml*: recovered ArticleNet artifacts
 paper-trader/backtest.db: 273 MB recovered USB copy
+  backtest_runs: 520
+  newest started_at/completed_at: 2026-06-04T22:17:36.662603Z
 paper-trader/data: 733 MB recovered USB copy
 paper-trader/.env: restored from recovered_sensitive and chmod 600
 ```
+
+Because Trading Intelligence was down for several days, ArticleNet has a real
+ingestion gap from after 2026-06-04 through 2026-06-08. Backfill this by
+running the capped continuous article aggregation service documented below.
+Do not attempt to compensate by starting continuous training or continuous
+backtests on this Mac.
+
+The USB itself was not mounted under `/Volumes` during the 2026-06-08 apply
+pass; the complete recovered copy was available from the private backup repo:
+
+```text
+/Users/jonathan/openclaw-usb-recovery
+```
+
+Relevant recovered runtime data has been applied into the live stack:
+
+```text
+USB digital-intern/db/articles.db -> live digital-intern/data/articles.db
+USB digital-intern/db/seen_articles.db -> live digital-intern/data/seen_articles.db
+USB digital-intern/db/source_health.db -> live digital-intern/data/source_health.db
+USB digital-intern/data/* cursors/signals/ml data -> live digital-intern/data/*
+USB digital-intern/ml and db/ml* -> live digital-intern/ml and db/ml*
+USB paper-trader/backtest.db -> live paper-trader/backtest.db
+USB paper-trader/data/* -> live paper-trader/data/*
+USB paper-trader/.env -> live paper-trader/.env, chmod 600
+USB paper-trader/logs/runner.log -> live paper-trader/logs/recovered_usb_20260608T074154Z/runner.log
+```
+
+Compatibility symlinks were added so old Linux/Zeph paths under
+`digital-intern/db/` resolve without duplicating multi-GB databases:
+
+```text
+digital-intern/db/articles.db -> ../data/articles.db
+digital-intern/db/seen_articles.db -> ../data/seen_articles.db
+digital-intern/db/source_health.db -> ../data/source_health.db
+```
+
+Do not overwrite newer live cursor/lock/WAL files with older USB snapshots.
+If a dry-run shows only `daemon.lock`, cursor JSON, or `*-wal`/`*-shm`
+differences, that reflects current Mac runtime activity.
 
 Runtime merge manifest:
 
@@ -67,15 +112,23 @@ com.jonathan.trading-intelligence.digital-intern
 
 com.jonathan.trading-intelligence.paper-trader
   127.0.0.1:8090
-  paper_trader.dashboard.run()
-  dashboard/API only; does not start runner.py live decision loop
+  paper-trader/runner.py
+  live Paper Trader runner requested by Jonathan on 2026-06-08; serves the
+  dashboard/API and sleeps during closed-market quiet windows
   PAPER_TRADER_DASHBOARD_PREWARM=0
+
+com.jonathan.trading-intelligence.article-aggregation
+  ArticleNet collector daemon requested by Jonathan on 2026-06-08
+  low priority, capped collectors, no embedded web server, no scorer, no
+  alert worker, no paper-trading worker, no backtest worker
+  ArticleNet ml_trainer allowed by Jonathan on 2026-06-08 with memory gate
 ```
 
-Important: do not revert these LaunchAgents to `digital-intern/daemon.py` or
-`paper-trader/runner.py` on this Mac unless Jonathan explicitly asks for live
-collector/trader loops. The safe default is dashboard/API plus recovered
-ArticleNet data, not high-fanout live work.
+Important: do not revert the ArticleNet LaunchAgent to the full uncapped
+`digital-intern/daemon.py` worker set on this Mac. When article collection is
+requested, use the separate capped `article-aggregation` LaunchAgent rather
+than changing the dashboard service. Paper Trader may run `runner.py` when
+Jonathan asks for live trader operation, but do not start continuous backtests.
 
 Endpoint verification after recovery:
 
@@ -134,6 +187,7 @@ Do not run:
 - `paper-trader/run_continuous_backtests.py`
 - systemd-style continuous backtest services
 - continuous digital-intern trainer on this Mac
+- the full uncapped `digital-intern/daemon.py` worker set
 - full repo test suites by default
 - source builds such as `llvmlite`, LLVM, or large native dependency compiles
 - broad `pip install --upgrade ...` operations
@@ -147,16 +201,22 @@ Prefer:
 - `DIGITAL_INTERN_WORKERS=web_server` for steady state after ArticleNet data
   is already populated
 - `DIGITAL_INTERN_CONTINUOUS_TRAINER=0`
+- the tracked low-priority ArticleNet aggregation plist when the user asks for
+  continuous article collection
 
-Before starting anything heavy:
+Before starting anything heavy, check memory first:
 
 ```bash
+memory_pressure
 uptime
 vm_stat | sed -n '1,12p'
-ps -ax -o pid,ppid,state,%cpu,%mem,etime,command | sort -k4 -nr | sed -n '1,25p'
+ps -axo pid,stat,%cpu,%mem,rss,etime,command | sort -k5 -nr | sed -n '1,25p'
 ```
 
-If the load average is still elevated after reboot, wait.
+Memory pressure is the primary risk on this 8 GB Mac. Stop or defer
+collectors if memory pressure is elevated, pages are throttled, swap activity
+is actively climbing, or one Python process grows unexpectedly. CPU/load still
+matters, but do not treat a low load average as sufficient by itself.
 
 ## Local Repositories
 
@@ -175,9 +235,10 @@ Trading intelligence:
 Observed trading repo state:
 
 ```text
-branch: master
+branch: mac
 remote: https://github.com/JonathanLiu1401/trading-intelligence.git
-HEAD: a7870d6 fix: add BLOCKED to compact report priority to prevent it being hidden
+HEAD before 2026-06-08 ArticleNet aggregation changes:
+  aa3f707 Restore recovered trading dashboard runtime
 ```
 
 Observed OpenClaw repo state:
@@ -472,7 +533,7 @@ Observed output:
 article torch ok 1.26.4 2.2.2 ArticleNet
 ```
 
-## Digital Intern: ArticleNet Only On This Mac
+## Digital Intern: ArticleNet On This Mac
 
 `digital-intern/daemon.py` now supports:
 
@@ -486,27 +547,132 @@ Meaning:
 - `web_server` exposes the ArticleNet dashboard/API on port 8080.
 - `continuous_trainer` is disabled.
 - High-fanout collectors, scorer backlog processing, and trainers are not left
-  running in the normal Mac steady state.
+  running in the normal Mac dashboard steady state.
 
-This is the preferred Mac startup mode because the user specifically said:
+The dashboard service should keep using this mode because the user specifically
+said:
 
 ```text
 do not start continuous training; just do the article net
 ```
 
-On 2026-06-07 local time, a short bounded collector/scorer burst populated
-ArticleNet to 2,112 articles, then the daemon was returned to
-`DIGITAL_INTERN_WORKERS=web_server` after CPU stayed high. Current dashboard
-stats showed 2,112 total articles, 0 urgent, 1,465 unscored, and 6.2 MB DB
-size. The unscored backlog is intentional until Jonathan asks for another
-bounded scoring pass.
+After USB recovery on 2026-06-08, ArticleNet is no longer a small scratch DB.
+It has 2,352,913 articles and `digital-intern/data/articles.db` is about
+1.7 GB. The newest row before the article aggregation restart was
+`2026-06-04T22:22:57.771833+00:00`, with zero rows in the previous 72 hours.
+This means the dashboard can look populated while collection is still stale.
 
-If future agents need to refresh ArticleNet, do it briefly and visibly with a
-small worker allowlist, then return to `web_server` only. Do not start the full
-daemon with every collector, and do not run the continuous trainer/backtest
-loops on this Mac.
+When Jonathan asks for continuous article collection, use the separate
+lightweight ArticleNet daemon:
+
+```text
+/Users/jonathan/trading-intelligence/launchd/com.jonathan.trading-intelligence.article-aggregation.plist
+```
+
+That LaunchAgent runs `digital-intern/article_aggregation_daemon.py`, not the
+full `digital-intern/daemon.py`. The lightweight daemon imports only article
+collectors, `ArticleStore`, source-health bookkeeping, and the heuristic
+scorer used to keep inserts relevant. Jonathan explicitly allowed ArticleNet
+`ml_trainer` on 2026-06-08, so the lightweight daemon may also run that worker.
+It still intentionally does not import or start the scorer backlog,
+`continuous_trainer`, alert workers, embedded web server, Paper Trader, or
+backtest workers.
+
+Install/start it with:
+
+```bash
+mkdir -p /Users/jonathan/trading-intelligence/logs
+cp /Users/jonathan/trading-intelligence/launchd/com.jonathan.trading-intelligence.article-aggregation.plist \
+  /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist
+plutil -lint /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist
+launchctl bootstrap gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist 2>/dev/null || true
+launchctl enable gui/$(id -u)/com.jonathan.trading-intelligence.article-aggregation
+launchctl kickstart -k gui/$(id -u)/com.jonathan.trading-intelligence.article-aggregation
+```
+
+Stop it with:
+
+```bash
+launchctl bootout gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist 2>/dev/null || true
+```
+
+The service runs:
+
+```text
+/usr/bin/nice -n 18 /Users/jonathan/trading-intelligence/.venv/bin/python article_aggregation_daemon.py
+WorkingDirectory: /Users/jonathan/trading-intelligence/digital-intern
+DIGITAL_INTERN_CONTINUOUS_TRAINER=0
+DIGITAL_INTERN_EMBEDDED_WEB=0
+ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION=1
+```
+
+Worker allowlist:
+
+```text
+gdelt,rss,google_news,yahoo_ticker_rss,market_movers,yahoo_trending,
+benzinga_analyst,globenewswire,prnewswire,seekingalpha,financial_blogs,
+investment_research_blogs,ml_trainer,stats,purge
+```
+
+Key Mac caps in the plist:
+
+```text
+RSS_INTERVAL=300
+RSS_MAX_WORKERS=4
+GDELT_INTERVAL=300
+GDELT_MAX_WORKERS=1
+GDELT_QUERY_BATCH_PER_PASS=48
+GOOGLE_NEWS_INTERVAL=300
+GOOGLE_NEWS_BATCH_PER_PASS=6
+GOOGLE_NEWS_MAX_WORKERS=2
+ML_TRAIN_BOOT_DELAY=600
+ML_TRAIN_INTERVAL=3600
+ML_TRAIN_MIN_FREE_PERCENT=55
+YAHOO_TICKER_RSS_INTERVAL=600
+MARKET_MOVERS_INTERVAL=600
+YAHOO_TRENDING_INTERVAL=600
+```
+
+`ml_trainer` is allowed, but only after the 10-minute boot delay and only when
+`memory_pressure` reports at least 55% system-wide free memory. If memory is
+below the threshold, the trainer logs a skip and backs off for the configured
+interval. This is separate from `continuous_trainer`, which remains disabled.
+
+GDELT uses a 7-day query window, so it should naturally recover much of the
+2026-06-04 through 2026-06-08 article gap. On this Mac the service rotates
+through 48 GDELT queries every 5 minutes instead of launching all 259 queries
+at startup; `digital-intern/data/gdelt_query_cursor.json` records progress
+through the query list. RSS, Google News, Yahoo, press-release, and blog
+collectors fill live-feed coverage. Some feeds may not expose full multi-day
+history; record what is actually recovered instead of faking timestamps.
+
+The recovered DB already has the current ArticleStore schema and indexes. The
+Mac launchd service sets `ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION=1` to
+avoid repeating the old live-news label cleanup scan across 2.35M rows before
+workers start. Do not enable that skip for a fresh or unmigrated DB.
+
+Verify ArticleNet freshness:
+
+```bash
+cd /Users/jonathan/trading-intelligence
+sqlite3 digital-intern/data/articles.db \
+  "select count(*), max(first_seen), coalesce(sum(first_seen >= datetime('now','-24 hours')),0), coalesce(sum(first_seen >= datetime('now','-72 hours')),0) from articles;"
+tail -n 120 logs/article-aggregation.launchd.log
+tail -n 120 logs/article-aggregation.launchd.err.log
+tail -n 120 digital-intern/logs/daemon.log
+memory_pressure
+ps -axo pid,stat,%cpu,%mem,rss,etime,command | rg 'article_aggregation_daemon|runner.py|Python|openclaw|codex'
+```
+
+Do not start the full daemon with every collector, and do not run the
+continuous trainer/backtest loops on this Mac.
 
 ## Paper Trader
+
+Paper Trader was started as the live runner on 2026-06-08 because Jonathan
+explicitly asked to start the Paper Trader. The runner owns the single-instance
+lock, serves the dashboard/API on port 8090, and sleeps in long quiet intervals
+while the market is closed. Watch memory before changing this service.
 
 Paper trader entrypoint:
 
@@ -533,7 +699,26 @@ Do not start:
 python run_continuous_backtests.py
 ```
 
-The README discusses continuous backtests, but this Mac should not run them.
+The README discusses continuous backtests, but this Mac should not run them
+without an explicit override and a fresh memory check. The recovered USB data
+already populated the live backtest database:
+
+```text
+paper-trader/backtest.db: 520 backtest_runs
+newest started_at: 2026-06-04T22:17:36.662603Z
+newest completed_at: 2026-06-04T22:17:36.662603Z
+paper-trader/data: 733 MB recovered runtime data
+```
+
+Verify without launching the continuous loop:
+
+```bash
+cd /Users/jonathan/trading-intelligence
+sqlite3 paper-trader/backtest.db \
+  "select count(*), max(started_at), max(completed_at) from backtest_runs;"
+curl --max-time 8 -fsS http://127.0.0.1:8090/api/backtests >/tmp/paper-backtests.json
+pgrep -af 'run_continuous_backtests.py|continuous-backtests' || true
+```
 
 LaunchAgent:
 
@@ -574,10 +759,12 @@ when `nohup` is used.
 1. Check load and ports:
 
 ```bash
+memory_pressure
+vm_stat | sed -n '1,12p'
 uptime
 lsof -nP -iTCP:8080 -sTCP:LISTEN
 lsof -nP -iTCP:8090 -sTCP:LISTEN
-pgrep -af 'daemon.py|runner.py|run_continuous_backtests.py'
+pgrep -af 'article_aggregation_daemon.py|daemon.py|runner.py|run_continuous_backtests.py|continuous_trainer'
 ```
 
 2. Start digital-intern in ArticleNet-only mode with launchd:
@@ -592,19 +779,17 @@ launchctl kickstart gui/$(id -u)/com.jonathan.trading-intelligence.digital-inter
 3. Wait 10 to 20 seconds, then probe:
 
 ```bash
-curl --max-time 5 -fsS http://127.0.0.1:8080/healthz
+curl --max-time 5 -fsS http://127.0.0.1:8080/api/health
 tail -n 80 /Users/jonathan/trading-intelligence/logs/digital-intern.launchd.log
 tail -n 80 /Users/jonathan/trading-intelligence/logs/digital-intern.launchd.err.log
 ```
 
-Look for:
+Look for the ArticleNet dashboard/API process only. Do not expect trainer or
+scorer workers in this Mac dashboard service:
 
 ```text
-continuous_trainer disabled
-worker allowlist active
-web_server
-ml_trainer
-scorer
+dashboard.web_server
+127.0.0.1:8080/api/health 200
 ```
 
 4. Start paper-trader with launchd:
@@ -629,9 +814,33 @@ tail -n 80 /Users/jonathan/trading-intelligence/logs/paper-trader.launchd.err.lo
 pgrep -af 'run_continuous_backtests.py|continuous-backtests' || true
 ```
 
+7. Start continuous article aggregation only if requested and only after memory
+   pressure is acceptable:
+
+```bash
+mkdir -p /Users/jonathan/trading-intelligence/logs
+cp /Users/jonathan/trading-intelligence/launchd/com.jonathan.trading-intelligence.article-aggregation.plist \
+  /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist
+plutil -lint /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist
+launchctl bootstrap gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist 2>/dev/null || true
+launchctl enable gui/$(id -u)/com.jonathan.trading-intelligence.article-aggregation
+launchctl kickstart -k gui/$(id -u)/com.jonathan.trading-intelligence.article-aggregation
+```
+
+8. Probe article aggregation:
+
+```bash
+launchctl print gui/$(id -u)/com.jonathan.trading-intelligence.article-aggregation | sed -n '/pid =/p;/state =/p'
+tail -n 120 /Users/jonathan/trading-intelligence/logs/article-aggregation.launchd.log
+tail -n 120 /Users/jonathan/trading-intelligence/logs/article-aggregation.launchd.err.log
+sqlite3 /Users/jonathan/trading-intelligence/digital-intern/data/articles.db \
+  "select count(*), max(first_seen), coalesce(sum(first_seen >= datetime('now','-24 hours')),0), coalesce(sum(first_seen >= datetime('now','-72 hours')),0) from articles;"
+```
+
 ## Safe Stop Procedure
 
 ```bash
+launchctl bootout gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.article-aggregation.plist 2>/dev/null || true
 launchctl bootout gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.paper-trader.plist 2>/dev/null || true
 launchctl bootout gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan.trading-intelligence.digital-intern.plist 2>/dev/null || true
 ```
@@ -639,7 +848,7 @@ launchctl bootout gui/$(id -u) /Users/jonathan/Library/LaunchAgents/com.jonathan
 Then verify:
 
 ```bash
-pgrep -af 'daemon.py|runner.py|run_continuous_backtests.py' || true
+pgrep -af 'article_aggregation_daemon.py|daemon.py|runner.py|run_continuous_backtests.py|continuous_trainer' || true
 lsof -nP -iTCP:8080 -sTCP:LISTEN
 lsof -nP -iTCP:8090 -sTCP:LISTEN
 ```
@@ -685,6 +894,25 @@ PYTHONPATH=. ../.venv/bin/python -m pytest -q \
 Do not rerun these casually while the Mac is hot. They are documented here so
 future agents do not repeat work under load.
 
+Article aggregation safety changes compiled successfully on 2026-06-08:
+
+```bash
+cd /Users/jonathan/trading-intelligence
+.venv/bin/python -m py_compile \
+  digital-intern/daemon.py \
+  digital-intern/article_aggregation_daemon.py \
+  digital-intern/collectors/rss_collector.py \
+  digital-intern/collectors/gdelt_collector.py \
+  digital-intern/collectors/google_news.py \
+  digital-intern/collectors/ticker_news.py
+```
+
+Use the repo virtualenv path exactly:
+
+```text
+/Users/jonathan/trading-intelligence/.venv/bin/python
+```
+
 ## Files Changed Locally
 
 `digital-intern/daemon.py`:
@@ -692,9 +920,56 @@ future agents do not repeat work under load.
 - Added `_env_enabled`.
 - Added `DIGITAL_INTERN_CONTINUOUS_TRAINER`.
 - Added `DIGITAL_INTERN_WORKERS`.
+- Added `_env_seconds` so selected collector/scorer intervals can be capped
+  from launchd without changing the high-throughput Linux defaults.
+- Moved ML/scorer/trainer, Discord alert, market-data, yfinance-heavy, and
+  backtest/paper-trading imports into the workers that need them. This keeps
+  dashboard-only and lightweight aggregation startup from importing the heavy
+  runtime graph.
 - Removed `continuous_trainer` from unconditional worker startup.
 - Appends `continuous_trainer` only when enabled.
 - Applies worker allowlist when `DIGITAL_INTERN_WORKERS` is set.
+
+`digital-intern/article_aggregation_daemon.py`:
+
+- Added the Mac ArticleNet runtime used by launchd for continuous article
+  aggregation. It starts capped article collectors plus stats/purge and the
+  memory-gated ArticleNet `ml_trainer`, uses a singleton lock, writes to the
+  recovered `ArticleStore`, and avoids scorer backlog, `continuous_trainer`,
+  alert, dashboard, Paper Trader, and backtest workers.
+
+`digital-intern/storage/article_store.py`:
+
+- Added `ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION`, used only by the Mac
+  article aggregation LaunchAgent to avoid a startup full-table cleanup scan
+  against the recovered 2.35M-row DB after schema/indexes are already present.
+
+Article collector caps:
+
+- `collectors/rss_collector.py` reads `RSS_MAX_WORKERS`.
+- `collectors/gdelt_collector.py` reads `GDELT_MAX_WORKERS` and
+  `GDELT_QUERY_BATCH_PER_PASS`. The Mac launchd service uses a rotating 48
+  query batch so GDELT eventually covers the full 7-day query universe without
+  loading every query at startup.
+- `collectors/google_news.py` reads `GOOGLE_NEWS_BATCH_PER_PASS` and
+  `GOOGLE_NEWS_MAX_WORKERS`.
+- `collectors/ticker_news.py` reads `TICKER_NEWS_MAX_WORKERS`.
+
+Launchd templates added/updated:
+
+```text
+launchd/com.jonathan.trading-intelligence.article-aggregation.plist
+launchd/com.jonathan.trading-intelligence.paper-trader.plist
+```
+
+Runtime compatibility links added from the recovered USB map:
+
+```text
+digital-intern/db/articles.db -> ../data/articles.db
+digital-intern/db/seen_articles.db -> ../data/seen_articles.db
+digital-intern/db/source_health.db -> ../data/source_health.db
+paper-trader/paper_trader/backtests.db copied from USB recovery (0-byte legacy file)
+```
 
 Root docs added:
 
@@ -736,8 +1011,8 @@ Only send the completion ping after:
 
 - OpenClaw gateway is up
 - Discord voice status says the bot is joined and not muted/deafened
-- digital-intern ArticleNet-only mode is running or intentionally deferred due
-  to high load
+- digital-intern ArticleNet dashboard mode is running
+- article aggregation is running or intentionally deferred due to high load
 - paper-trader is running or intentionally deferred due to high load
 - health probes/logs have been checked
 
@@ -747,7 +1022,7 @@ Command:
 openclaw message send \
   --channel discord \
   --target channel:1153698670227750954 \
-  --message '<@454961974048980992> OpenClaw is running with Codex GPT-5.5 xhigh fast mode, Grok is first backup, Discord voice is joined, and trading services status: ...'
+  --message '<@454961974048980992> Trading status: dashboards healthy, ArticleNet aggregation ..., Paper Trader data restored, continuous training/backtests off.'
 ```
 
 Keep the Discord message short and factual.
