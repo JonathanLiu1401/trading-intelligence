@@ -1,12 +1,20 @@
 # Monorepo root gitignore
 # Subproject data directories — large, volatile, never committed
 digital-intern/data/
+digital-intern/db/
 paper-trader/backtest.db
 paper-trader/backtest.db-wal
 paper-trader/backtest.db-shm
 paper-trader/logs/
 paper-trader/state/
 digital-intern/logs/
+digital-intern/ml/*.pt
+digital-intern/ml/*.pkl
+digital-intern/ml/dataset_cache*.npz
+digital-intern/ml/dataset_cache_meta.json
+digital-intern/ml/training_metrics.jsonl
+logs/
+run/
 digital-intern/.supervisor_state.*.tmp
 __pycache__/
 *.pyc

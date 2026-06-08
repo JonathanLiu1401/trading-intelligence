@@ -9,18 +9,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -30,12 +33,18 @@ from storage.article_store import ArticleStore, _LIVE_ONLY_CLAUSE  # noqa: E402
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
 DASHBOARD_HTML = DASHBOARD_DIR / "dashboard.html"
+COMMAND_CENTER_HTML = DASHBOARD_DIR / "command_center.html"
+SECTION_PAGE_HTML = DASHBOARD_DIR / "section_page.html"
 STRUCTURED_LOG = ROOT / "logs" / "structured.jsonl"
 METRICS_LOG = ROOT / "logs" / "metrics.jsonl"
 # Atomic JSON snapshot written by the daemon supervisor — preferred source
 # of truth for worker state (avoids re-parsing logs).
 SUPERVISOR_STATE = ROOT / "logs" / "supervisor_state.json"
 SERVICE_NAME = os.environ.get("DIGITAL_INTERN_SERVICE", "digital-intern")
+DIGITAL_INTERN_LAUNCHAGENT = (
+    Path.home() / "Library" / "LaunchAgents" /
+    "com.jonathan.trading-intelligence.digital-intern.plist"
+)
 
 WORKERS = [
     "gdelt", "rss", "web", "reddit", "ticker",
@@ -200,6 +209,20 @@ def _read_supervisor_state() -> dict[str, Any]:
         return {}
 
 
+def _configured_worker_allowlist() -> set[str] | None:
+    raw = os.environ.get("DIGITAL_INTERN_WORKERS", "")
+    if not raw and DIGITAL_INTERN_LAUNCHAGENT.exists():
+        try:
+            with DIGITAL_INTERN_LAUNCHAGENT.open("rb") as f:
+                plist = plistlib.load(f)
+            env = plist.get("EnvironmentVariables") or {}
+            raw = str(env.get("DIGITAL_INTERN_WORKERS") or "")
+        except Exception:
+            raw = ""
+    allowlist = {name.strip() for name in raw.split(",") if name.strip()}
+    return allowlist or None
+
+
 def _worker_health(lookback: int = 2000) -> list[dict[str, Any]]:
     seen: dict[str, float] = {}
     for entry in _tail_jsonl(STRUCTURED_LOG, lookback):
@@ -214,6 +237,7 @@ def _worker_health(lookback: int = 2000) -> list[dict[str, Any]]:
     # Daemon snapshot is the authoritative source for state / crash counts.
     sup = _read_supervisor_state()
     sup_by_name = {w["name"]: w for w in sup.get("workers", [])}
+    allowed_workers = _configured_worker_allowlist()
     now = time.time()
     out: list[dict[str, Any]] = []
     for w in WORKERS:
@@ -225,20 +249,24 @@ def _worker_health(lookback: int = 2000) -> list[dict[str, Any]]:
         total_crashes = int(sup_entry.get("total_crashes", 0) or 0)
         last_exception = sup_entry.get("last_exception") or ""
 
-        stale_threshold = 3600 if w in _QUIET_WORKERS else 600
-        if state == "disabled":
+        if allowed_workers is not None and w not in allowed_workers:
+            state = "configured_off"
+            status = "disabled"
+        elif state == "disabled":
             status = "stale"
-        elif age is None:
-            status = "unknown"
-        elif age < 120:
-            status = "ok"
-        elif age < stale_threshold:
-            status = "warn"
         else:
-            status = "stale"
-        # Degraded state from supervisor always escalates a green dot to warn
-        if state == "degraded" and status == "ok":
-            status = "warn"
+            stale_threshold = 3600 if w in _QUIET_WORKERS else 600
+            if age is None:
+                status = "unknown"
+            elif age < 120:
+                status = "ok"
+            elif age < stale_threshold:
+                status = "warn"
+            else:
+                status = "stale"
+            # Degraded state from supervisor always escalates a green dot to warn
+            if state == "degraded" and status == "ok":
+                status = "warn"
 
         out.append({
             "name": w,
@@ -257,9 +285,12 @@ def _core_workers_status(workers: list[dict[str, Any]]) -> dict[str, Any]:
     """Summary of CORE_WORKERS; ``critical`` is True iff all are stale."""
     statuses = {w["name"]: w["status"] for w in workers if w["name"] in CORE_WORKERS}
     down = [name for name, s in statuses.items() if s in ("stale", "unknown")]
+    disabled = [name for name, s in statuses.items() if s == "disabled"]
     return {
         "core": list(CORE_WORKERS),
         "down": down,
+        "disabled": disabled,
+        "allowlist": sorted(_configured_worker_allowlist() or []),
         "critical": len(down) >= len(CORE_WORKERS),
     }
 
@@ -385,35 +416,649 @@ def _articles_payload(limit: int = 50, min_score: float = 0.0) -> list[dict[str,
     return out
 
 
+def _read_http_json(port: int, path: str, timeout: float = 4.0) -> dict[str, Any]:
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"http://127.0.0.1:{port}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return {"ok": True, "status": resp.status, "data": payload}
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            payload = {"error": raw.decode("utf-8", errors="replace")[:400]}
+        return {"ok": False, "status": e.code, "data": payload, "error": payload.get("error")}
+    except Exception as e:
+        return {"ok": False, "status": None, "data": None, "error": str(e)}
+
+
+def _row_value(row: dict[str, Any], key: str) -> Any:
+    value = row
+    for part in key.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _short_value(value: Any) -> str:
+    if value is None:
+        return "--"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, str):
+        return value if len(value) <= 220 else value[:217] + "..."
+    if isinstance(value, (list, tuple, set)):
+        return f"{len(value)} items"
+    if isinstance(value, dict):
+        return f"{len(value)} fields"
+    return str(value)
+
+
+def _first_text(data: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = _row_value(data, key)
+        if value not in (None, "", [], {}):
+            return _short_value(value)
+    return None
+
+
+def _metric_list(data: dict[str, Any], keys: tuple[str, ...]) -> list[dict[str, str]]:
+    metrics: list[dict[str, str]] = []
+    for key in keys:
+        value = _row_value(data, key)
+        if value not in (None, "", [], {}):
+            metrics.append({"label": key.replace("_", " ").replace(".", " / "), "value": _short_value(value)})
+    return metrics[:8]
+
+
+def _rows_from_payload(data: Any, preferred_keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return data[:12] if isinstance(data, list) else []
+    for key in preferred_keys:
+        value = _row_value(data, key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)][:12]
+        if isinstance(value, dict):
+            return [{"name": k, **v} if isinstance(v, dict) else {"name": k, "value": v} for k, v in list(value.items())[:12]]
+    for key, value in data.items():
+        if isinstance(value, list) and value and all(isinstance(x, dict) for x in value[:3]):
+            return value[:12]
+    return []
+
+
+def _columns_for_rows(rows: list[dict[str, Any]]) -> list[str]:
+    preferred = (
+        "name", "source", "ticker", "symbol", "title", "headline", "action", "category",
+        "state", "status", "verdict", "reason", "reasoning", "score", "urgency",
+        "published", "timestamp", "ts", "first_seen", "n", "count", "pct", "pl_usd",
+        "total_pl_usd", "return_pct", "score", "timestamp", "ts",
+    )
+    hidden = {"id", "url", "raw", "html", "prompt", "body", "content"}
+    keys: list[str] = []
+    seen: set[str] = set()
+    for key in preferred:
+        if key not in seen and any(key in row for row in rows):
+            keys.append(key)
+            seen.add(key)
+        if len(keys) >= 6:
+            return keys
+    for row in rows:
+        for key in row.keys():
+            if key not in seen and key not in hidden and not isinstance(row.get(key), (dict, list)):
+                keys.append(key)
+                seen.add(key)
+            if len(keys) >= 6:
+                return keys
+    return keys[:6]
+
+
+def _section_card(
+    title: str,
+    response: dict[str, Any],
+    *,
+    headline_keys: tuple[str, ...] = ("headline", "summary", "verdict_reason", "hint", "note", "error"),
+    metric_keys: tuple[str, ...] = (),
+    row_keys: tuple[str, ...] = ("rows", "items", "recent", "tape", "articles", "leaderboard", "models", "opportunities"),
+) -> dict[str, Any]:
+    data = response.get("data")
+    if not response.get("ok"):
+        return {
+            "title": title,
+            "status": "down",
+            "state": "UNAVAILABLE",
+            "headline": response.get("error") or f"HTTP {response.get('status')}",
+            "metrics": [],
+            "columns": [],
+            "rows": [],
+        }
+    if not isinstance(data, dict):
+        rows = data[:12] if isinstance(data, list) else []
+        return {
+            "title": title,
+            "status": "ok",
+            "state": "OK",
+            "headline": f"{len(rows)} rows" if isinstance(rows, list) else "loaded",
+            "metrics": [],
+            "columns": _columns_for_rows(rows) if isinstance(rows, list) else [],
+            "rows": rows if isinstance(rows, list) else [],
+        }
+
+    state = _first_text(data, ("state", "verdict", "status")) or "OK"
+    state_upper = state.upper()
+    status = "ok"
+    if any(token in state_upper for token in ("ERROR", "CRITICAL", "DOWN", "FAIL")):
+        status = "down"
+    elif any(token in state_upper for token in ("NO_DATA", "INSUFFICIENT", "WARN", "STALE", "BLIND")):
+        status = "warn"
+    rows = _rows_from_payload(data, row_keys)
+    headline = _first_text(data, headline_keys)
+    if not headline:
+        headline = f"{len(rows)} rows loaded" if rows else f"{state} data loaded"
+    metrics = _metric_list(data, metric_keys)
+    if not metrics:
+        metrics = _metric_list(data, (
+            "n", "count", "total", "n_runs", "completed_runs", "n_models", "n_personas",
+            "n_decisions", "n_trades", "n_round_trips", "n_articles", "n_raw",
+            "n_after_dedup", "cash_pct", "total_value", "window_minutes",
+        ))
+    return {
+        "title": title,
+        "status": status,
+        "state": state,
+        "headline": headline,
+        "metrics": metrics,
+        "columns": _columns_for_rows(rows),
+        "rows": rows,
+    }
+
+
+_SECTION_CONFIG: dict[str, dict[str, Any]] = {
+    "compare": {
+        "title": "Compare",
+        "description": "Backtest and model comparison without starting new runs.",
+        "cards": (
+            ("Backtest Summary", 8090, "/api/backtests/stats", ("completed_runs", "total_runs", "beat_spy_count", "beat_spy_rate"), ("runs",)),
+            ("Backtest Runs", 8090, "/api/backtests", ("total", "completed_runs"), ("runs", "items", "rows")),
+            ("Model Rankings", 8090, "/api/model-rankings", ("n_models",), ("models",)),
+            ("Persona Leaderboard", 8090, "/api/persona-leaderboard", ("n_runs", "n_personas"), ("leaderboard", "drag_personas")),
+        ),
+    },
+    "strategy": {
+        "title": "Strategy Lab",
+        "description": "Read-only strategy, opportunity, and deployment diagnostics.",
+        "cards": (
+            ("Game Plan", 8090, "/api/game-plan", ("n_actions", "n_open", "market_open", "next_open_seconds"), ("position_actions", "portfolio_directives", "opportunities")),
+            ("Actionable Opportunities", 8090, "/api/actionable-opportunities", ("n", "n_opportunities", "cash_pct"), ("opportunities", "rows", "items")),
+            ("Funded Suggestions", 8090, "/api/funded-suggestions", ("n", "cash_usd", "buying_power_usd"), ("suggestions", "rows", "items")),
+            ("Deployment Plan", 8090, "/api/deployment-plan", ("n_actions", "cash_usd", "deployable_cash_usd"), ("actions", "rows", "items")),
+            ("Decision Context", 8090, "/api/decision-context", ("input_summary.signal_count", "input_summary.n_urgent", "market_open", "claude_invoked"), ("advisory", "rows", "items")),
+        ),
+    },
+    "journal": {
+        "title": "Journal",
+        "description": "Today action tape, decision health, and realized record.",
+        "cards": (
+            ("Today Action Tape", 8090, "/api/today-action-tape", ("n_decisions", "n_trades", "n_no_decisions", "net_cash_flow_usd"), ("tape",)),
+            ("Decision Health", 8090, "/api/decision-health", ("n_decisions", "n_decisions_24h", "no_decision_rate_24h"), ("recent", "action_mix")),
+            ("Session Delta", 8090, "/api/session-delta?minutes=1440", ("n_fills", "equity_delta_usd", "equity_delta_pct"), ("fills", "rows", "items")),
+            ("Closed Positions", 8090, "/api/closed-positions", ("n_closed", "total_realized_pl"), ("positions", "rows", "items")),
+            ("Track Record", 8090, "/api/track-record", ("n_round_trips",), ("names", "rows", "items")),
+        ),
+    },
+    "personas": {
+        "title": "Personas",
+        "description": "Persona skill, model rankings, and book-fit diagnostics.",
+        "cards": (
+            ("Persona Leaderboard", 8090, "/api/persona-leaderboard", ("n_runs", "n_personas"), ("leaderboard", "drag_personas")),
+            ("Persona Book Fit", 8090, "/api/persona-book-fit", ("n_positions", "n_personas"), ("matches", "rows", "items")),
+            ("Model Rankings", 8090, "/api/model-rankings", ("n_models",), ("models",)),
+            ("Baseline Compare", 8090, "/api/baseline-compare", ("n", "n_records", "oos_rmse_ratio"), ("rows", "items")),
+            ("Scorer Confidence", 8090, "/api/scorer-confidence", ("n", "n_predictions"), ("rows", "items", "by_bucket")),
+        ),
+    },
+    "tape": {
+        "title": "Tape",
+        "description": "Market tape, sector pulse, and realized tape-fit.",
+        "cards": (
+            ("Tape Fit P/L", 8090, "/api/tape-fit-pl", ("n_round_trips", "n_directional", "min_for_verdict"), ("buckets",)),
+            ("Sector Pulse", 8090, "/api/sector-pulse", ("n_tickers", "n_hot", "window_hours"), ("tickers", "sectors", "rows")),
+            ("News Velocity", 8090, "/api/news-velocity", ("n_held", "n_with_data", "window_hours"), ("per_ticker",)),
+            ("News Source Mix", 8090, "/api/news-source-mix", ("n_held", "n_with_data", "any_echo"), ("per_ticker",)),
+            ("Macro Calendar", 8090, "/api/macro-calendar", ("n_events",), ("events", "rows", "items")),
+        ),
+    },
+    "pulse": {
+        "title": "News Pulse",
+        "description": "ArticleNet feed and trader news-quality diagnostics.",
+        "cards": (
+            ("ArticleNet Stats", 8080, "/api/stats", ("total", "urgent", "unscored", "db_mb"), ("rows", "items")),
+            ("Recent Articles", 8080, "/api/articles?limit=20", ("total", "urgent"), ("articles", "rows", "items")),
+            ("News Deduped", 8090, "/api/news-deduped?hours=6&min_score=4", ("n_raw", "n_after_dedup", "compression_ratio"), ("articles",)),
+            ("News Edge", 8090, "/api/news-edge", ("n", "n_articles"), ("rows", "items", "tickers")),
+            ("Source Edge", 8090, "/api/source-edge", ("n_sources", "n"), ("sources", "rows", "items")),
+            ("Sector Heatmap", 8090, "/api/sector-heatmap", ("n_tickers",), ("sectors", "tickers", "rows")),
+        ),
+    },
+}
+
+
+def _section_payload(section: str) -> dict[str, Any]:
+    cfg = _SECTION_CONFIG.get(section)
+    if not cfg:
+        return {
+            "ok": False,
+            "section": section,
+            "title": "Unknown Section",
+            "description": "No section configuration.",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cards": [],
+        }
+    cards = []
+    for title, port, path, metric_keys, row_keys in cfg["cards"]:
+        response = _read_http_json(port, path, timeout=6.0)
+        cards.append(_section_card(
+            title,
+            response,
+            metric_keys=tuple(metric_keys),
+            row_keys=tuple(row_keys),
+        ))
+    return {
+        "ok": True,
+        "section": section,
+        "title": cfg["title"],
+        "description": cfg["description"],
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cards": cards,
+    }
+
+
+def _command_center_payload() -> dict[str, Any]:
+    intern_stats = _read_http_json(8080, "/api/stats", timeout=3.0)
+    intern_health = _read_http_json(8080, "/api/health", timeout=3.0)
+    trader_health = _read_http_json(8090, "/api/healthz", timeout=3.0)
+    trader_portfolio = _read_http_json(8090, "/api/portfolio", timeout=3.0)
+    trader_desk = _read_http_json(8090, "/api/desk-pulse", timeout=4.0)
+    trader_game = _read_http_json(8090, "/api/game-plan", timeout=5.0)
+    trader_session = _read_http_json(8090, "/api/session-delta?minutes=360", timeout=4.0)
+    trader_build = _read_http_json(8090, "/api/build-info", timeout=3.0)
+
+    workers = _worker_health()
+    worker_counts = {
+        "ok": sum(1 for w in workers if w.get("status") == "ok"),
+        "warn": sum(1 for w in workers if w.get("status") == "warn"),
+        "stale": sum(1 for w in workers if w.get("status") == "stale"),
+        "unknown": sum(1 for w in workers if w.get("status") == "unknown"),
+        "disabled": sum(1 for w in workers if w.get("status") == "disabled"),
+    }
+    core_status = _core_workers_status(workers)
+    errors = _recent_errors()
+
+    stats = intern_stats.get("data") if isinstance(intern_stats.get("data"), dict) else {}
+    desk = trader_desk.get("data") if isinstance(trader_desk.get("data"), dict) else {}
+    game = trader_game.get("data") if isinstance(trader_game.get("data"), dict) else {}
+    build = trader_build.get("data") if isinstance(trader_build.get("data"), dict) else {}
+
+    services = [
+        {
+            "id": "unified-dashboard",
+            "name": "Unified Dashboard",
+            "status": "ok",
+            "detail": "127.0.0.1:8765 with tailnet proxy",
+            "href": "/",
+        },
+        {
+            "id": "digital-intern",
+            "name": "Digital Intern",
+            "status": "ok" if intern_health.get("ok") else "down",
+            "detail": f"{stats.get('total', 0)} articles, {stats.get('urgent', 0)} urgent",
+            "href": "/intern/",
+        },
+        {
+            "id": "paper-trader",
+            "name": "Paper Trader",
+            "status": "ok" if trader_health.get("ok") else "down",
+            "detail": (desk.get("headline") or trader_health.get("error") or "desk pulse pending")[:160],
+            "href": "/trader/",
+        },
+        {
+            "id": "ops-view",
+            "name": "Ops View",
+            "status": "down" if core_status.get("critical") else "ok",
+            "detail": (
+                "core workers critical" if core_status.get("critical")
+                else (
+                    "collector workers intentionally off"
+                    if core_status.get("disabled") else "core workers ready"
+                )
+            ),
+            "href": "/ops/",
+        },
+    ]
+
+    action_queue: list[dict[str, str]] = []
+    if not intern_health.get("ok"):
+        action_queue.append({
+            "severity": "fail",
+            "title": "Digital Intern API is unreachable",
+            "detail": str(intern_health.get("error") or intern_health.get("status") or "unknown"),
+        })
+    if not trader_health.get("ok"):
+        action_queue.append({
+            "severity": "fail",
+            "title": "Paper Trader API is unreachable",
+            "detail": str(trader_health.get("error") or trader_health.get("status") or "unknown"),
+        })
+    if core_status.get("critical"):
+        action_queue.append({
+            "severity": "fail",
+            "title": "Core ArticleNet workers are stale",
+            "detail": ", ".join(core_status.get("down") or []),
+        })
+    if build.get("stale") is True:
+        action_queue.append({
+            "severity": "warn",
+            "title": "Paper Trader process is running stale code",
+            "detail": f"boot {build.get('boot_sha')} vs head {build.get('head_sha')}",
+        })
+    if desk.get("state") not in (None, "HEALTHY", "NO_DATA"):
+        action_queue.append({
+            "severity": "warn",
+            "title": f"Desk pulse state: {desk.get('state')}",
+            "detail": desk.get("headline") or "",
+        })
+    if game.get("state") == "ACTIONS_PRESENT":
+        action_queue.append({
+            "severity": "warn",
+            "title": "Game plan has live actions",
+            "detail": game.get("headline") or "",
+        })
+    if not action_queue:
+        action_queue.append({
+            "severity": "ok",
+            "title": "No immediate operator action",
+            "detail": "Command Center APIs are responding.",
+        })
+
+    return {
+        "ok": True,
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "services": services,
+        "action_queue": action_queue,
+        "article_net": {
+            "ok": bool(intern_stats.get("ok") and intern_health.get("ok")),
+            "stats": stats,
+            "health": intern_health.get("data"),
+        },
+        "trader": {
+            "ok": bool(trader_health.get("ok")),
+            "health": trader_health.get("data"),
+            "portfolio": trader_portfolio.get("data") if isinstance(trader_portfolio.get("data"), dict) else {},
+            "desk_pulse": desk,
+            "game_plan": game,
+            "session_delta": trader_session.get("data") if isinstance(trader_session.get("data"), dict) else {},
+            "build_info": build,
+        },
+        "ops": {
+            "core_status": core_status,
+            "workers": worker_counts,
+            "errors": len(errors),
+        },
+    }
+
+
 # ── routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
-async def index():
+async def command_center():
+    if not COMMAND_CENTER_HTML.exists():
+        return JSONResponse({"error": "command_center.html missing"}, status_code=500)
+    return FileResponse(str(COMMAND_CENTER_HTML), media_type="text/html")
+
+
+async def ops_index():
     if not DASHBOARD_HTML.exists():
         return JSONResponse({"error": "dashboard.html missing"}, status_code=500)
     return FileResponse(str(DASHBOARD_HTML), media_type="text/html")
 
 
+async def section_index():
+    if not SECTION_PAGE_HTML.exists():
+        return JSONResponse({"error": "section_page.html missing"}, status_code=500)
+    return FileResponse(str(SECTION_PAGE_HTML), media_type="text/html")
+
+
+async def _proxy_http(
+    request: Request,
+    port: int,
+    upstream_path: str,
+    *,
+    forwarded_prefix: str | None = None,
+    html_rewrites: tuple[tuple[str, str], ...] = (),
+    timeout: float = 20.0,
+) -> Response:
+    if not upstream_path.startswith("/"):
+        upstream_path = "/" + upstream_path
+    query = request.url.query
+    url = f"http://127.0.0.1:{port}{upstream_path}" + (f"?{query}" if query else "")
+    body = await request.body()
+    headers: dict[str, str] = {}
+    for key in ("Content-Type", "Accept", "User-Agent"):
+        value = request.headers.get(key)
+        if value:
+            headers[key] = value
+    if forwarded_prefix:
+        headers["X-Forwarded-Prefix"] = forwarded_prefix
+    req = urllib.request.Request(
+        url,
+        data=body if body else None,
+        headers=headers,
+        method=request.method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as upstream:
+            payload = upstream.read()
+            status = upstream.status
+            content_type = upstream.headers.get("Content-Type", "application/octet-stream")
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        status = e.code
+        content_type = e.headers.get("Content-Type", "text/plain")
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": f"proxy to {port}{upstream_path} failed: {e}"},
+            status_code=502,
+        )
+    if html_rewrites and "text/html" in content_type.lower():
+        text = payload.decode("utf-8", errors="replace")
+        for old, new in html_rewrites:
+            text = text.replace(old, new)
+        payload = text.encode("utf-8")
+    return Response(content=payload, status_code=status, headers={"Content-Type": content_type})
+
+
+_INTERN_HTML_REWRITES = (
+    ('"/api/', '"/intern/api/'),
+    ("'/api/", "'/intern/api/"),
+    ("`/api/", "`/intern/api/"),
+)
+
+
+_TRADER_HTML_REWRITES = (
+    (
+        'history.replaceState(null, "", name === "trader" ? "/" : "/backtests");',
+        'history.replaceState(null, "", name === "trader" ? "/trader/" : "/trader/backtests");',
+    ),
+)
+
+
+@app.get("/intern")
+@app.get("/intern/")
+async def intern_dashboard(request: Request):
+    return await _proxy_http(request, 8080, "/", html_rewrites=_INTERN_HTML_REWRITES)
+
+
+@app.get("/intern/chat")
+async def intern_chat(request: Request):
+    return await _proxy_http(request, 8080, "/chat", html_rewrites=_INTERN_HTML_REWRITES)
+
+
+@app.api_route("/intern/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def intern_api_proxy(path: str, request: Request):
+    return await _proxy_http(request, 8080, f"/api/{path}")
+
+
+@app.get("/trader")
+@app.get("/trader/")
+async def trader_dashboard(request: Request):
+    return await _proxy_http(
+        request,
+        8090,
+        "/",
+        forwarded_prefix="/trader",
+        html_rewrites=_TRADER_HTML_REWRITES,
+    )
+
+
+@app.get("/trader/backtests")
+async def trader_backtests(request: Request):
+    return await _proxy_http(
+        request,
+        8090,
+        "/backtests",
+        forwarded_prefix="/trader",
+        html_rewrites=_TRADER_HTML_REWRITES,
+    )
+
+
+@app.get("/trader/ticker/{sym}")
+async def trader_ticker(sym: str, request: Request):
+    return await _proxy_http(
+        request,
+        8090,
+        f"/ticker/{sym}",
+        forwarded_prefix="/trader",
+        html_rewrites=_TRADER_HTML_REWRITES,
+    )
+
+
+@app.get("/trader/monkey-benchmark")
+async def trader_monkey_benchmark(request: Request):
+    return await _proxy_http(
+        request,
+        8090,
+        "/monkey-benchmark",
+        forwarded_prefix="/trader",
+        html_rewrites=_TRADER_HTML_REWRITES,
+    )
+
+
+@app.api_route("/trader/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def trader_api_proxy(path: str, request: Request):
+    return await _proxy_http(request, 8090, f"/api/{path}", forwarded_prefix="/trader")
+
+
+@app.get("/backtests")
+@app.get("/backtests/compare")
+async def backtests_compare(request: Request):
+    return await section_index()
+
+
+@app.get("/strategy-lab")
+async def strategy_lab(request: Request):
+    return await section_index()
+
+
+@app.get("/journal")
+async def journal(request: Request):
+    return await section_index()
+
+
+@app.get("/personas")
+async def personas(request: Request):
+    return await section_index()
+
+
+@app.get("/tape")
+async def tape(request: Request):
+    return await section_index()
+
+
+@app.get("/pulse")
+async def pulse(request: Request):
+    return await section_index()
+
+
+@app.get("/system")
+@app.get("/system/")
+@app.get("/ops")
+@app.get("/ops/")
+async def ops_dashboard():
+    return await ops_index()
+
+
+@app.get("/api/command-center")
+@app.get("/ops/api/command-center")
+async def api_command_center():
+    return JSONResponse(_command_center_payload())
+
+
+@app.get("/api/action-queue")
+@app.get("/ops/api/action-queue")
+async def api_action_queue():
+    payload = _command_center_payload()
+    return JSONResponse({
+        "as_of": payload["as_of"],
+        "items": payload["action_queue"],
+    })
+
+
+@app.get("/api/sections/{section}")
+@app.get("/ops/api/sections/{section}")
+async def api_section(section: str):
+    aliases = {
+        "backtests": "compare",
+        "backtests-compare": "compare",
+        "strategy-lab": "strategy",
+        "news-pulse": "pulse",
+    }
+    key = aliases.get(section, section)
+    payload = _section_payload(key)
+    return JSONResponse(payload, status_code=200 if payload.get("ok") else 404)
+
+
 @app.get("/api/stats")
+@app.get("/ops/api/stats")
 async def api_stats():
     return JSONResponse(_stats_payload())
 
 
 @app.get("/api/articles")
+@app.get("/ops/api/articles")
 async def api_articles(limit: int = 50, min_score: float = 0.0):
     return JSONResponse(_articles_payload(limit, min_score))
 
 
 @app.get("/api/metrics")
+@app.get("/ops/api/metrics")
 async def api_metrics():
     return JSONResponse(_tail_jsonl(METRICS_LOG, 200))
 
 
 @app.get("/api/logs")
+@app.get("/ops/api/logs")
 async def api_logs(n: int = 50):
     return JSONResponse(_tail_jsonl(STRUCTURED_LOG, max(1, min(2000, n))))
 
 
 @app.get("/api/health")
+@app.get("/ops/api/health")
 async def api_health():
     workers = _worker_health()
     return JSONResponse({
@@ -426,11 +1071,13 @@ async def api_health():
 
 
 @app.get("/api/articles_per_hour")
+@app.get("/ops/api/articles_per_hour")
 async def api_articles_per_hour():
     return JSONResponse(_articles_per_hour_24h())
 
 
 @app.post("/api/restart")
+@app.post("/ops/api/restart")
 async def api_restart():
     try:
         r = subprocess.run(
@@ -447,6 +1094,7 @@ async def api_restart():
 
 
 # ── websocket: push every 5s ─────────────────────────────────────────────
+@app.websocket("/ops/ws")
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()

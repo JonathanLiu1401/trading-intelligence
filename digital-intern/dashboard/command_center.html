@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Trading Stack - Command Center</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--panel2:#20242d;--hover:#252a34;--border:#303642;--strong:#465063;--text:#eef2f7;--muted:#9aa3b2;--green:#4ade80;--yellow:#facc15;--red:#fb7185;--cyan:#38bdf8;--font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.45 var(--font)}a{color:inherit;text-decoration:none}
+.topbar{height:48px;display:flex;align-items:center;gap:2px;padding:0 20px;background:var(--panel);border-bottom:1px solid var(--border);overflow-x:auto;position:sticky;top:0;z-index:20}.brand{color:var(--yellow);font-weight:700;font-size:13px;margin-right:14px;white-space:nowrap}.topbar a{color:var(--muted);padding:6px 11px;border-radius:6px;white-space:nowrap}.topbar a:hover{color:var(--text);background:var(--hover)}.topbar a.active{color:var(--yellow);background:rgba(250,204,21,.12)}
+main{max-width:1480px;margin:0 auto;padding:18px 20px 28px}.head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:14px}h1{font-size:22px;line-height:1.1;margin:0;font-weight:700}.stamp{color:var(--muted);font-family:var(--mono);font-size:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.cmd-btn,button.cmd-btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:7px 12px;border:1px solid var(--strong);background:var(--panel2);color:var(--text);border-radius:6px;font:600 13px/1 var(--font);cursor:pointer}.cmd-btn:hover,button.cmd-btn:hover{background:var(--hover);border-color:var(--cyan)}.cmd-btn.primary{color:#071018;background:var(--cyan);border-color:var(--cyan)}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0}.wide{grid-column:span 8}.side{grid-column:span 4}.half{grid-column:span 6}.third{grid-column:span 4}.title{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}.title h2{margin:0;font-size:13px;font-weight:700}.badge{display:inline-flex;align-items:center;min-height:22px;padding:3px 8px;border:1px solid var(--strong);border-radius:99px;font:700 11px/1 var(--mono);color:var(--muted)}.badge.ok{color:var(--green);border-color:rgba(74,222,128,.45);background:rgba(74,222,128,.10)}.badge.warn{color:var(--yellow);border-color:rgba(250,204,21,.45);background:rgba(250,204,21,.10)}.badge.down,.badge.fail{color:var(--red);border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.10)}
+.headline{font-size:18px;font-weight:700;margin:4px 0 10px;overflow-wrap:anywhere}.metric-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}.metric{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:9px}.metric .k{color:var(--muted);font-size:11px}.metric .v{font:700 18px/1.25 var(--mono);margin-top:4px;overflow-wrap:anywhere}.service-list,.queue{display:grid;gap:8px}.service{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:9px;border:1px solid var(--border);background:var(--panel2);border-radius:6px}.service-name{font-weight:700}.service-detail,.queue-detail{color:var(--muted);font-size:12px;margin-top:2px;overflow-wrap:anywhere}.queue-item{border-left:3px solid var(--cyan);padding:8px 10px;background:var(--panel2);border-radius:0 6px 6px 0}.queue-item.warn{border-left-color:var(--yellow)}.queue-item.fail{border-left-color:var(--red)}.table{width:100%;border-collapse:collapse;margin-top:6px}.table th,.table td{text-align:left;border-bottom:1px solid var(--border);padding:8px 6px;vertical-align:top}.table th{color:var(--muted);font-size:11px;font-weight:600}
+@media(max-width:980px){main{padding:14px 12px 22px}.wide,.side,.third,.half{grid-column:span 12}.metric-row{grid-template-columns:repeat(2,minmax(0,1fr))}.head{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<nav class="topbar">
+  <span class="brand">TRADING STACK</span>
+  <a href="/" class="active">Command Center</a>
+  <a href="/intern/">Digital Intern</a>
+  <a href="/trader/">Paper Trader</a>
+  <a href="/trader/backtests">Backtests</a>
+  <a href="/backtests/compare">Compare</a>
+  <a href="/strategy-lab">Strategy Lab</a>
+  <a href="/journal">Journal</a>
+  <a href="/personas">Personas</a>
+  <a href="/tape">Tape</a>
+  <a href="/pulse">News Pulse</a>
+  <a href="/ops/">Ops View</a>
+  <a href="/intern/chat">Chat</a>
+  <a href="/system/">System</a>
+</nav>
+<main>
+  <div class="head">
+    <div><h1>Command Center</h1><div class="stamp" id="asOf">loading</div></div>
+    <div class="actions">
+      <button class="cmd-btn primary" id="refreshBtn" type="button">Refresh</button>
+      <a class="cmd-btn" href="/intern/">Intern</a>
+      <a class="cmd-btn" href="/trader/">Trader</a>
+      <a class="cmd-btn" href="/trader/backtests">Backtests</a>
+      <a class="cmd-btn" href="/ops/">Ops</a>
+    </div>
+  </div>
+  <section class="grid">
+    <div class="card wide"><div class="title"><h2>Desk Pulse</h2><span class="badge" id="deskState">...</span></div><div class="headline" id="deskHeadline">Loading...</div><div class="metric-row"><div class="metric"><div class="k">Equity</div><div class="v" id="mEquity">--</div></div><div class="metric"><div class="k">Return</div><div class="v" id="mReturn">--</div></div><div class="metric"><div class="k">Open positions</div><div class="v" id="mOpen">--</div></div><div class="metric"><div class="k">Code</div><div class="v" id="mCode">--</div></div></div></div>
+    <div class="card side"><div class="title"><h2>Services</h2><span class="badge" id="serviceState">...</span></div><div class="service-list" id="services"></div></div>
+    <div class="card half"><div class="title"><h2>Action Queue</h2><span class="badge" id="queueState">...</span></div><div class="queue" id="queue"></div></div>
+    <div class="card half"><div class="title"><h2>Game Plan</h2><span class="badge" id="planState">...</span></div><div class="headline" id="planHeadline">Loading...</div><div class="metric-row"><div class="metric"><div class="k">Actions</div><div class="v" id="planActions">--</div></div><div class="metric"><div class="k">Open book</div><div class="v" id="planOpen">--</div></div><div class="metric"><div class="k">Market</div><div class="v" id="planMarket">--</div></div><div class="metric"><div class="k">Opportunities</div><div class="v" id="planOpps">--</div></div></div></div>
+    <div class="card third"><div class="title"><h2>ArticleNet</h2><span class="badge" id="articleState">...</span></div><div class="metric-row"><div class="metric"><div class="k">Total</div><div class="v" id="aTotal">--</div></div><div class="metric"><div class="k">Urgent</div><div class="v" id="aUrgent">--</div></div><div class="metric"><div class="k">Unscored</div><div class="v" id="aUnscored">--</div></div><div class="metric"><div class="k">DB MB</div><div class="v" id="aDb">--</div></div></div></div>
+    <div class="card third"><div class="title"><h2>Session Delta</h2><span class="badge" id="sessionState">...</span></div><div class="headline" id="sessionHeadline">Loading...</div><table class="table"><tbody><tr><th>Window</th><td id="sessionWindow">--</td></tr><tr><th>Fills</th><td id="sessionFills">--</td></tr><tr><th>Equity move</th><td id="sessionMove">--</td></tr></tbody></table></div>
+    <div class="card third"><div class="title"><h2>Ops Health</h2><span class="badge" id="opsState">...</span></div><table class="table"><tbody><tr><th>Core</th><td id="opsCore">--</td></tr><tr><th>Workers</th><td id="opsWorkers">--</td></tr><tr><th>Errors</th><td id="opsErrors">--</td></tr></tbody></table></div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function cls(s){return s==="ok"?"ok":s==="warn"?"warn":"down"}
+function badge(id,t,s){const e=$(id);e.textContent=t||"--";e.className="badge "+cls(s||"warn")}
+function money(v){return v==null?"--":"$"+Number(v).toLocaleString(undefined,{maximumFractionDigits:2})}
+function pct(v){return v==null?"--":(Number(v)>=0?"+":"")+Number(v).toFixed(2)+"%"}
+function num(v){return v==null?"--":Number(v).toLocaleString()}
+function text(v,f="--"){return(v==null||v==="")?f:String(v)}
+async function loadCommandCenter(){
+  badge("serviceState","loading","warn");
+  const r=await fetch("/api/command-center?ts="+Date.now());
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  const d=await r.json();
+  $("asOf").textContent="as of "+text(d.as_of);
+  const desk=d.trader?.desk_pulse||{};
+  badge("deskState",text(desk.state,"UNKNOWN"),desk.state==="HEALTHY"?"ok":"warn");
+  $("deskHeadline").textContent=text(desk.headline,"No desk pulse available.");
+  $("mEquity").textContent=money(desk.money?.equity_usd??d.trader?.portfolio?.total_value);
+  $("mReturn").textContent=pct(desk.money?.total_return_pct??d.trader?.portfolio?.deposit_adjusted_return_pct);
+  $("mOpen").textContent=num(desk.concentration?.n_open_positions??d.trader?.portfolio?.n_positions);
+  $("mCode").textContent=text((desk.integrity?.status)||(d.trader?.build_info?.stale===false?"CURRENT":"STALE"));
+  const plan=d.trader?.game_plan||{};
+  badge("planState",text(plan.state,"UNKNOWN"),plan.state==="ACTIONS_PRESENT"?"warn":"ok");
+  $("planHeadline").textContent=text(plan.headline,"No game plan available.");
+  $("planActions").textContent=num(plan.n_actions);$("planOpen").textContent=num(plan.n_open);$("planMarket").textContent=plan.market_open?"OPEN":"CLOSED";$("planOpps").textContent=num((plan.opportunities||[]).length);
+  const sess=d.trader?.session_delta||{};
+  badge("sessionState",text(sess.state,"UNKNOWN"),sess.state==="ACTIVE"?"ok":"warn");
+  $("sessionHeadline").textContent=text(sess.headline,"No session delta available.");$("sessionWindow").textContent=text(sess.window_label);$("sessionFills").textContent=num(sess.n_fills);$("sessionMove").textContent=money(sess.equity_delta_usd)+" / "+pct(sess.equity_delta_pct);
+  const art=d.article_net?.stats||{};
+  badge("articleState",d.article_net?.ok?"online":"offline",d.article_net?.ok?"ok":"down");
+  $("aTotal").textContent=num(art.total);$("aUrgent").textContent=num(art.urgent);$("aUnscored").textContent=num(art.unscored);$("aDb").textContent=text(art.db_mb);
+  const ops=d.ops||{};
+  badge("opsState",ops.core_status?.critical?"critical":"ready",ops.core_status?.critical?"down":"ok");
+  $("opsCore").textContent=ops.core_status?.critical?"critical: "+(ops.core_status.down||[]).join(", "):"ready";
+  $("opsWorkers").textContent=`${ops.workers?.ok||0} ok / ${ops.workers?.warn||0} warn / ${ops.workers?.stale||0} stale / ${ops.workers?.disabled||0} off`;
+  $("opsErrors").textContent=num(ops.errors);
+  const sv=d.services||[],worst=sv.some(s=>s.status==="down")?"down":sv.some(s=>s.status==="warn")?"warn":"ok";
+  badge("serviceState",worst==="ok"?"all online":worst,worst);
+  $("services").innerHTML=sv.map(s=>`<a class="service" href="${s.href||"#"}"><span><span class="service-name">${s.name}</span><div class="service-detail">${s.detail||""}</div></span><span class="badge ${cls(s.status)}">${s.status}</span></a>`).join("");
+  const q=d.action_queue||[],qWorst=q.some(x=>x.severity==="fail")?"down":q.some(x=>x.severity==="warn")?"warn":"ok";
+  badge("queueState",q.length?`${q.length} item${q.length===1?"":"s"}`:"clear",qWorst);
+  $("queue").innerHTML=q.map(x=>`<div class="queue-item ${x.severity||""}"><strong>${x.title}</strong><div class="queue-detail">${x.detail||""}</div></div>`).join("");
+}
+$("refreshBtn").addEventListener("click",()=>loadCommandCenter().catch(showError));
+function showError(e){badge("serviceState","failed","down");$("queue").innerHTML=`<div class="queue-item fail"><strong>Command Center refresh failed</strong><div class="queue-detail">${e.message}</div></div>`}
+loadCommandCenter().catch(showError);
+</script>
+</body>
+</html>
