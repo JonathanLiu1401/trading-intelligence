@@ -59,6 +59,7 @@ from datetime import datetime, timezone
 from .round_trips import build_round_trips
 from .runner_heartbeat import build_runner_heartbeat
 from .trader_scorecard import build_trader_scorecard
+from ..store import capital_basis_snapshot
 
 # Default starting equity. The dashboard endpoint passes ``store.INITIAL_CASH``
 # explicitly (AGENTS.md invariant #12 — one source of truth for the $1000
@@ -94,7 +95,8 @@ def _safe(fn, *args, **kwargs) -> dict:
 def _money_block(portfolio: dict,
                   positions: list[dict],
                   trades: list[dict],
-                  initial_cash: float) -> dict:
+                  initial_cash: float,
+                  equity_curve: list[dict] | None = None) -> dict:
     """Equity, return %, and the canonical realised round-trip metrics.
 
     ``trades`` is store-native **newest-first** (``store.recent_trades()``);
@@ -106,8 +108,13 @@ def _money_block(portfolio: dict,
     equity = _num((portfolio or {}).get("total_value"))
     cash = _num((portfolio or {}).get("cash"))
     base = initial_cash if initial_cash else _DEFAULT_INITIAL_CASH
-    total_return_pct = (round((equity - base) / base * 100, 2)
-                        if equity is not None and base else None)
+    raw_total_return_pct = (round((equity - base) / base * 100, 2)
+                            if equity is not None and base else None)
+    capital = capital_basis_snapshot(
+        equity_curve or [], equity, initial_cash=base)
+    total_return_pct = capital.get("deposit_adjusted_return_pct")
+    if total_return_pct is None:
+        total_return_pct = raw_total_return_pct
 
     rts = build_round_trips(list(reversed(trades or [])))
     pnls = [rt["pnl_usd"] for rt in rts]
@@ -133,6 +140,12 @@ def _money_block(portfolio: dict,
         "equity_usd": round(equity, 2) if equity is not None else None,
         "cash_usd": round(cash, 2) if cash is not None else None,
         "total_return_pct": total_return_pct,
+        "raw_total_return_pct": raw_total_return_pct,
+        "capital_basis": capital.get("capital_basis"),
+        "net_external_cash_flow": capital.get("net_external_cash_flow"),
+        "deposit_adjusted_pnl": capital.get("deposit_adjusted_pnl"),
+        "deposit_adjusted_return_pct": capital.get(
+            "deposit_adjusted_return_pct"),
         "realized_pl_usd": realized_pl_usd,
         "unrealized_pl_usd": round(unreal, 2),
         "n_round_trips": n,
@@ -201,7 +214,7 @@ def build_desk_pulse(portfolio: dict,
     bi = build_info if isinstance(build_info, dict) else {}
 
     money = _money_block(portfolio or {}, positions or [], trades or [],
-                         initial_cash)
+                         initial_cash, equity_curve or [])
     concentration = _concentration_block(positions or [])
 
     decs = decisions or []

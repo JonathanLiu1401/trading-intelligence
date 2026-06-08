@@ -107,6 +107,26 @@ class TestMoneyBlock:
             initial_cash=2000.0, now=_NOW)
         assert rep["money"]["total_return_pct"] == -43.5
 
+    def test_external_deposit_is_not_reported_as_return(self):
+        """A manual top-up changes capital basis, not trading performance."""
+        eq = [
+            {"timestamp": "2026-06-08T09:00:00+00:00",
+             "total_value": 1000.0, "cash": 1000.0, "sp500_price": 7400.0},
+            {"timestamp": "2026-06-08T09:05:00+00:00",
+             "total_value": 10000.0, "cash": 10000.0, "sp500_price": 7400.0},
+        ]
+        rep = build_desk_pulse(
+            {"total_value": 10000.0, "cash": 10000.0}, [], [],
+            _fresh_decisions(), eq, build_info={}, market_open=True,
+            initial_cash=1000.0, now=_NOW)
+        m = rep["money"]
+        assert m["total_return_pct"] == 0.0
+        assert m["deposit_adjusted_return_pct"] == 0.0
+        assert m["deposit_adjusted_pnl"] == 0.0
+        assert m["capital_basis"] == 10000.0
+        assert m["net_external_cash_flow"] == 9000.0
+        assert m["raw_total_return_pct"] == 900.0
+
     def test_unrealized_is_sum_of_marks_null_safe(self):
         positions = [
             {"ticker": "NVDA", "type": "stock", "qty": 10,
