@@ -83,6 +83,7 @@ def build_decision_context(
     track_record_block: str | None = None,
     risk_mirror_block: str | None = None,
     sector_exposure_block: str | None = None,
+    portfolio_construction_block: str | None = None,
     ml_opinion_block: str | None = None,
     event_calendar_block: str | None = None,
     macro_calendar_block: str | None = None,
@@ -96,7 +97,8 @@ def build_decision_context(
     # pass merged_signals there — identical to strategy.decide().
     # event_calendar_block (forward earnings) + macro_calendar_block
     # (forward FOMC rate decisions) + buying_power_block (deployable cash) +
-    # sector_exposure_block (live-book sector concentration) are threaded
+    # sector_exposure_block (live-book sector concentration) +
+    # portfolio_construction_block (target allocation/risk/why) are threaded
     # through here because decide() now passes ALL of them to _build_payload;
     # omitting any silently drops an advisory block from this "byte-identical
     # reconstruction", so a trader auditing whether Opus saw the
@@ -112,6 +114,7 @@ def build_decision_context(
         track_record_block=track_record_block,
         risk_mirror_block=risk_mirror_block,
         sector_exposure_block=sector_exposure_block,
+        portfolio_construction_block=portfolio_construction_block,
         event_calendar_block=event_calendar_block,
         macro_calendar_block=macro_calendar_block,
         buying_power_block=buying_power_block,
@@ -156,6 +159,7 @@ def build_decision_context(
             "track_record": bool(track_record_block),
             "risk_mirror": bool(risk_mirror_block),
             "sector_exposure": bool(sector_exposure_block),
+            "portfolio_construction": bool(portfolio_construction_block),
             "ml_opinion": bool(ml_opinion_block),
             "event_calendar": bool(event_calendar_block),
             "macro_calendar": bool(macro_calendar_block),
@@ -258,6 +262,29 @@ def assemble_inputs(store) -> dict:
     except Exception:
         pass
 
+    # Portfolio-construction target — built EXACTLY as decide() builds it:
+    # same read-only snapshot, merged signal rows, already-fetched quant
+    # signals, and already-fetched watch prices. This endpoint is the audit
+    # surface for "did Opus see the target allocation/risk/why block?"
+    portfolio_construction_block = None
+    try:
+        from .portfolio_construction import build_portfolio_construction
+        from .sector_exposure import classify as _pc_classify
+        from .stress_scenarios import _LEVERAGE_BETA as _pc_beta
+        portfolio_construction_block = build_portfolio_construction(
+            snap,
+            merged,
+            quant_sigs,
+            watch_px,
+            _pc_classify,
+            _pc_beta,
+            risk_tolerance="medium",
+            time_horizon="1-3 years",
+            fallback_tickers=["SPY", "QQQ", *strategy.WATCHLIST[:10]],
+        ).get("prompt_block")
+    except Exception:
+        pass
+
     # Forward scheduled-event awareness — built EXACTLY as decide() builds it
     # (scope = held ∪ the full WATCHLIST, not the lean _names_in_play set —
     # narrowing it would re-blind the reconstruction the same way it would
@@ -326,6 +353,7 @@ def assemble_inputs(store) -> dict:
         track_record_block=track_record_block,
         risk_mirror_block=risk_mirror_block,
         sector_exposure_block=sector_exposure_block,
+        portfolio_construction_block=portfolio_construction_block,
         ml_opinion_block=ml_opinion_block,
         event_calendar_block=event_calendar_block,
         macro_calendar_block=macro_calendar_block,
@@ -358,6 +386,7 @@ if __name__ == "__main__":  # works even when :8090 is wedged (desk_pulse preced
               f"track_record={a['track_record']} "
               f"risk_mirror={a['risk_mirror']} "
               f"sector_exposure={a['sector_exposure']} "
+              f"portfolio_construction={a['portfolio_construction']} "
               f"ml={a['ml_opinion']} "
               f"event_calendar={a['event_calendar']} "
               f"macro_calendar={a['macro_calendar']} "

@@ -54,6 +54,28 @@ STOCK_MARGIN_NET_WORTH_PCT = 0.50
 STOCK_BUY_MIN_LEVERAGE = 1.0
 STOCK_BUY_MAX_LEVERAGE = 20.0
 
+# Hard operator discipline for the live paper book. These are deliberately
+# enforced in _execute(), not merely described to the model, because the live
+# trade log showed repeated same-ticker round trips and sector pile-ons.
+TRADE_DISCIPLINE_MIN_BOOK_VALUE = float(os.environ.get(
+    "PAPER_TRADER_DISCIPLINE_MIN_BOOK_VALUE", "5000",
+))
+ENTRY_COOLDOWN_AFTER_EXIT_S = int(os.environ.get(
+    "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_EXIT_S", str(2 * 3600),
+))
+ENTRY_COOLDOWN_AFTER_ANY_TRADE_S = int(os.environ.get(
+    "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_ANY_TRADE_S", str(30 * 60),
+))
+MAX_POST_TRADE_SINGLE_NAME_PCT = float(os.environ.get(
+    "PAPER_TRADER_MAX_POST_TRADE_SINGLE_NAME_PCT", "35",
+))
+MAX_POST_TRADE_SECTOR_PCT = float(os.environ.get(
+    "PAPER_TRADER_MAX_POST_TRADE_SECTOR_PCT", "45",
+))
+MAX_POST_TRADE_LEVERAGED_PCT = float(os.environ.get(
+    "PAPER_TRADER_MAX_POST_TRADE_LEVERAGED_PCT", "20",
+))
+
 # ML advisor gate — when the backtest ML model's median alpha consistently
 # beats SPY, its (quant+news) recommendation is injected into the Opus prompt
 # as an *advisory* opinion. Opus retains full autonomy over the final call.
@@ -63,18 +85,46 @@ ML_QUALIFY_TTL_S = 3600.0      # recheck every hour
 
 _ml_qualify_cache: tuple[bool, str, float] | None = None
 
+_CLI_PATH_PREFIXES = (
+    str(Path.home() / ".local" / "bin"),
+    str(Path.home() / ".nvm" / "versions" / "node" / "v24.15.0" / "bin"),
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/home/zeph/.local/bin",
+    "/home/zeph/.nvm/versions/node/v24.15.0/bin",
+)
+
 
 def _cli_path(name: str) -> str | None:
+    override = os.environ.get(f"PAPER_TRADER_{name.upper()}_BIN")
+    if override and Path(override).exists():
+        return override
     found = shutil.which(name)
     if found:
         return found
-    for candidate in (
-        f"/home/zeph/.local/bin/{name}",
-        f"/home/zeph/.nvm/versions/node/v24.15.0/bin/{name}",
-    ):
+    for directory in _CLI_PATH_PREFIXES:
+        candidate = Path(directory) / name
         if Path(candidate).exists():
-            return candidate
+            return str(candidate)
     return None
+
+
+def _llm_subprocess_env(use_codex: bool) -> dict[str, str]:
+    """PATH-safe environment for launchd/systemd-started model CLI wrappers."""
+    entries: list[str] = []
+    for value in (*_CLI_PATH_PREFIXES, os.environ.get("PATH", "")):
+        if not value:
+            continue
+        entries.extend(part for part in value.split(os.pathsep) if part)
+    entries.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    deduped = list(dict.fromkeys(entries))
+    env = {**os.environ, "PATH": os.pathsep.join(deduped)}
+    if use_codex:
+        env["CODEX_HOME"] = os.environ.get(
+            "PAPER_TRADER_CODEX_HOME",
+            str(Path.home() / ".codex"),
+        )
+    return env
 
 # Tracks the most recent LLM subprocess so a new _claude_call can kill a
 # lingering one from a prior cycle. Overlapping calls compete for the same API
@@ -258,14 +308,17 @@ _TP_PCT_LEVERAGED = 0.25
 SYSTEM_PROMPT = """You are managing a paper trading portfolio. Use the live
 portfolio value, cash balance, positions, and buying-power fields in CONTEXT as
 the source of truth for account size.
-Your ONLY goal is maximum profit. You have complete freedom over position sizing,
-risk, leverage, and timing. There are NO enforced limits. You can:
-- Put 100% of portfolio into one trade if you have high conviction
+Your ONLY goal is maximum profit after churn, concentration, and avoidable
+drawdown. You have autonomy over timing, thesis, and sizing inside the hard
+operator discipline enforced by the engine: no repeated same-ticker entry churn,
+no oversized single-name or sector pile-on, and no oversized leveraged ETF bet.
+You can:
+- Concentrate when evidence is exceptional, but only within the hard engine caps
 - Short stocks when the evidence is bearish
 - Hold options through expiry if you believe in the thesis
-- Go all-in on a single ticker
-- Let losers run if you expect reversal
-- Take leveraged ETF positions (MUU, LNOK, etc.)
+- Keep cash when the available trades would only recycle a stale idea
+- Let losers run only when the thesis is still intact and risk is diversified
+- Take leveraged ETF positions (MUU, LNOK, etc.) only as bounded sleeves
 
 LEVERAGE INSTRUMENTS AVAILABLE:
 - Leveraged ETFs 3x Bull: TQQQ (QQQ), UPRO/SPXL (SPY), UDOW (Dow), URTY (Russell), SOXL (semis), TECL (tech), FNGU (FANGs), CURE (healthcare), LABU (biotech), NAIL (homebuilders), DPST (banks), FAS (financials), DFEN (defense), TNA (small-cap), UTSL (utilities)
@@ -276,13 +329,15 @@ LEVERAGE INSTRUMENTS AVAILABLE:
 - Risk: leveraged ETFs decay in sideways markets; best for strong trending moves only
 
 POSITION SIZING GUIDANCE:
-- High conviction (RSI+MACD+MA all aligned): up to 40% portfolio
-- Medium conviction (2/3 signals aligned): 15-25%
-- Low conviction / leveraged ETF: max 10%
-- Never go 100% into one leveraged ETF (decay risk)
+- High conviction (RSI+MACD+MA all aligned): up to 25-35% portfolio
+- Medium conviction (2/3 signals aligned): 10-20%
+- Low conviction / leveraged ETF: max 5-10%
+- Do not rebuy a ticker right after selling it unless a genuinely new catalyst appears
+- Never go 100% into one ticker or leveraged ETF
 
 THINK LIKE A HEDGE FUND MANAGER WHO WANTS ASYMMETRIC RETURNS.
-Small, safe trades will not outperform. Take calculated risks.
+Small, safe trades will not outperform. Recycled, correlated trades will not
+outperform either. Take calculated risks across differentiated ideas.
 High conviction = large size. Low conviction = stay cash.
 
 HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New long stock positions are
@@ -800,13 +855,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=(
-                {**os.environ, "CODEX_HOME": os.environ.get(
-                    "PAPER_TRADER_CODEX_HOME",
-                    str(Path.home() / ".codex"),
-                )}
-                if use_codex else None
-            ),
+            env=_llm_subprocess_env(use_codex),
         )
         _active_claude_proc = proc
         _active_claude_started_at = time.monotonic()
@@ -1206,6 +1255,7 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    risk_mirror_block: str | None = None,
                    sector_exposure_block: str | None = None,
                    stress_block: str | None = None,
+                   portfolio_construction_block: str | None = None,
                    event_calendar_block: str | None = None,
                    macro_calendar_block: str | None = None,
                    buying_power_block: str | None = None,
@@ -1342,6 +1392,16 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # forward event block: the trader sees its book shape, then what that
     # shape loses on a shock, then what is *coming*, before prices bias it.
     stress_section = f"{stress_block}\n" if stress_block else ""
+    # Portfolio-construction target — the allocation sibling of
+    # stress_scenarios. The concentration/stress blocks answer "what does the
+    # current book risk?"; this answers "what diversified target would the
+    # same evidence imply under a risk tolerance/time horizon?" Observational
+    # only (invariants #2/#12): it never gates or sizes a trade, and Opus
+    # retains full autonomy.
+    construction_section = (
+        f"{portfolio_construction_block}\n"
+        if portfolio_construction_block else ""
+    )
     # Forward scheduled-event awareness (earnings) — same observational/
     # advisory contract as the three mirrors above (invariants #2/#12). Placed
     # right after the backward-looking behavioural stack and before market
@@ -1409,7 +1469,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{event_section}{macro_section}{bp_section}{exit_proximity_section}
+{review_section}{track_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{construction_section}{event_section}{macro_section}{bp_section}{exit_proximity_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1642,6 +1702,147 @@ def _stock_buying_power(snapshot: dict) -> float:
     return cash + max(0.0, total) * STOCK_MARGIN_NET_WORTH_PCT
 
 
+def _parse_trade_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _position_abs_value(p: dict) -> float:
+    try:
+        if p.get("market_value") is not None:
+            return abs(float(p.get("market_value") or 0.0))
+        mult = 100 if p.get("type") in ("call", "put") else 1
+        price = float(p.get("current_price") or p.get("avg_cost") or 0.0)
+        qty = float(p.get("qty") or 0.0)
+        return abs(price * qty * mult)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _trade_discipline_guard(
+    decision: dict,
+    snapshot: dict,
+    store: Store,
+    *,
+    price: float,
+    effective_qty: float,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Hard block repeated entries and concentration pile-ons.
+
+    Applies only to new stock entries (BUY/SHORT). Exits are always allowed so
+    the guard cannot trap risk. The small-book threshold keeps legacy unit tests
+    and toy local simulations from turning into "35% max" math exercises; the
+    live Mac book is above this threshold.
+    """
+    action = (decision.get("action") or "").upper()
+    if action not in {"BUY", "SHORT"}:
+        return True, ""
+    try:
+        total = float(snapshot.get("total_value") or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total < TRADE_DISCIPLINE_MIN_BOOK_VALUE:
+        return True, ""
+
+    ticker = str(decision.get("ticker") or "").upper()
+    if not ticker:
+        return False, "ticker required for entry discipline"
+    now = now or datetime.now(timezone.utc)
+
+    try:
+        recent = store.recent_trades(100)
+    except Exception:
+        recent = []
+    for tr in recent:
+        if str(tr.get("ticker") or "").upper() != ticker:
+            continue
+        ts = _parse_trade_ts(tr.get("timestamp"))
+        if ts is None:
+            continue
+        age_s = (now - ts).total_seconds()
+        if age_s < 0:
+            continue
+        prior = str(tr.get("action") or "").upper()
+        if prior in {"SELL", "COVER", "SELL_CALL", "SELL_PUT"}:
+            if age_s < ENTRY_COOLDOWN_AFTER_EXIT_S:
+                mins = int(age_s // 60)
+                wait = int((ENTRY_COOLDOWN_AFTER_EXIT_S - age_s + 59) // 60)
+                return (
+                    False,
+                    f"churn cooldown: {ticker} was exited {mins}m ago; "
+                    f"wait {wait}m or bring a genuinely new catalyst",
+                )
+        elif prior in {"BUY", "SHORT", "BUY_CALL", "BUY_PUT"}:
+            if age_s < ENTRY_COOLDOWN_AFTER_ANY_TRADE_S:
+                mins = int(age_s // 60)
+                wait = int((ENTRY_COOLDOWN_AFTER_ANY_TRADE_S - age_s + 59) // 60)
+                return (
+                    False,
+                    f"same-ticker entry cooldown: {ticker} was traded {mins}m "
+                    f"ago; wait {wait}m before adding/recycling",
+                )
+
+    notional = abs(float(price) * float(effective_qty))
+    if notional <= 0:
+        return True, ""
+
+    try:
+        from .analytics.sector_exposure import classify
+    except Exception:
+        classify = lambda _ticker: "other"  # noqa: E731
+
+    name_values: dict[str, float] = {}
+    sector_values: dict[str, float] = {}
+    for p in snapshot.get("positions") or []:
+        tk = str(p.get("ticker") or "").upper()
+        if not tk:
+            continue
+        value = _position_abs_value(p)
+        if value <= 0:
+            continue
+        name_values[tk] = name_values.get(tk, 0.0) + value
+        sec = classify(tk)
+        sector_values[sec] = sector_values.get(sec, 0.0) + value
+
+    sector = classify(ticker)
+    denom = max(total, sum(name_values.values()) + notional, 1.0)
+    post_name = name_values.get(ticker, 0.0) + notional
+    post_sector = sector_values.get(sector, 0.0) + notional
+    post_name_pct = post_name / denom * 100.0
+    post_sector_pct = post_sector / denom * 100.0
+
+    if post_name_pct > MAX_POST_TRADE_SINGLE_NAME_PCT + 1e-6:
+        return (
+            False,
+            f"diversification block: {ticker} would be "
+            f"{post_name_pct:.1f}% of book; max "
+            f"{MAX_POST_TRADE_SINGLE_NAME_PCT:.1f}%",
+        )
+    if post_sector_pct > MAX_POST_TRADE_SECTOR_PCT + 1e-6:
+        return (
+            False,
+            f"sector concentration block: {sector} would be "
+            f"{post_sector_pct:.1f}% of book; max "
+            f"{MAX_POST_TRADE_SECTOR_PCT:.1f}%",
+        )
+    if sector.endswith("_lev") and post_sector_pct > MAX_POST_TRADE_LEVERAGED_PCT + 1e-6:
+        return (
+            False,
+            f"leveraged sleeve block: {sector} would be "
+            f"{post_sector_pct:.1f}% of book; max "
+            f"{MAX_POST_TRADE_LEVERAGED_PCT:.1f}%",
+        )
+    return True, ""
+
+
 def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
     """Apply the decision against the paper book. Returns (status, detail)."""
     action = (decision.get("action", "HOLD") or "HOLD").upper()
@@ -1679,6 +1880,12 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             leverage = _stock_buy_leverage(decision)
             effective_qty = round(qty * leverage, 8)
             notional = price * effective_qty
+            ok, why = _trade_discipline_guard(
+                decision, snapshot, store,
+                price=price, effective_qty=effective_qty,
+            )
+            if not ok:
+                return "BLOCKED", why
             buying_power = _stock_buying_power(snapshot)
             if buying_power - notional < -1e-6:
                 return (
@@ -1735,6 +1942,12 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
 
         if action == "SHORT":
             notional = price * qty
+            ok, why = _trade_discipline_guard(
+                decision, snapshot, store,
+                price=price, effective_qty=qty,
+            )
+            if not ok:
+                return "BLOCKED", why
             shorting_power = _stock_buying_power(snapshot)
             if shorting_power - notional < -1e-6:
                 return (
@@ -2323,6 +2536,33 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] stress-scenarios failed (non-fatal): {e}")
 
+    # Portfolio-construction target — uses only data already in this cycle
+    # (snapshot, merged signals, quant_sigs, watch_px). No extra DB read and
+    # no extra yfinance call on the live path. Observational only: it gives
+    # Opus a concrete allocation/risk/why target for self-checking, never a
+    # directive or cap.
+    portfolio_construction_block: str | None = None
+    try:
+        from .analytics.portfolio_construction import (
+            build_portfolio_construction,
+        )
+        from .analytics.sector_exposure import classify as _pc_classify
+        from .analytics.stress_scenarios import _LEVERAGE_BETA as _pc_beta
+        pc = build_portfolio_construction(
+            snap,
+            merged,
+            quant_sigs,
+            watch_px,
+            _pc_classify,
+            _pc_beta,
+            risk_tolerance="medium",
+            time_horizon="1-3 years",
+            fallback_tickers=["SPY", "QQQ", *WATCHLIST[:10]],
+        )
+        portfolio_construction_block = pc.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] portfolio-construction failed (non-fatal): {e}")
+
     # Forward scheduled-event awareness — the #1 thing a discretionary desk
     # tracks that the engine was fully blind to: upcoming EARNINGS on the
     # names in play. Reads digital-intern's earnings_calendar.json snapshot
@@ -2447,6 +2687,7 @@ def decide() -> dict:
                              risk_mirror_block=risk_mirror_block,
                              sector_exposure_block=sector_exposure_block,
                              stress_block=stress_block,
+                             portfolio_construction_block=portfolio_construction_block,
                              event_calendar_block=event_calendar_block,
                              macro_calendar_block=macro_calendar_block,
                              buying_power_block=buying_power_block,

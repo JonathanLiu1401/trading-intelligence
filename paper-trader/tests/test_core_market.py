@@ -96,12 +96,27 @@ class TestGetPriceMocked:
     def setup_method(self):
         market._PRICE_CACHE.clear()
 
+    @pytest.fixture(autouse=True)
+    def _regular_session(self, monkeypatch):
+        monkeypatch.setattr(market, "market_phase", lambda: "MID_SESSION")
+
     def test_fast_info_path_returns_price_and_caches(self, monkeypatch):
         fake_ticker = MagicMock()
         fake_ticker.fast_info = {"last_price": 123.45, "regular_market_price": 0}
         monkeypatch.setattr(market.yf, "Ticker", lambda t: fake_ticker)
         assert market.get_price("FAKE") == 123.45
         assert market._cached_price("FAKE") == 123.45
+
+    def test_fast_info_camelcase_last_price_preferred(self, monkeypatch):
+        fake_ticker = MagicMock()
+        fake_ticker.fast_info = {
+            "lastPrice": 125.50,
+            "last_price": 123.45,
+            "regularMarketPrice": 122.0,
+        }
+        monkeypatch.setattr(market.yf, "Ticker", lambda t: fake_ticker)
+
+        assert market.get_price("FAKE") == pytest.approx(125.50)
 
     def test_zero_fast_info_falls_back_to_history(self, monkeypatch):
         import pandas as pd
@@ -386,6 +401,10 @@ class TestGetPricesBulk:
     def setup_method(self):
         market._PRICE_CACHE.clear()
 
+    @pytest.fixture(autouse=True)
+    def _regular_session(self, monkeypatch):
+        monkeypatch.setattr(market, "market_phase", lambda: "MID_SESSION")
+
     def _no_download(self, *a, **k):
         raise AssertionError("yf.download must not be called")
 
@@ -490,6 +509,19 @@ class TestGetPricesBulk:
         market._store_price("BBB", 6.0)
         monkeypatch.setattr(market.yf, "download", self._no_download)
         assert market.get_prices(["AAA", "BBB"]) == {"AAA": 5.0, "BBB": 6.0}
+
+    def test_small_after_hours_batch_uses_fast_quotes_not_regular_bulk(
+            self, monkeypatch):
+        monkeypatch.setattr(market, "market_phase", lambda: "AFTER_CLOSE")
+        fake_ticker = MagicMock()
+        fake_ticker.fast_info = {
+            "lastPrice": 125.50,
+            "last_price": 123.45,
+        }
+        monkeypatch.setattr(market.yf, "Ticker", lambda t: fake_ticker)
+        monkeypatch.setattr(market.yf, "download", self._no_download)
+
+        assert market.get_prices(["AAA"]) == {"AAA": pytest.approx(125.50)}
 
 
 class TestGetOptionsChain:

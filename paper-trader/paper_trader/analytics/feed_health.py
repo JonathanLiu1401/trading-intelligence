@@ -61,15 +61,16 @@ STALE_HOURS = 6.0
 # news period. 6h ≫ the 2h decision window and ≫ any real collector gap.
 SPLIT_BRAIN_GAP_H = 6.0
 
-# The ai_score threshold ``strategy.decide()`` feeds Opus via
+# The effective-score threshold ``strategy.decide()`` feeds Opus via
 # ``signals.get_top_signals(hours=2, min_score=4.0)`` (mirror this literal in
-# both places — see strategy.py:1501 and decision_context.py:197). Used by the
-# UNSCORED_FEED sub-classification below: when the article DB is fresh and
-# carrying rows, but the trader is BLIND because every row's ai_score sits
-# below the gate, the operator action is "fix digital-intern scoring", NOT
-# "fix the collector / restart the runner" — the two root causes the existing
-# BLIND headline ("183 live article(s) in the last 2h") conflates into one
-# misleading "feed looks alive" line.
+# both places — see strategy.py:1501 and decision_context.py:197). Effective
+# score means LLM ``ai_score`` first, then local-model ``ml_score``. Used by
+# the UNSCORED_FEED sub-classification below: when the article DB is fresh and
+# carrying rows, but the trader is BLIND because every row's effective score
+# sits below the gate, the operator action is "fix digital-intern scoring",
+# NOT "fix the collector / restart the runner" — the two root causes the
+# existing BLIND headline ("183 live article(s) in the last 2h") conflates
+# into one misleading "feed looks alive" line.
 LIVE_MIN_SCORE = 4.0
 
 
@@ -123,8 +124,8 @@ def build_feed_health(decisions: list[dict], feed: dict,
     resolved_age = _age_h(resolved_newest, now)
     live_2h = int(feed.get("resolved_live_2h") or 0)
     live_24h = int(feed.get("resolved_live_24h") or 0)
-    # ``resolved_scored_2h`` — articles in the 2h window whose ai_score >=
-    # LIVE_MIN_SCORE (the same gate strategy.decide() feeds Opus). Optional:
+    # ``resolved_scored_2h`` — articles in the 2h window whose effective score
+    # >= LIVE_MIN_SCORE (the same gate strategy.decide() feeds Opus). Optional:
     # callers (the endpoint) supply it; pure-builder tests / legacy callers
     # that omit it leave us with ``None``, which suppresses the new
     # UNSCORED_FEED clause entirely (backwards-compatible). Comparing
@@ -136,7 +137,7 @@ def build_feed_health(decisions: list[dict], feed: dict,
     except (TypeError, ValueError):
         scored_2h = None
     # UNSCORED_FEED: the DB is carrying articles but NONE pass the live
-    # trader's ai_score gate. Distinct from "no articles at all" — the
+    # trader's effective-score gate. Distinct from "no articles at all" — the
     # operator action is "fix the ML scorer", not "fix the collector". We
     # only assert this when both (a) the caller supplied an explicit scored
     # count AND (b) raw articles are present AND (c) zero of them are scored.
@@ -260,18 +261,18 @@ def build_feed_health(decisions: list[dict], feed: dict,
     # the bare BLIND headline against a fresh DB and 183 live rows would
     # plausibly conclude "feed is fine, just no high-score news" — but the
     # observed live root cause (2026-05-24 hybrid pass) was every article
-    # arriving with ai_score=0.0, i.e. the digital-intern ML pipeline had
-    # silently stopped scoring. Surfacing the distinction tells the operator
-    # *which* upstream to restart. Suppressed (empty) when ``scored_2h`` is
-    # unknown — the pure-builder fixture path that doesn't pass the new field
-    # keeps its byte-identical pre-fix headline.
+    # arriving with ai_score=0.0 / ml_score=NULL, i.e. the digital-intern ML
+    # pipeline had silently stopped scoring. Surfacing the distinction tells
+    # the operator *which* upstream to restart. Suppressed (empty) when
+    # ``scored_2h`` is unknown — the pure-builder fixture path that doesn't
+    # pass the new field keeps its byte-identical pre-fix headline.
     unscored_clause = ""
     if unscored_feed:
         unscored_clause = (
             f" — articles ARRIVING ({live_2h} in the last 2h) but NONE pass "
-            f"the ai_score>={LIVE_MIN_SCORE:.1f} gate the live trader feeds "
-            f"Opus; the digital-intern ML scoring pipeline appears down — "
-            f"restart the scorer, not the collector."
+            f"the effective_score>={LIVE_MIN_SCORE:.1f} gate the live trader "
+            f"feeds Opus; the digital-intern ML scoring pipeline appears "
+            f"down — restart the scorer, not the collector."
         )
 
     if verdict == "NO_DATA":
@@ -310,11 +311,12 @@ def build_feed_health(decisions: list[dict], feed: dict,
         "resolved_live_2h": live_2h,
         "resolved_live_24h": live_24h,
         # Sub-classification: the article DB is fresh and carrying rows but
-        # NONE pass the live trader's ai_score gate (the digital-intern ML
-        # scoring pipeline is silently down). None == "caller did not supply
-        # the scored count this build", which suppresses the new headline
-        # clause entirely so legacy/test callers see the byte-identical
-        # pre-fix output. The endpoint passes resolved_scored_2h.
+        # NONE pass the live trader's effective-score gate (the digital-intern
+        # ML scoring pipeline is silently down). None == "caller did not
+        # supply the scored count this build", which suppresses the new
+        # headline clause entirely so legacy/test callers see the
+        # byte-identical pre-fix output. The endpoint passes
+        # resolved_scored_2h.
         "resolved_scored_2h": scored_2h,
         "unscored_feed": unscored_feed,
         "split_brain": split_brain,

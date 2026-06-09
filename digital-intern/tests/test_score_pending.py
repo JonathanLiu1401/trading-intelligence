@@ -35,7 +35,7 @@ def _recent_iso(minutes_ago: int = 5) -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
 
 
-def _insert(store, *, id, url, title, source, kw_score=1.0):
+def _insert(store, *, id, url, title, source, kw_score=1.0, first_seen=None):
     with store._write_lock:
         store.conn.execute(
             "INSERT INTO articles "
@@ -43,7 +43,7 @@ def _insert(store, *, id, url, title, source, kw_score=1.0):
             " first_seen, cycle, ml_score, score_source) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (id, url, title, source, "", kw_score, 0.0, 0,
-             _recent_iso(), 0, None, None),
+             first_seen or _recent_iso(), 0, None, None),
         )
         store.conn.commit()
 
@@ -154,6 +154,61 @@ def test_score_pending_noop_when_model_unfitted(store, monkeypatch):
     # rel_std==99 sentinel → time_sensitivity must NOT be persisted (not a real
     # prediction).
     assert ts is None
+
+
+def test_score_pending_max_batches_bounds_work(store, monkeypatch):
+    """The Mac launchd scorer uses max_batches=1 so a huge backlog cannot turn
+    one daemon cycle into an all-day historical drain."""
+    for i in range(3):
+        _insert(store, id=f"x{i}", url=f"https://reuters.com/x{i}",
+                title=f"Batch bounded article {i}", source="rss",
+                kw_score=3.0 - i)
+
+    def _fake_score_articles(batch):
+        return [
+            ArticleScore(relevance=6.0, urgency=2.0, rel_std=0.1,
+                         urg_std=0.1, needs_llm=False,
+                         confident_noise=False, time_sensitivity=0.7)
+            for _ in batch
+        ]
+
+    import ml.inference as _inf
+    monkeypatch.setattr(_inf, "score_articles", _fake_score_articles)
+
+    n = store.score_pending(batch_size=1, max_batches=1)
+
+    assert n == 1
+    scored = store.conn.execute(
+        "SELECT COUNT(*) FROM articles WHERE ml_score IS NOT NULL"
+    ).fetchone()[0]
+    pending = {a["_id"] for a in store.get_unscored(min_kw=0.0)}
+    assert scored == 1
+    assert len(pending) == 2
+
+
+def test_score_pending_recent_hours_uses_fresh_window(store, monkeypatch):
+    old_seen = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    _insert(store, id="old", url="https://reuters.com/old",
+            title="Old backlog article", source="rss", first_seen=old_seen)
+    _insert(store, id="fresh", url="https://reuters.com/fresh",
+            title="Fresh live article", source="rss")
+
+    def _fake_score_articles(batch):
+        return [
+            ArticleScore(relevance=6.0, urgency=2.0, rel_std=0.1,
+                         urg_std=0.1, needs_llm=False,
+                         confident_noise=False, time_sensitivity=0.7)
+            for _ in batch
+        ]
+
+    import ml.inference as _inf
+    monkeypatch.setattr(_inf, "score_articles", _fake_score_articles)
+
+    n = store.score_pending(batch_size=10, max_batches=1, recent_hours=6)
+
+    assert n == 1
+    assert _row(store, "fresh")[1] == pytest.approx(6.0)
+    assert _row(store, "old")[1] is None
 
 
 def test_score_pending_prefloor_recap_and_quote_widget(store, monkeypatch):

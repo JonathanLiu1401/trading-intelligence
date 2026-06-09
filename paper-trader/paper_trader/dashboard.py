@@ -8451,9 +8451,9 @@ def portfolio_api():
 
     Backward-compatible: the original three keys (``total_value``, ``cash``,
     ``starting_value``) remain unchanged. We additionally expose at-a-glance
-    trader-actionable fields composed *purely* from the already-cached
-    ``portfolio.positions_json`` row (no extra store reads, no network — so
-    this endpoint stays the lean lowest-latency public surface):
+    trader-actionable fields from a live read-only mark when possible. If the
+    quote path fails, it falls back to the already-cached
+    ``portfolio.positions_json`` row:
 
       * ``n_positions`` — open lots count
       * ``open_value`` — Σ market_value across open lots (i.e. total_value − cash)
@@ -8479,7 +8479,26 @@ def portfolio_api():
     three legacy keys are always present.
     """
     store = get_store()
-    pf = store.get_portfolio()
+    stored_pf = store.get_portfolio()
+    live_marked = False
+    live_error = None
+    try:
+        from .strategy import portfolio_snapshot_readonly
+        snap = portfolio_snapshot_readonly(store)
+        snap_positions = snap.get("positions") or []
+        if snap_positions or not (stored_pf.get("positions") or []):
+            pf = {
+                **stored_pf,
+                "cash": snap.get("cash"),
+                "total_value": snap.get("total_value"),
+                "positions": snap_positions,
+            }
+            live_marked = True
+        else:
+            pf = stored_pf
+    except Exception as e:
+        live_error = str(e)
+        pf = stored_pf
 
     cash_raw = pf.get("cash")
     total_raw = pf.get("total_value")
@@ -8550,7 +8569,13 @@ def portfolio_api():
         "unrealized_pl": round(unrealized_pl, 2),
         "unrealized_pl_pct": pnl_pct,
         "stale_marks": stale_marks,
-        "last_updated": pf.get("last_updated"),
+        "last_updated": (
+            datetime.now(timezone.utc).isoformat()
+            if live_marked else pf.get("last_updated")
+        ),
+        "stored_last_updated": stored_pf.get("last_updated"),
+        "live_marked": live_marked,
+        "live_mark_error": live_error,
         "pnl_vs_start": pnl_vs_start,
         "pnl_vs_start_pct": pnl_vs_start_pct,
         "pnl_vs_initial": pnl_vs_start,
@@ -10163,6 +10188,115 @@ def stress_scenarios_api():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/portfolio-construction")
+def portfolio_construction_api():
+    """Risk-tolerance/time-horizon portfolio-construction target.
+
+    Implements the "given assets -> allocation %, expected return, risk, and
+    why" workflow as a deterministic advisory surface. It composes the current
+    live book, recent scored signal candidates, cached quant signals, and live
+    watch prices into a target allocation. Observational only: never places a
+    trade, never gates Opus, and never enforces a rebalance.
+    """
+    try:
+        from . import market as _mkt
+        from . import signals as _sig
+        from .analytics.portfolio_construction import (
+            build_portfolio_construction,
+        )
+        from .strategy import (
+            QUANT_TICKERS_LIVE,
+            WATCHLIST,
+            get_quant_signals_live,
+            portfolio_snapshot_readonly,
+        )
+        risk_tolerance = request.args.get("risk_tolerance", "medium")
+        time_horizon = request.args.get("time_horizon", "1-3 years")
+        try:
+            hours = max(1.0, min(48.0, float(request.args.get("hours", 6))))
+        except (TypeError, ValueError):
+            hours = 6.0
+
+        store = get_store()
+        snap = portfolio_snapshot_readonly(store)
+        try:
+            top_signals = _sig.get_top_signals(
+                n=30, hours=int(hours), min_score=4.0)
+        except Exception:
+            top_signals = []
+
+        watch = {t.upper() for t in WATCHLIST}
+        held = {
+            str(p.get("ticker") or "").upper()
+            for p in (snap.get("positions") or [])
+            if p.get("ticker")
+        }
+        signal_scores: dict[str, float] = {}
+        for row in top_signals:
+            score = float(row.get("ai_score") or 0.0)
+            for raw in row.get("tickers") or []:
+                tk = str(raw or "").upper()
+                if tk not in watch:
+                    continue
+                signal_scores[tk] = max(score, signal_scores.get(tk, 0.0))
+        signal_names = {
+            tk for tk, _score in sorted(
+                signal_scores.items(), key=lambda kv: (-kv[1], kv[0])
+            )[:8]
+        }
+        candidate_tickers = sorted(
+            held
+            | signal_names
+            | set(QUANT_TICKERS_LIVE)
+            | {"SPY", "QQQ"}
+        )
+        candidate_tickers = [t for t in candidate_tickers if t in watch or t in held]
+        construction_signals: list[dict] = []
+        for row in top_signals:
+            row_tickers = [
+                str(t or "").upper()
+                for t in row.get("tickers") or []
+                if str(t or "").upper() in signal_names
+            ]
+            if not row_tickers:
+                continue
+            slim = dict(row)
+            slim["tickers"] = row_tickers
+            construction_signals.append(slim)
+
+        try:
+            prices = _mkt.get_prices(candidate_tickers) if candidate_tickers else {}
+        except Exception:
+            prices = {}
+        try:
+            quant = (
+                get_quant_signals_live(candidate_tickers)
+                if candidate_tickers else {}
+            )
+        except Exception:
+            quant = {}
+
+        from .analytics.sector_exposure import classify as _classify
+        from .analytics.stress_scenarios import _LEVERAGE_BETA as _beta_map
+
+        result = build_portfolio_construction(
+            snap,
+            construction_signals,
+            quant,
+            prices,
+            _classify,
+            _beta_map,
+            risk_tolerance=risk_tolerance,
+            time_horizon=time_horizon,
+            fallback_tickers=["SPY", "QQQ", *list(WATCHLIST[:10])],
+        )
+        result["n_signals_input"] = len(top_signals)
+        result["n_candidate_tickers"] = len(candidate_tickers)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "allocations": []}), 500
 
 
 @app.route("/api/position-blowup")
@@ -17438,12 +17572,12 @@ def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
     article or the split-brain detector would be defeated by training data.
     Returns ``{exists, newest, live_2h, live_24h, live_scored_2h}``; never
     raises. ``live_scored_2h`` counts articles in the 2h window with
-    ``ai_score >= LIVE_MIN_SCORE`` (the same gate the live trader feeds Opus
-    via signals.get_top_signals) so build_feed_health can distinguish "feed
+    effective score >= LIVE_MIN_SCORE (LLM ``ai_score`` first, then local
+    ``ml_score``; the same gate the live trader feeds Opus via
+    signals.get_top_signals) so build_feed_health can distinguish "feed
     arriving but unscored" (ML pipeline down — restart the scorer) from "no
     articles" (collector down — restart digital-intern). Only computed when
-    ``want_counts`` is True (the resolved-DB probe), zero on other
-    candidates."""
+    ``want_counts`` is True (the resolved-DB probe), zero on other candidates."""
     out = {"exists": False, "newest": None, "live_2h": 0, "live_24h": 0,
            "live_scored_2h": 0}
     try:
@@ -17479,8 +17613,8 @@ def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
                     f"SELECT COUNT(*) FROM articles WHERE "
                     f"first_seen >= ? AND {live_clause}", (s24,)
                 ).fetchone()[0] or 0)
-                # Match strategy.decide()'s ai_score >= 4.0 gate so the
-                # endpoint can prove "X rows in window but 0 of them pass
+                # Match strategy.decide()'s effective-score >= 4.0 gate so
+                # the endpoint can prove "X rows in window but 0 of them pass
                 # the live trader's gate" — the digital-intern-scorer-down
                 # case. Imported lazily to avoid an import-cycle hazard
                 # (feed_health imports nothing from dashboard); a missing
@@ -17490,9 +17624,22 @@ def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
                 # confirmed the DB exists and the live trader hits this
                 # same threshold).
                 from .analytics.feed_health import LIVE_MIN_SCORE
+                try:
+                    cols = {
+                        row[1]
+                        for row in conn.execute(
+                            "PRAGMA table_info(articles)"
+                        ).fetchall()
+                    }
+                except sqlite3.Error:
+                    cols = set()
+                score_expr = (
+                    "COALESCE(NULLIF(ai_score, 0), ml_score, 0)"
+                    if "ml_score" in cols else "COALESCE(ai_score, 0)"
+                )
                 out["live_scored_2h"] = int(conn.execute(
                     f"SELECT COUNT(*) FROM articles WHERE "
-                    f"first_seen >= ? AND ai_score >= ? AND {live_clause}",
+                    f"first_seen >= ? AND {score_expr} >= ? AND {live_clause}",
                     (s2, LIVE_MIN_SCORE)
                 ).fetchone()[0] or 0)
         finally:
@@ -17715,6 +17862,31 @@ def mark_integrity_api():
         return jsonify(build_mark_integrity(snap.get("positions") or []))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/live-mark-reconciliation")
+def live_mark_reconciliation_api():
+    """Do displayed held-stock marks agree with an independent live quote read?
+
+    ``/api/mark-integrity`` catches missing quotes that were explicitly marked
+    at cost. This catches the adjacent stale-source bug: the trader has a
+    numeric price, but that price disagrees with a direct held-ticker quote
+    read, so P/L can look flat while live data has moved.
+    """
+    try:
+        from .analytics.live_mark_reconciliation import (
+            build_live_mark_reconciliation,
+            held_stock_tickers,
+            independent_stock_quotes,
+        )
+        from .strategy import portfolio_snapshot_readonly
+        store = get_store()
+        snap = portfolio_snapshot_readonly(store)
+        positions = snap.get("positions") or []
+        quotes = independent_stock_quotes(held_stock_tickers(positions))
+        return jsonify(build_live_mark_reconciliation(positions, quotes))
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
 
 
 @app.route("/api/decision-context")

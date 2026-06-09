@@ -31,23 +31,33 @@
     <key>ARTICLE_STORE_SKIP_LABEL_CLEANUP_MIGRATION</key>
     <string>1</string>
     <key>DIGITAL_INTERN_WORKERS</key>
-    <string>gdelt,rss,google_news,yahoo_ticker_rss,market_movers,yahoo_trending,benzinga_analyst,globenewswire,prnewswire,seekingalpha,financial_blogs,investment_research_blogs,ml_trainer,stats,purge</string>
+    <string>gdelt,rss,google_news,yahoo_ticker_rss,market_movers,yahoo_trending,benzinga_analyst,globenewswire,prnewswire,seekingalpha,financial_blogs,investment_research_blogs,scorer,ml_trainer,stats,purge</string>
+    <key>SCORER_INTERVAL</key>
+    <string>60</string>
+    <key>SCORER_ACTIVE_SLEEP</key>
+    <string>2</string>
+    <key>SCORER_BATCH_SIZE</key>
+    <string>100</string>
+    <key>SCORER_RECENT_HOURS</key>
+    <string>24</string>
+    <key>SCORER_ENABLE_LLM</key>
+    <string>1</string>
     <key>RSS_INTERVAL</key>
-    <string>300</string>
+    <string>120</string>
     <key>RSS_MAX_WORKERS</key>
     <string>4</string>
     <key>GDELT_INTERVAL</key>
-    <string>300</string>
+    <string>180</string>
     <key>GDELT_MAX_WORKERS</key>
     <string>1</string>
     <key>GDELT_QUERY_BATCH_PER_PASS</key>
     <string>48</string>
     <key>GOOGLE_NEWS_INTERVAL</key>
-    <string>300</string>
+    <string>120</string>
     <key>GOOGLE_NEWS_BATCH_PER_PASS</key>
-    <string>6</string>
+    <string>12</string>
     <key>GOOGLE_NEWS_MAX_WORKERS</key>
-    <string>2</string>
+    <string>4</string>
     <key>ML_TRAIN_BOOT_DELAY</key>
     <string>600</string>
     <key>ML_TRAIN_INTERVAL</key>
@@ -61,25 +71,25 @@
     <key>ML_TRAIN_KW_MIN</key>
     <string>2000</string>
     <key>YAHOO_TICKER_RSS_INTERVAL</key>
-    <string>600</string>
+    <string>180</string>
     <key>MARKET_MOVERS_INTERVAL</key>
-    <string>600</string>
+    <string>180</string>
     <key>YAHOO_TRENDING_INTERVAL</key>
-    <string>600</string>
+    <string>180</string>
     <key>BENZINGA_INTERVAL</key>
-    <string>300</string>
+    <string>120</string>
     <key>GLOBENEWSWIRE_INTERVAL</key>
-    <string>300</string>
+    <string>180</string>
     <key>PRNEWSWIRE_INTERVAL</key>
-    <string>300</string>
+    <string>180</string>
     <key>FINANCIAL_BLOGS_INTERVAL</key>
-    <string>600</string>
+    <string>300</string>
     <key>INVESTMENT_RESEARCH_BLOGS_INTERVAL</key>
     <string>900</string>
     <key>FINVIZ_INTERVAL</key>
     <string>600</string>
     <key>SEEKINGALPHA_INTERVAL</key>
-    <string>600</string>
+    <string>300</string>
   </dict>
 
   <key>ProcessType</key>

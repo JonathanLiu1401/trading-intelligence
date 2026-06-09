@@ -28,7 +28,7 @@ invariants #2 / #12).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .decision_drought import build_decision_drought
 from .decision_forensics import (
@@ -48,6 +48,7 @@ MIN_CURRENT = 12
 # decision_forensics' verdict bands so the two never disagree on the same data.
 CRITICAL_PCT = 50.0
 DEGRADED_PCT = 25.0
+RECENT_WINDOW_HOURS = 24.0
 
 
 def build_decision_reliability(decisions: list[dict],
@@ -71,6 +72,11 @@ def build_decision_reliability(decisions: list[dict],
         "current_failures": 0,
         "current_failure_rate_pct": 0.0,
         "current_mode_mix": [],
+        "recent_window_hours": RECENT_WINDOW_HOURS,
+        "recent_total": 0,
+        "recent_failures": 0,
+        "recent_failure_rate_pct": 0.0,
+        "recent_state": "NO_DATA",
         "headline_failure_rate_pct": 0.0,
         "involuntary_alpha_bleed_pct": 0.0,
         "decisions_per_day": None,
@@ -125,6 +131,24 @@ def build_decision_reliability(decisions: list[dict],
     current_rate = (round(current_failures / current_total * 100, 1)
                     if current_total else 0.0)
 
+    recent_cutoff = now - timedelta(hours=RECENT_WINDOW_HOURS)
+    recent = [
+        r for r in current
+        if r[0] is not None and r[0] >= recent_cutoff
+    ]
+    recent_total = len(recent)
+    recent_failures = sum(1 for (_, nd, _) in recent if nd)
+    recent_rate = (round(recent_failures / recent_total * 100, 1)
+                   if recent_total else 0.0)
+    if recent_total < MIN_CURRENT:
+        recent_state = "INSUFFICIENT"
+    elif recent_rate >= CRITICAL_PCT:
+        recent_state = "CRITICAL"
+    elif recent_rate >= DEGRADED_PCT:
+        recent_state = "DEGRADED"
+    else:
+        recent_state = "HEALTHY"
+
     mode_n: dict[str, int] = {}
     for (_, nd, mode) in current:
         if nd and mode:
@@ -173,7 +197,10 @@ def build_decision_reliability(decisions: list[dict],
             f"judgeable. Headline {headline_rate}% still includes "
             f"{legacy_failures} dead legacy row(s).")
     else:
-        if current_rate >= CRITICAL_PCT:
+        if (recent_state == "HEALTHY"
+                and current_rate >= DEGRADED_PCT):
+            state = "RECOVERING"
+        elif current_rate >= CRITICAL_PCT:
             state = "CRITICAL"
         elif current_rate >= DEGRADED_PCT:
             state = "DEGRADED"
@@ -187,9 +214,17 @@ def build_decision_reliability(decisions: list[dict],
         if legacy_failures:
             gap = (f" (the {headline_rate}% headline is inflated by "
                    f"{legacy_failures} dead legacy row(s))")
-        headline = (
-            f"{state} — current-regime parse-fail {current_rate}% over "
-            f"{current_total} cycle(s){gap}.{bleed_clause}")
+        if state == "RECOVERING":
+            headline = (
+                f"RECOVERING — current-regime parse-fail is still "
+                f"{current_rate}% over {current_total} cycle(s){gap}, but "
+                f"the last {RECENT_WINDOW_HOURS:g}h is healthy at "
+                f"{recent_rate}% over {recent_total} cycle(s)."
+                f"{bleed_clause}")
+        else:
+            headline = (
+                f"{state} — current-regime parse-fail {current_rate}% over "
+                f"{current_total} cycle(s){gap}.{bleed_clause}")
 
     out.update({
         "legacy_failures": legacy_failures,
@@ -198,6 +233,11 @@ def build_decision_reliability(decisions: list[dict],
         "current_failures": current_failures,
         "current_failure_rate_pct": current_rate,
         "current_mode_mix": current_mode_mix,
+        "recent_window_hours": RECENT_WINDOW_HOURS,
+        "recent_total": recent_total,
+        "recent_failures": recent_failures,
+        "recent_failure_rate_pct": recent_rate,
+        "recent_state": recent_state,
         "headline_failure_rate_pct": headline_rate,
         "involuntary_alpha_bleed_pct": bleed,
         "decisions_per_day": decisions_per_day,

@@ -11,6 +11,7 @@ API key (``WEB_API_KEY``) protects ``/api/*`` only; the HTML dashboard at
 """
 from __future__ import annotations
 
+import html
 import os
 import json
 import re
@@ -65,6 +66,12 @@ def _ttl_set(key: str, ttl_s: float, value):
     with _dashboard_cache_lock:
         _dashboard_cache[key] = (time.monotonic() + ttl_s, value)
     return value
+
+
+def _clean_snippet(text: str, limit: int = 360) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
 def _logger():
@@ -153,15 +160,22 @@ def _ro_query(sql: str, params: tuple = ()) -> list[tuple]:
 
 
 def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
+    score_expr = (
+        "CASE "
+        "WHEN ai_score IS NOT NULL AND ai_score > 0 THEN ai_score "
+        "WHEN ml_score IS NOT NULL THEN ml_score "
+        "ELSE COALESCE(kw_score, 0) END"
+    )
     try:
         rows = _ro_query(
-            "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
+            "SELECT id, url, title, source, published, kw_score, ai_score, "
+            "ml_score, urgency, first_seen, score_source, time_sensitivity, "
+            f"{score_expr} AS effective_score "
             "FROM articles "
             "WHERE first_seen >= datetime('now','-30 days') "
-            "AND (ai_score >= ? OR kw_score >= ?) "
-            f"AND {_LIVE_ONLY_SQL} "
+            f"AND {score_expr} >= ? AND {_LIVE_ONLY_SQL} "
             "ORDER BY first_seen DESC LIMIT ?",
-            (min_score, min_score, max(1, min(500, int(limit)))),
+            (min_score, max(1, min(500, int(limit)))),
         )
     except sqlite3.Error:
         return []
@@ -169,14 +183,175 @@ def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
     for r in rows:
         ai = float(r[6] or 0)
         kw = float(r[5] or 0)
+        ml = r[7]
+        effective = float(r[12] or 0)
+        if ai > 0:
+            effective_source = "llm"
+        elif ml is not None:
+            effective_source = "ml"
+        else:
+            effective_source = "keyword"
         out.append({
             "id": r[0], "url": r[1], "title": r[2], "source": r[3],
             "published": r[4], "kw_score": kw, "ai_score": ai,
-            "score": ai if ai > 0 else kw,
-            "urgency": int(r[7] or 0),
-            "first_seen": r[8],
+            "ml_score": float(ml) if ml is not None else None,
+            "score_source": r[10],
+            "effective_score": effective,
+            "effective_score_source": effective_source,
+            "score": effective,
+            "urgency": int(r[8] or 0),
+            "first_seen": r[9],
+            "time_sensitivity": r[11],
         })
     return out
+
+
+def _search_from_db(
+    query: str = "",
+    *,
+    ticker: str | None = None,
+    source: str | None = None,
+    hours: float = 72.0,
+    min_score: float = 0.0,
+    limit: int = 20,
+) -> dict:
+    raw_query = (query or "").strip()
+    raw_ticker = (ticker or "").strip().upper()
+    raw_source = (source or "").strip()
+    try:
+        hours_f = max(1.0, min(24.0 * 30.0, float(hours)))
+    except (TypeError, ValueError):
+        hours_f = 72.0
+    try:
+        limit_i = max(1, min(100, int(limit)))
+    except (TypeError, ValueError):
+        limit_i = 20
+    try:
+        min_score_f = float(min_score)
+    except (TypeError, ValueError):
+        min_score_f = 0.0
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours_f)).isoformat()
+    score_expr = (
+        "CASE "
+        "WHEN ai_score IS NOT NULL AND ai_score > 0 THEN ai_score "
+        "WHEN ml_score IS NOT NULL THEN ml_score "
+        "ELSE COALESCE(kw_score, 0) END"
+    )
+    clauses = [f"first_seen >= ? AND {_LIVE_ONLY_SQL}", f"{score_expr} >= ?"]
+    params: list = [since, min_score_f]
+
+    def _like(value: str) -> str:
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        return f"%{escaped}%"
+
+    terms = [
+        t for t in re.split(r"\s+", raw_query)
+        if t and len(t) <= 80 and t not in {"*", "AND", "OR"}
+    ][:8]
+    for term in terms:
+        clauses.append(
+            "(title LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' "
+            "OR url LIKE ? ESCAPE '\\')"
+        )
+        pat = _like(term)
+        params.extend([pat, pat, pat])
+    if raw_ticker:
+        ticker_pat = _like(raw_ticker)
+        cashtag_pat = _like(f"${raw_ticker}")
+        clauses.append(
+            "(title LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' "
+            "OR source LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\')"
+        )
+        params.extend([ticker_pat, cashtag_pat, ticker_pat, ticker_pat])
+    if raw_source:
+        clauses.append("source LIKE ? ESCAPE '\\'")
+        params.append(_like(raw_source))
+
+    try:
+        rows = _ro_query(
+            "SELECT id, url, title, source, published, kw_score, ai_score, "
+            "ml_score, urgency, first_seen, score_source, time_sensitivity, "
+            f"{score_expr} AS effective_score, full_text "
+            "FROM articles WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY effective_score DESC, urgency DESC, first_seen DESC "
+            "LIMIT ?",
+            tuple([*params, limit_i]),
+        )
+    except sqlite3.Error:
+        rows = []
+
+    now = datetime.now(timezone.utc)
+
+    def _age_hours(ts: str | None) -> float | None:
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return round((now - dt).total_seconds() / 3600.0, 3)
+
+    def _snippet(blob) -> str:
+        if not blob:
+            return ""
+        try:
+            text = zlib.decompress(blob).decode("utf-8", errors="replace")
+            return _clean_snippet(text)
+        except Exception:
+            return ""
+
+    articles = []
+    for r in rows:
+        ai = float(r[6] or 0.0)
+        ml = r[7]
+        effective = float(r[12] or 0.0)
+        if ai > 0:
+            effective_source = "llm"
+        elif ml is not None:
+            effective_source = "ml"
+        else:
+            effective_source = "keyword"
+        articles.append({
+            "id": r[0],
+            "url": r[1],
+            "title": r[2],
+            "source": r[3],
+            "published": r[4],
+            "kw_score": float(r[5] or 0.0),
+            "ai_score": ai,
+            "ml_score": float(ml) if ml is not None else None,
+            "score_source": r[10],
+            "effective_score": round(effective, 3),
+            "effective_score_source": effective_source,
+            "urgency": int(r[8] or 0),
+            "first_seen": r[9],
+            "age_hours": _age_hours(r[9]),
+            "time_sensitivity": r[11],
+            "snippet": _snippet(r[13]),
+        })
+    return {
+        "query": raw_query,
+        "ticker": raw_ticker or None,
+        "source": raw_source or None,
+        "window_hours": hours_f,
+        "min_score": min_score_f,
+        "limit": limit_i,
+        "count": len(articles),
+        "newest_first_seen": max(
+            (a["first_seen"] for a in articles if a.get("first_seen")),
+            default=None,
+        ),
+        "sources": sorted({str(a["source"]) for a in articles if a.get("source")})[:25],
+        "articles": articles,
+    }
 
 
 def _stats_from_db() -> dict:
@@ -5871,6 +6046,34 @@ def create_app(store=None) -> Flask:
             f"articles:{limit}:{min_score:.3f}",
             5.0,
             lambda: _articles_from_db(limit, min_score),
+        ))
+
+    @app.get("/api/search")
+    @app.get("/api/articles/search")
+    def api_search():
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        q = request.args.get("q", "")
+        ticker = request.args.get("ticker") or None
+        source = request.args.get("source") or None
+        hours = float(request.args.get("hours", 72.0))
+        min_score = float(request.args.get("min_score", 0.0))
+        limit = max(1, min(100, int(request.args.get("limit", 20))))
+        cache_key = (
+            f"search:{q}:{ticker}:{source}:{hours:.3f}:"
+            f"{min_score:.3f}:{limit}"
+        )
+        return jsonify(_ttl_cache(
+            cache_key,
+            5.0,
+            lambda: _search_from_db(
+                q,
+                ticker=ticker,
+                source=source,
+                hours=hours,
+                min_score=min_score,
+                limit=limit,
+            ),
         ))
 
     @app.get("/api/portfolio")

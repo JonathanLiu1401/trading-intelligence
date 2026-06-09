@@ -4,6 +4,7 @@ Stores article metadata + compressed full text. Auto-purges articles older than 
 """
 import functools
 import hashlib
+import html
 import logging
 import os
 import random
@@ -312,6 +313,13 @@ _STATS_BACKLOG_TTL_SECS = 300
 _STATS_BACKLOG_LOCK = threading.Lock()
 _STATS_BACKLOG_CACHE: dict = {"ts": 0.0, "unscored": 0,
                               "below_threshold": 0, "refreshing": False}
+
+
+def _clean_snippet(text: str, limit: int = 360) -> str:
+    """Compact RSS/HTML summaries into citeable plain text."""
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
 def _refresh_backlog_counts(score_min_kw: float) -> None:
@@ -1944,6 +1952,32 @@ class ArticleStore:
             for r in rows
         ]
 
+    @_retry_on_lock
+    def get_unscored_recent(
+        self,
+        limit: int = 500,
+        min_kw: float = 0.0,
+        hours: float = 6.0,
+    ) -> list:
+        """Get recent unscored live articles using the indexed first_seen path."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        cur = self.conn.execute(
+            "SELECT id, url, title, source, full_text, published, first_seen "
+            "FROM articles "
+            "WHERE first_seen >= ? "
+            f"AND ai_score=0 AND ml_score IS NULL AND kw_score>=? "
+            f"AND {_LIVE_ONLY_CLAUSE} "
+            "ORDER BY first_seen DESC, kw_score DESC LIMIT ?",
+            (cutoff, min_kw, limit),
+        )
+        rows = cur.fetchall()
+        return [
+            {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
+             "summary": decompress(r[4]) if r[4] else "",
+             "published": r[5] or "", "first_seen": r[6] or ""}
+            for r in rows
+        ]
+
     def prefloor_pseudo_articles(
         self, batch: list[dict]
     ) -> tuple[list[dict], int]:
@@ -2039,19 +2073,42 @@ class ArticleStore:
             self.update_ml_scores_batch(pre_floor)
         return real, len(pre_floor)
 
-    def score_pending(self, batch_size: int = 500) -> int:
-        """Run ML inference on all unscored articles. Returns count scored.
-        Non-blocking: if another caller already holds the inference lock, returns 0."""
+    def score_pending(
+        self,
+        batch_size: int = 500,
+        max_batches: int | None = None,
+        recent_hours: float | None = None,
+    ) -> int:
+        """Run ML inference on pending articles. Returns count scored.
+
+        By default this drains the backlog, preserving the historical one-shot
+        behavior. ``max_batches`` lets the Mac launchd daemon score bounded
+        slices so collector threads do not get pinned behind a full historical
+        drain. ``recent_hours`` makes the bounded Mac path score fresh rows via
+        the indexed ``first_seen`` query before old backlog. Non-blocking: if
+        another caller already holds the inference lock, returns 0.
+        """
         if not _INFER_LOCK.acquire(blocking=False):
             return 0
         total = 0
+        batches = 0
         try:
             # Lazy import to avoid circular imports at module load
             from ml.inference import score_articles
             while True:
-                batch = self.get_unscored(limit=batch_size, min_kw=0.0)
+                if max_batches is not None and batches >= max_batches:
+                    break
+                if recent_hours is not None:
+                    batch = self.get_unscored_recent(
+                        limit=batch_size,
+                        min_kw=0.0,
+                        hours=recent_hours,
+                    )
+                else:
+                    batch = self.get_unscored(limit=batch_size, min_kw=0.0)
                 if not batch:
                     break
+                batches += 1
 
                 # Pre-floor recap-template / quote-widget pseudo-articles
                 # BEFORE inference. They never warrant urgency=1 regardless
@@ -2403,6 +2460,165 @@ class ArticleStore:
             (since,),
         ))[0]
         return {"total": total, "urgent": urgent}
+
+    @_retry_on_lock
+    def search_articles(
+        self,
+        query: str = "",
+        *,
+        ticker: str | None = None,
+        source: str | None = None,
+        hours: float = 72.0,
+        min_score: float = 0.0,
+        limit: int = 20,
+        include_snippets: bool = True,
+    ) -> dict:
+        """Search the local ArticleNet corpus with source/freshness metadata.
+
+        This is intentionally lightweight rather than a heavyweight FTS rebuild:
+        the live DB is large, so the search path uses the indexed ``first_seen``
+        window first, then filters title/source/url tokens and ranks with the
+        same effective score the trader consumes: LLM ``ai_score`` first, then
+        local ``ml_score``, then keyword score. That gives OpenClaw a fast local
+        source to cite before reaching for the web.
+        """
+        raw_query = (query or "").strip()
+        raw_ticker = (ticker or "").strip().upper()
+        raw_source = (source or "").strip()
+        try:
+            hours_f = max(1.0, min(24.0 * 30.0, float(hours)))
+        except (TypeError, ValueError):
+            hours_f = 72.0
+        try:
+            limit_i = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            limit_i = 20
+        try:
+            min_score_f = float(min_score)
+        except (TypeError, ValueError):
+            min_score_f = 0.0
+
+        since_dt = datetime.now(timezone.utc) - timedelta(hours=hours_f)
+        since = since_dt.isoformat()
+        score_expr = (
+            "CASE "
+            "WHEN ai_score IS NOT NULL AND ai_score > 0 THEN ai_score "
+            "WHEN ml_score IS NOT NULL THEN ml_score "
+            "ELSE COALESCE(kw_score, 0) END"
+        )
+
+        clauses = [f"first_seen >= ? AND {_LIVE_ONLY_CLAUSE}", f"{score_expr} >= ?"]
+        params: list = [since, min_score_f]
+
+        def _like(value: str) -> str:
+            escaped = (
+                value.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            return f"%{escaped}%"
+
+        terms = [
+            t for t in re.split(r"\s+", raw_query)
+            if t and len(t) <= 80 and t not in {"*", "AND", "OR"}
+        ][:8]
+        for term in terms:
+            clauses.append(
+                "(title LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' "
+                "OR url LIKE ? ESCAPE '\\')"
+            )
+            pat = _like(term)
+            params.extend([pat, pat, pat])
+
+        if raw_ticker:
+            ticker_pat = _like(raw_ticker)
+            cashtag_pat = _like(f"${raw_ticker}")
+            clauses.append(
+                "(title LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' "
+                "OR source LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\')"
+            )
+            params.extend([ticker_pat, cashtag_pat, ticker_pat, ticker_pat])
+
+        if raw_source:
+            clauses.append("source LIKE ? ESCAPE '\\'")
+            params.append(_like(raw_source))
+
+        sql = (
+            "SELECT id, url, title, source, published, kw_score, ai_score, "
+            "ml_score, urgency, first_seen, score_source, time_sensitivity, "
+            f"{score_expr} AS effective_score, full_text "
+            "FROM articles WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY effective_score DESC, urgency DESC, first_seen DESC "
+            "LIMIT ?"
+        )
+        params.append(limit_i * 3 if include_snippets else limit_i)
+        rows = self.conn.execute(sql, params).fetchall()
+
+        now = datetime.now(timezone.utc)
+
+        def _age_hours(ts: str | None) -> float | None:
+            if not ts:
+                return None
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return round((now - dt).total_seconds() / 3600.0, 3)
+
+        out = []
+        for r in rows[:limit_i]:
+            ai = float(r[6] or 0.0)
+            ml = r[7]
+            kw = float(r[5] or 0.0)
+            effective = float(r[12] or 0.0)
+            if ai > 0:
+                effective_source = "llm"
+            elif ml is not None:
+                effective_source = "ml"
+            else:
+                effective_source = "keyword"
+            snippet = ""
+            if include_snippets and r[13]:
+                snippet = _clean_snippet(decompress(r[13]))
+            out.append({
+                "id": r[0],
+                "url": r[1],
+                "title": r[2],
+                "source": r[3],
+                "published": r[4],
+                "kw_score": kw,
+                "ai_score": ai,
+                "ml_score": float(ml) if ml is not None else None,
+                "score_source": r[10],
+                "effective_score": round(effective, 3),
+                "effective_score_source": effective_source,
+                "urgency": int(r[8] or 0),
+                "first_seen": r[9],
+                "age_hours": _age_hours(r[9]),
+                "time_sensitivity": r[11],
+                "snippet": snippet,
+            })
+
+        newest = max(
+            (a["first_seen"] for a in out if a.get("first_seen")),
+            default=None,
+        )
+        sources = sorted({str(a["source"]) for a in out if a.get("source")})
+        return {
+            "query": raw_query,
+            "ticker": raw_ticker or None,
+            "source": raw_source or None,
+            "window_hours": hours_f,
+            "min_score": min_score_f,
+            "limit": limit_i,
+            "count": len(out),
+            "newest_first_seen": newest,
+            "sources": sources[:25],
+            "articles": out,
+        }
 
     @_retry_on_lock
     def urgency_label_split(self, hours: int = 24) -> dict:

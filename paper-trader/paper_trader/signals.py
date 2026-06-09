@@ -483,16 +483,33 @@ def _connect_ro() -> sqlite3.Connection | None:
         return None
 
 
+def _effective_score_sql(conn: sqlite3.Connection) -> str:
+    """Unified live-news score: LLM ai_score first, then local ML score."""
+    try:
+        cols = {
+            (row["name"] if isinstance(row, sqlite3.Row) else row[1])
+            for row in conn.execute("PRAGMA table_info(articles)").fetchall()
+        }
+    except sqlite3.Error:
+        cols = set()
+    if "ml_score" in cols:
+        return "COALESCE(NULLIF(ai_score, 0), ml_score, 0)"
+    return "COALESCE(ai_score, 0)"
+
+
 def get_top_signals(n: int = 20, hours: int = 2, min_score: float = 4.0) -> list[dict]:
-    """Top scored articles from the last N hours with ai_score >= min_score."""
+    """Top scored articles from the last N hours with effective score >= min_score."""
     conn = _connect_ro()
     if not conn:
         return []
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
+        score_expr = _effective_score_sql(conn)
         rows = conn.execute(
-            "SELECT id, url, title, source, ai_score, urgency, first_seen, full_text "
-            "FROM articles WHERE first_seen >= ? AND ai_score >= ? "
+            "SELECT id, url, title, source, "
+            f"{score_expr} AS ai_score, urgency, first_seen, full_text "
+            "FROM articles "
+            f"WHERE first_seen >= ? AND {score_expr} >= ? "
             "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
             "AND source NOT LIKE 'opus_annotation%' "
             "ORDER BY ai_score DESC, first_seen DESC LIMIT ?",
@@ -534,9 +551,11 @@ def get_ticker_sentiment(ticker: str, hours: int = 4) -> dict:
         return {"ticker": ticker, "avg_score": 0.0, "max_score": 0.0, "n": 0, "urgent": 0}
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
+        score_expr = _effective_score_sql(conn)
         rows = conn.execute(
-            "SELECT title, full_text, ai_score, urgency FROM articles "
-            "WHERE first_seen >= ? AND ai_score > 0 "
+            "SELECT title, full_text, "
+            f"{score_expr} AS ai_score, urgency FROM articles "
+            f"WHERE first_seen >= ? AND {score_expr} > 0 "
             "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
             "AND source NOT LIKE 'opus_annotation%'",
             (since,),
@@ -583,8 +602,10 @@ def get_urgent_articles(minutes: int = 30) -> list[dict]:
         return []
     since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
     try:
+        score_expr = _effective_score_sql(conn)
         rows = conn.execute(
-            "SELECT id, title, source, ai_score, urgency, first_seen, full_text "
+            "SELECT id, title, source, "
+            f"{score_expr} AS ai_score, urgency, first_seen, full_text "
             "FROM articles WHERE urgency >= 1 AND first_seen >= ? "
             "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
             "AND source NOT LIKE 'opus_annotation%' "
@@ -661,9 +682,11 @@ def ticker_sentiments(tickers: list[str], hours: int = 4) -> list[dict]:
         return [{"ticker": t, "avg_score": 0.0, "max_score": 0.0, "n": 0, "urgent": 0} for t in tickers]
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
+        score_expr = _effective_score_sql(conn)
         rows = conn.execute(
-            "SELECT title, full_text, ai_score, urgency FROM articles "
-            "WHERE first_seen >= ? AND ai_score > 0 "
+            "SELECT title, full_text, "
+            f"{score_expr} AS ai_score, urgency FROM articles "
+            f"WHERE first_seen >= ? AND {score_expr} > 0 "
             "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
             "AND source NOT LIKE 'opus_annotation%'",
             (since,),

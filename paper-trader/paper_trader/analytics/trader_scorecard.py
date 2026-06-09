@@ -65,7 +65,7 @@ _OK = {
     "trade_asymmetry": {"EDGE_POSITIVE", "FLAT"},
     "churn": {"BUY_AND_HOLD", "ACTIVE_TURNOVER"},
     "capital_paralysis": {"FREE"},
-    "decision_reliability": {"HEALTHY"},
+    "decision_reliability": {"HEALTHY", "RECOVERING"},
     "open_attribution": {"SELECTION_ADDING", "FLAT_VS_SPY"},
 }
 

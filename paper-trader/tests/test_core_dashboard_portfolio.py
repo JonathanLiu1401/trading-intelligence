@@ -27,6 +27,8 @@ if str(_ROOT) not in sys.path:
 
 from paper_trader import dashboard
 from paper_trader import store as store_mod
+from paper_trader import strategy
+from paper_trader.analytics import live_mark_reconciliation
 from paper_trader.store import INITIAL_CASH, Store
 
 
@@ -174,6 +176,61 @@ class TestPortfolioApiEnrichedFields:
         self._seed_book(fresh_store, cash=760.0, positions=positions)
         body = _get_json(client, "/api/portfolio")
         assert body["stale_marks"] == 2  # NVDA + LITE, NOT TQQQ
+
+    def test_live_mark_overrides_cached_flat_snapshot(
+            self, fresh_store, client, monkeypatch):
+        cached = [
+            {"ticker": "NVDA", "type": "stock", "qty": 1,
+             "avg_cost": 100.0, "current_price": 100.0,
+             "market_value": 100.0, "unrealized_pl": 0.0,
+             "stale_mark": False},
+        ]
+        self._seed_book(fresh_store, cash=900.0, positions=cached)
+        live = [
+            {"ticker": "NVDA", "type": "stock", "qty": 1,
+             "avg_cost": 100.0, "current_price": 112.0,
+             "market_value": 112.0, "unrealized_pl": 12.0,
+             "stale_mark": False},
+        ]
+        monkeypatch.setattr(
+            strategy,
+            "portfolio_snapshot_readonly",
+            lambda _store: {"cash": 900.0, "total_value": 1012.0,
+                            "positions": live},
+        )
+
+        body = _get_json(client, "/api/portfolio")
+
+        assert body["live_marked"] is True
+        assert body["total_value"] == pytest.approx(1012.0)
+        assert body["open_value"] == pytest.approx(112.0)
+        assert body["unrealized_pl"] == pytest.approx(12.0)
+
+    def test_live_mark_reconciliation_endpoint_flags_stale_numeric_mark(
+            self, fresh_store, client, monkeypatch):
+        live = [
+            {"ticker": "SOXX", "type": "stock", "qty": 10,
+             "avg_cost": 570.84, "current_price": 570.84,
+             "market_value": 5708.40, "unrealized_pl": 0.0,
+             "stale_mark": False},
+        ]
+        monkeypatch.setattr(
+            strategy,
+            "portfolio_snapshot_readonly",
+            lambda _store: {"cash": 4291.60, "total_value": 10000.0,
+                            "positions": live},
+        )
+        monkeypatch.setattr(
+            live_mark_reconciliation,
+            "independent_stock_quotes",
+            lambda tickers: {"SOXX": 571.45},
+        )
+
+        body = _get_json(client, "/api/live-mark-reconciliation")
+
+        assert body["verdict"] == "DIVERGED"
+        assert body["book_delta_usd"] == pytest.approx(6.1)
+        assert body["worst"]["ticker"] == "SOXX"
 
     def test_pnl_vs_start_absolute_and_pct(self, fresh_store, client):
         """The book-wide drift vs the $1000 baseline (INITIAL_CASH) — the

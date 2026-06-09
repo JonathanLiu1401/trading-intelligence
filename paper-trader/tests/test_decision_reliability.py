@@ -186,6 +186,40 @@ def test_degraded_and_dead_cycles_sub_one_day_span():
     assert out["dead_cycles_per_day"] == round(6 / 24 * 48.0, 2)  # 12.0
 
 
+def test_recovering_when_long_regime_bad_but_recent_window_healthy():
+    decs = []
+    # Old current-regime damage: 50 failures 48h ago.
+    for k in range(50):
+        decs.append(_dec(
+            0,
+            no_decision=True,
+            reasoning=_NOJSON_REASON,
+            ts=(NOW - timedelta(hours=48, minutes=k)).isoformat(),
+        ))
+    # Recent recovery: enough samples in the last 24h, only 1 failure.
+    for k in range(24):
+        nd = k == 0
+        decs.append(_dec(
+            0,
+            no_decision=nd,
+            reasoning=_NOJSON_REASON if nd else None,
+            ts=(NOW - timedelta(hours=2, minutes=k)).isoformat(),
+        ))
+    decs.sort(key=lambda d: d["timestamp"], reverse=True)
+
+    out = build_decision_reliability(decs, [], now=NOW)
+
+    assert out["current_total"] == 74
+    assert out["current_failures"] == 51
+    assert out["current_failure_rate_pct"] == round(51 / 74 * 100, 1)
+    assert out["recent_total"] == 24
+    assert out["recent_failures"] == 1
+    assert out["recent_failure_rate_pct"] == round(1 / 24 * 100, 1)
+    assert out["recent_state"] == "HEALTHY"
+    assert out["state"] == "RECOVERING"
+    assert "last 24h is healthy" in out["headline"]
+
+
 def test_zero_span_does_not_divide_by_zero():
     # all identical timestamps → no derivable cadence, never an exception.
     same = NOW.isoformat()

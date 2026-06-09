@@ -391,6 +391,38 @@ def _store_price(ticker: str, price: float):
     _PRICE_CACHE[ticker] = (price, time.time())
 
 
+def _fast_info_get(fast, *keys: str) -> float | None:
+    for key in keys:
+        try:
+            value = fast.get(key)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def _fast_info_price(ticker: str) -> float | None:
+    t = yf.Ticker(ticker)
+    fast = t.fast_info
+    return _fast_info_get(
+        fast,
+        # yfinance's FastInfo accepts/serializes both naming styles across
+        # versions. Prefer the quote-style camelCase keys because the
+        # snake_case aliases can lag at the regular-session 1m close.
+        "lastPrice",
+        "last_price",
+        "regularMarketPrice",
+        "regular_market_price",
+    )
+
+
 def get_price(ticker: str) -> float | None:
     """Latest trade price for the symbol, or None."""
     cached = _cached_price(ticker)
@@ -399,11 +431,14 @@ def get_price(ticker: str) -> float | None:
     if _is_dead(ticker):
         return None
     try:
-        t = yf.Ticker(ticker)
-        fast = t.fast_info
-        price = fast.get("last_price") or fast.get("regular_market_price")
+        price = _fast_info_price(ticker)
         if price is None or price <= 0:
-            hist = t.history(period="1d", interval="1m")
+            t = yf.Ticker(ticker)
+            hist = t.history(
+                period="1d",
+                interval="1m",
+                prepost=market_phase() in {"PRE_MARKET", "AFTER_CLOSE", "OVERNIGHT"},
+            )
             if not hist.empty:
                 price = float(hist["Close"].iloc[-1])
         if price and price > 0:
@@ -430,6 +465,11 @@ def get_prices(tickers: list[str]) -> dict[str, float | None]:
             out[t] = None  # known-dead: skip the yfinance round-trip this cycle
         else:
             missing.append(t)
+    phase = market_phase()
+    if missing and len(missing) <= 8 and phase in {"PRE_MARKET", "AFTER_CLOSE", "OVERNIGHT"}:
+        for t in missing:
+            out[t] = get_price(t)
+        return out
     if missing:
         try:
             data = yf.download(missing, period="1d", interval="1m",

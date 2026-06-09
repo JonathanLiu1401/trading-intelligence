@@ -387,15 +387,25 @@ def _stats_payload() -> dict[str, Any]:
 
 
 def _articles_payload(limit: int = 50, min_score: float = 0.0) -> list[dict[str, Any]]:
+    score_expr = (
+        "CASE "
+        "WHEN ai_score IS NOT NULL AND ai_score > 0 THEN ai_score "
+        "WHEN ml_score IS NOT NULL THEN ml_score "
+        "ELSE COALESCE(kw_score, 0) END"
+    )
     try:
         rows = store().conn.execute(
-            "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
-            f"FROM articles WHERE MAX(ai_score, kw_score) >= ? AND {_LIVE_ONLY_CLAUSE} "
-            "ORDER BY ai_score DESC, kw_score DESC, first_seen DESC LIMIT ?",
+            "SELECT id, url, title, source, published, kw_score, ai_score, "
+            "ml_score, urgency, first_seen, score_source, time_sensitivity, "
+            f"{score_expr} AS effective_score "
+            "FROM articles "
+            "WHERE first_seen >= datetime('now','-30 days') "
+            f"AND {score_expr} >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "ORDER BY first_seen DESC LIMIT ?",
             (min_score, max(1, min(500, limit))),
         ).fetchall()
     except Exception:
-        # SQLite older syntax fallback (MAX of two columns)
+        # Older DBs may not have ml_score / score_source yet.
         rows = store().conn.execute(
             "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
             "FROM articles "
@@ -408,14 +418,58 @@ def _articles_payload(limit: int = 50, min_score: float = 0.0) -> list[dict[str,
     for r in rows:
         ai = float(r[6] or 0)
         kw = float(r[5] or 0)
+        if len(r) >= 13:
+            ml = r[7]
+            urgency = int(r[8] or 0)
+            first_seen = r[9]
+            score_source = r[10]
+            time_sensitivity = r[11]
+            effective = float(r[12] or 0)
+            if ai > 0:
+                effective_source = "llm"
+            elif ml is not None:
+                effective_source = "ml"
+            else:
+                effective_source = "keyword"
+        else:
+            ml = None
+            urgency = int(r[7] or 0)
+            first_seen = r[8]
+            score_source = None
+            time_sensitivity = None
+            effective = ai if ai > 0 else kw
+            effective_source = "llm" if ai > 0 else "keyword"
         out.append({
             "id": r[0], "url": r[1], "title": r[2], "source": r[3],
             "published": r[4], "kw_score": kw, "ai_score": ai,
-            "score": ai if ai > 0 else kw,
-            "urgency": int(r[7] or 0),
-            "first_seen": r[8],
+            "ml_score": float(ml) if ml is not None else None,
+            "score_source": score_source,
+            "effective_score": effective,
+            "effective_score_source": effective_source,
+            "score": effective,
+            "urgency": urgency,
+            "first_seen": first_seen,
+            "time_sensitivity": time_sensitivity,
         })
     return out
+
+
+def _search_payload(
+    q: str = "",
+    ticker: str | None = None,
+    source: str | None = None,
+    hours: float = 72.0,
+    min_score: float = 0.0,
+    limit: int = 20,
+) -> dict[str, Any]:
+    return store().search_articles(
+        q,
+        ticker=ticker,
+        source=source,
+        hours=hours,
+        min_score=min_score,
+        limit=limit,
+    )
 
 
 def _read_http_json(port: int, path: str, timeout: float = 4.0) -> dict[str, Any]:
@@ -1110,6 +1164,22 @@ async def api_stats():
 @app.get("/ops/api/articles")
 async def api_articles(limit: int = 50, min_score: float = 0.0):
     return JSONResponse(await asyncio.to_thread(_articles_payload, limit, min_score))
+
+
+@app.get("/api/search")
+@app.get("/api/articles/search")
+@app.get("/ops/api/search")
+async def api_search(
+    q: str = "",
+    ticker: str | None = None,
+    source: str | None = None,
+    hours: float = 72.0,
+    min_score: float = 0.0,
+    limit: int = 20,
+):
+    return JSONResponse(await asyncio.to_thread(
+        _search_payload, q, ticker, source, hours, min_score, limit,
+    ))
 
 
 @app.get("/api/metrics")

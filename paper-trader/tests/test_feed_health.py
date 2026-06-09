@@ -277,7 +277,7 @@ def test_constants_echoed():
 
 class TestUnscoredFeed:
     """When a fresh DB is carrying rows but none clear the live trader's
-    ai_score gate, the operator action is "restart the ML scorer", not
+    effective-score gate, the operator action is "restart the ML scorer", not
     "restart the collector". The classic BLIND headline conflated both
     failure modes; the new ``unscored_feed`` flag + headline clause splits
     them. Pure-builder callers that omit ``resolved_scored_2h`` must keep
@@ -291,7 +291,7 @@ class TestUnscoredFeed:
         return f
 
     def test_unscored_flag_when_articles_arriving_but_zero_scored(self):
-        # 5-decision BLIND streak + fresh DB with 183 rows but 0 scored ≥4.0
+        # 5-decision BLIND streak + fresh DB with 183 rows but 0 scored >=4.0
         # — the live 2026-05-24 pathology. Should set unscored_feed=True
         # and surface a "restart scorer not collector" clause in the BLIND
         # headline; the existing BLIND prefix stays byte-identical.
@@ -304,7 +304,7 @@ class TestUnscoredFeed:
         assert out["unscored_feed"] is True
         assert out["resolved_scored_2h"] == 0
         assert "articles ARRIVING (183 in the last 2h)" in out["headline"]
-        assert "ai_score>=4.0" in out["headline"]
+        assert "effective_score>=4.0" in out["headline"]
         assert "scoring pipeline appears down" in out["headline"]
         assert "restart the scorer" in out["headline"]
         # The pre-fix BLIND prefix is preserved (additive contract — the new

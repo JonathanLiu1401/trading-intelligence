@@ -3011,6 +3011,45 @@ def _mark_integrity_line(store) -> str:
         return ""
 
 
+def _live_mark_reconciliation_line(store) -> str:
+    """One-line guard for "numeric but stale" held-stock marks.
+
+    ``_mark_integrity_line`` only fires when the snapshot explicitly carries
+    ``stale_mark=True``. The after-hours flat-P/L bug had no stale flag: the
+    quote adapter returned a stale numeric price. This independent held-ticker
+    reconciliation is the Discord surface for that class.
+    """
+    try:
+        from .analytics.live_mark_reconciliation import (
+            build_live_mark_reconciliation,
+            held_stock_tickers,
+            independent_stock_quotes,
+        )
+        from .strategy import portfolio_snapshot_readonly
+
+        snap = portfolio_snapshot_readonly(store)
+        positions = snap.get("positions") or []
+        tickers = held_stock_tickers(positions)
+        if not tickers:
+            return ""
+        out = build_live_mark_reconciliation(
+            positions,
+            independent_stock_quotes(tickers),
+        )
+        if not isinstance(out, dict):
+            return ""
+        verdict = out.get("verdict")
+        if verdict not in ("DIVERGED", "NO_QUOTES"):
+            return ""
+        headline = out.get("headline") or ""
+        if not headline:
+            return ""
+        return f"⚠️ **LIVE MARKS** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] live-mark reconciliation line skipped: {e}")
+        return ""
+
+
 def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
     """Read newest live ``first_seen`` (and optionally 2h/24h live counts) from
     one candidate ``articles.db``. Mirrors ``dashboard._feed_db_probe`` but is
@@ -5360,6 +5399,9 @@ def send_hourly_summary() -> bool:
     mi = _mark_integrity_line(store)
     if mi:
         body += "\n" + mi
+    lm = _live_mark_reconciliation_line(store)
+    if lm:
+        body += "\n" + lm
     # ENGINE LATCH sits right after MARK INTEGRITY — same urgency tier:
     # both answer "is downstream P/L meaningful right now?". If the
     # consecutive-NO_DECISION breaker or the Claude quota latch is held,
@@ -5756,6 +5798,9 @@ def send_daily_close() -> bool:
     mi = _mark_integrity_line(store)
     if mi:
         body += "\n" + mi
+    lm = _live_mark_reconciliation_line(store)
+    if lm:
+        body += "\n" + lm
     # FEED HEALTH follows MARK INTEGRITY on daily close too — see
     # ``send_hourly_summary`` for the rationale (same urgency tier, input
     # compromise; silent on HEALTHY / NO_DATA per the silence contract).

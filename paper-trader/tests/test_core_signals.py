@@ -33,6 +33,7 @@ def _build_articles_db(path: Path, rows: list[dict]) -> None:
             title TEXT,
             source TEXT,
             ai_score REAL,
+            ml_score REAL,
             urgency REAL,
             first_seen TEXT,
             full_text BLOB
@@ -41,14 +42,15 @@ def _build_articles_db(path: Path, rows: list[dict]) -> None:
     )
     for r in rows:
         conn.execute(
-            "INSERT INTO articles (id, url, title, source, ai_score, urgency, first_seen, full_text) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO articles (id, url, title, source, ai_score, ml_score, urgency, first_seen, full_text) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 r.get("id"),
                 r.get("url"),
                 r.get("title"),
                 r.get("source"),
                 r.get("ai_score"),
+                r.get("ml_score"),
                 r.get("urgency"),
                 r.get("first_seen"),
                 zlib.compress(r.get("body", "").encode("utf-8")) if r.get("body") else None,
@@ -609,6 +611,29 @@ class TestGetTopSignals:
         scores = [r["ai_score"] for r in rows]
         assert scores == sorted(scores, reverse=True)
 
+    def test_ml_score_used_when_ai_score_is_zero(self, fake_articles_db):
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "ml pass NVDA", "source": "x",
+             "ai_score": 0.0, "ml_score": 7.5, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+            {"id": 2, "url": "http://b", "title": "ml below AMD", "source": "x",
+             "ai_score": 0.0, "ml_score": 3.5, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        rows = signals.get_top_signals(n=10, hours=24, min_score=4.0)
+        assert [r["title"] for r in rows] == ["ml pass NVDA"]
+        assert rows[0]["ai_score"] == pytest.approx(7.5)
+
+    def test_ai_score_takes_precedence_over_ml_score(self, fake_articles_db):
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "llm label wins", "source": "x",
+             "ai_score": 5.0, "ml_score": 9.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        rows = signals.get_top_signals(n=10, hours=24, min_score=4.0)
+        assert len(rows) == 1
+        assert rows[0]["ai_score"] == pytest.approx(5.0)
+
     def test_backtest_url_filtered(self, fake_articles_db):
         # Backtest synthetic rows must never reach the live trader.
         _build_articles_db(fake_articles_db, [
@@ -684,6 +709,21 @@ class TestTickerSentiments:
         assert nvda["n"] == 2
         # avg = (4 + 8) / 2 = 6.0
         assert nvda["avg_score"] == pytest.approx(6.0)
+        assert nvda["max_score"] == 8.0
+
+    def test_ml_score_contributes_when_ai_score_zero(self, fake_articles_db):
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "NVDA model-scored",
+             "source": "x", "ai_score": 0.0, "ml_score": 6.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+            {"id": 2, "url": "http://b", "title": "NVDA llm-scored",
+             "source": "x", "ai_score": 8.0, "ml_score": 2.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        out = signals.ticker_sentiments(["NVDA"], hours=24)
+        nvda = out[0]
+        assert nvda["n"] == 2
+        assert nvda["avg_score"] == pytest.approx(7.0)
         assert nvda["max_score"] == 8.0
 
     def test_urgent_counter_increments(self, fake_articles_db):
@@ -1157,6 +1197,20 @@ class TestGetTickerSentiment:
         out = signals.get_ticker_sentiment("AMD", hours=24)
         assert out["n"] == 1
         assert out["max_score"] == 6.0
+
+    def test_ml_score_contributes_when_ai_score_zero(self, fake_articles_db):
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "AMD model-scored",
+             "source": "x", "ai_score": 0.0, "ml_score": 7.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+            {"id": 2, "url": "http://b", "title": "AMD llm-scored",
+             "source": "x", "ai_score": 5.0, "ml_score": 9.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        out = signals.get_ticker_sentiment("AMD", hours=24)
+        assert out["n"] == 2
+        assert out["avg_score"] == pytest.approx(6.0)
+        assert out["max_score"] == 7.0
 
     def test_backtest_rows_excluded(self, fake_articles_db):
         _build_articles_db(fake_articles_db, [

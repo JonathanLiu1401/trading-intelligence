@@ -1,10 +1,11 @@
 """Memory-safe ArticleNet aggregation daemon for the Mac launchd service.
 
-This process intentionally runs only article collectors plus the optional
-ArticleNet trainer. It does not import or start scorer, alerting, dashboard,
-paper-trading, or backtest workers. The full Linux daemon remains in daemon.py;
-this file is the constrained Mac runtime used to keep ArticleNet collecting
-and retraining without exhausting memory.
+This process intentionally runs only article collectors plus bounded utility
+workers: stats, purge, ArticleNet trainer, and the lightweight ML scorer. It
+does not start alerting, dashboard, paper-trading, or backtest workers. The
+full Linux daemon remains in daemon.py; this file is the constrained Mac
+runtime used to keep ArticleNet collecting and scoring without exhausting
+memory.
 """
 from __future__ import annotations
 
@@ -68,7 +69,10 @@ def _requested_workers() -> set[str]:
 def _sleep(seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, seconds)
     while _running and time.monotonic() < deadline:
-        time.sleep(min(1.0, deadline - time.monotonic()))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
 
 
 def _memory_free_percent() -> int | None:
@@ -228,6 +232,103 @@ def _purge_worker(store: ArticleStore) -> None:
         _sleep(300)
 
 
+def _scorer_worker(store: ArticleStore) -> None:
+    interval = _env_seconds("SCORER_INTERVAL", 300)
+    active_sleep = _env_seconds("SCORER_ACTIVE_SLEEP", 5)
+    recent_hours = _env_seconds("SCORER_RECENT_HOURS", 6)
+    enable_llm = os.environ.get("SCORER_ENABLE_LLM", "1") != "0"
+    try:
+        batch_size = max(1, int(os.environ.get("SCORER_BATCH_SIZE", "20") or "20"))
+    except (TypeError, ValueError):
+        batch_size = 20
+    log.info(
+        "[scorer] started interval=%ss active_sleep=%ss batch_size=%s "
+        "recent_hours=%s enable_llm=%s",
+        interval,
+        active_sleep,
+        batch_size,
+        recent_hours,
+        enable_llm,
+    )
+    from ml.inference import score_articles as _score_articles
+    from watchers.urgency_scorer import (
+        BATCH_SIZE as _llm_batch_size,
+        score_batch as _score_batch,
+    )
+
+    while _running:
+        try:
+            with _store_lock:
+                unscored = store.get_unscored_recent(
+                    limit=batch_size,
+                    min_kw=0.0,
+                    hours=recent_hours,
+                )
+            if not unscored:
+                _worker_last_ok["scorer"] = time.time()
+                _sleep(interval)
+                continue
+            with _store_lock:
+                unscored, n_pre_floored = store.prefloor_pseudo_articles(unscored)
+            if not unscored:
+                _worker_last_ok["scorer"] = time.time()
+                log.info("[scorer] pre_floored=%d", n_pre_floored)
+                _sleep(active_sleep)
+                continue
+
+            scores = _score_articles(unscored)
+            ml_updates = []
+            llm_candidates = []
+            ts_updates = []
+            for art, sc in zip(unscored, scores):
+                aid = art.get("_id")
+                if not aid:
+                    continue
+                if sc.rel_std < 99:
+                    ts_updates.append((aid, sc.time_sensitivity))
+                ml_score = max(sc.relevance, sc.urgency)
+                if sc.needs_llm or (3.8 <= ml_score <= 4.3):
+                    llm_candidates.append(art)
+                    continue
+                is_urgent = 1 if sc.urgency >= 8.0 else 0
+                final = max(sc.relevance, sc.urgency, 0.01)
+                ml_updates.append((aid, final, is_urgent))
+
+            if ml_updates:
+                store.update_ml_scores_batch(ml_updates)
+            if ts_updates:
+                store.update_time_sensitivity_batch(ts_updates)
+
+            llm_urgent = 0
+            if enable_llm and llm_candidates:
+                for j in range(0, len(llm_candidates), _llm_batch_size):
+                    llm_urgent += _score_batch(
+                        llm_candidates[j:j + _llm_batch_size],
+                        store,
+                    )
+
+            _worker_last_ok["scorer"] = time.time()
+            log.info(
+                "[scorer] batch=%d ml_scored=%d llm_sent=%d llm_urgent=%d "
+                "pre_floored=%d",
+                len(unscored),
+                len(ml_updates),
+                len(llm_candidates) if enable_llm else 0,
+                llm_urgent,
+                n_pre_floored,
+            )
+            if ml_updates:
+                _sleep(active_sleep)
+            else:
+                _sleep(interval)
+        except MemoryError:
+            log.warning("[scorer] MemoryError; backing off")
+            _sleep(interval)
+        except Exception as e:
+            log.warning("[scorer_worker] error: %s", e)
+            _sleep(interval)
+
+
 def _ml_trainer_worker(store: ArticleStore) -> None:
     interval = _env_seconds("ML_TRAIN_INTERVAL", 3600)
     boot_delay = _env_seconds("ML_TRAIN_BOOT_DELAY", 600)
@@ -314,7 +415,7 @@ def main() -> None:
         ),
     ]
 
-    known_workers = {name for name, *_ in workers} | {"stats", "purge", "ml_trainer"}
+    known_workers = {name for name, *_ in workers} | {"stats", "purge", "scorer", "ml_trainer"}
     unknown_workers = sorted(requested - known_workers)
     if unknown_workers:
         log.warning("[article_aggregation] unknown DIGITAL_INTERN_WORKERS ignored: %s", unknown_workers)
@@ -333,7 +434,12 @@ def main() -> None:
         t.start()
         threads.append(t)
 
-    utility_workers = [("stats", _stats_worker), ("purge", _purge_worker), ("ml_trainer", _ml_trainer_worker)]
+    utility_workers = [
+        ("stats", _stats_worker),
+        ("purge", _purge_worker),
+        ("scorer", _scorer_worker),
+        ("ml_trainer", _ml_trainer_worker),
+    ]
     if requested:
         utility_workers = [(name, fn) for name, fn in utility_workers if name in requested]
     for name, fn in utility_workers:

@@ -97,6 +97,28 @@ class TestLastClaudeFail:
         strategy._quota_exhausted = False
         strategy._active_claude_proc = None
 
+    def test_cli_path_checks_mac_fallbacks_when_launchd_path_is_minimal(self, monkeypatch, tmp_path):
+        mac_bin = tmp_path / "usr-local-bin"
+        mac_bin.mkdir()
+        cli = mac_bin / "codex"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: None)
+        monkeypatch.setattr(strategy, "_CLI_PATH_PREFIXES", (str(mac_bin),))
+
+        assert strategy._cli_path("codex") == str(cli)
+
+    def test_llm_env_prefixes_cli_dirs_for_node_wrappers(self, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setattr(strategy, "_CLI_PATH_PREFIXES",
+                            ("/usr/local/bin", "/Users/jonathan/.local/bin"))
+
+        env = strategy._llm_subprocess_env(use_codex=False)
+
+        parts = env["PATH"].split(":")
+        assert parts[:2] == ["/usr/local/bin", "/Users/jonathan/.local/bin"]
+        assert "/usr/bin" in parts
+        assert "/bin" in parts
+
     def test_cli_missing_sets_cli_missing(self, monkeypatch):
         self._reset()
         monkeypatch.setattr(strategy, "_cli_path", lambda _: None)
@@ -912,6 +934,76 @@ class TestExecuteBuy:
         status, detail = strategy._execute(decision, snap, fresh_store)
         assert status == "BLOCKED"
         assert "qty" in detail.lower()
+
+    def test_buy_blocked_when_it_would_overconcentrate_live_book(
+        self, fresh_store, monkeypatch
+    ):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {
+            "cash": 10000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 15000.0,
+            "positions": [],
+        }
+        decision = {"action": "BUY", "ticker": "AMD", "qty": 50, "reasoning": ""}
+
+        status, detail = strategy._execute(decision, snap, fresh_store)
+
+        assert status == "BLOCKED"
+        assert "diversification block" in detail
+        assert fresh_store.open_positions() == []
+
+    def test_buy_allows_bounded_entry_on_live_book(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {
+            "cash": 10000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 15000.0,
+            "positions": [],
+        }
+        decision = {"action": "BUY", "ticker": "AMD", "qty": 30, "reasoning": ""}
+
+        status, detail = strategy._execute(decision, snap, fresh_store)
+
+        assert status == "FILLED"
+        assert "BUY 30" in detail
+
+    def test_buy_blocked_when_same_sector_would_exceed_cap(
+        self, fresh_store, monkeypatch
+    ):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {
+            "cash": 7000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 12000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 15,
+                "avg_cost": 200.0, "current_price": 200.0,
+                "market_value": 3000.0,
+            }],
+        }
+        decision = {"action": "BUY", "ticker": "AMD", "qty": 20, "reasoning": ""}
+
+        status, detail = strategy._execute(decision, snap, fresh_store)
+
+        assert status == "BLOCKED"
+        assert "sector concentration block" in detail
+
+    def test_rebuy_after_recent_exit_is_blocked(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        fresh_store.record_trade("DRAM", "SELL", 10, 100.0, "recent exit")
+        snap = {
+            "cash": 10000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 15000.0,
+            "positions": [],
+        }
+        decision = {"action": "BUY", "ticker": "DRAM", "qty": 10, "reasoning": ""}
+
+        status, detail = strategy._execute(decision, snap, fresh_store)
+
+        assert status == "BLOCKED"
+        assert "churn cooldown" in detail
 
 
 class TestExecutePortfolioJsonConsistency:

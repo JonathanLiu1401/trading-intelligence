@@ -210,6 +210,7 @@ _CLASSIFY_CASES = [
     ("decision_reliability", {"state": "DEGRADED"}, "FLAG"),
     ("decision_reliability", {"state": "STALE_LEGACY_DOMINATED"}, "FLAG"),
     ("decision_reliability", {"state": "HEALTHY"}, "OK"),
+    ("decision_reliability", {"state": "RECOVERING"}, "OK"),
     ("decision_reliability", {"state": "INSUFFICIENT"}, "IMMATURE"),
     ("decision_reliability", {"state": "NO_DATA"}, "IMMATURE"),
     ("open_attribution", {"status": "SELECTION_DRAG"}, "FLAG"),
