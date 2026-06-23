@@ -18,6 +18,17 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
+try:
+    from triage.adaptive_relevance import apply_adaptive_return_boost
+except Exception:  # pragma: no cover - scoring must survive overlay failure
+    def apply_adaptive_return_boost(base_score, title, summary, source=""):
+        return {
+            "score": base_score,
+            "multiplier": 1.0,
+            "features": [],
+            "reason": "adaptive_overlay_unavailable",
+        }
+
 
 # Short / ambiguous keyword tokens that need \b boundary matching to avoid
 # false positives (e.g. "intel" → "intelligence", "dram" → "dramatic",
@@ -365,7 +376,23 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
             kw += 0.5
 
     if kw == 0.0:
-        return {"score": 0.0, "reason": "no_keywords", "events": []}
+        adaptive = apply_adaptive_return_boost(0.5, title, summary, source)
+        if adaptive.get("features") and float(adaptive.get("score") or 0.0) >= 1.0:
+            return {
+                "score": adaptive["score"],
+                "kw": 0.0,
+                "src_weight": _source_weight(source),
+                "event_bonus": 1.0,
+                "recency": round(_recency_factor(published), 2),
+                "port_boost": 0.0,
+                "port_mult": 1.0,
+                "blacklist_penalty": 1.0,
+                "events": [],
+                "n_events": 0,
+                "adaptive": adaptive,
+                "reason": "adaptive_only",
+            }
+        return {"score": 0.0, "reason": "no_keywords", "events": [], "adaptive": adaptive}
 
     # Blacklist handling. Previously a blacklist hit hard-zeroed the article
     # before keywords were even counted, which silently discarded genuine
@@ -415,11 +442,16 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
     # Composite
     raw = (kw * src_w * event_bonus * rec * port_mult * blacklist_penalty) + port_boost
 
-    # Normalise to 0-10
-    score = min(10.0, round(raw / 4.0 * 10.0, 2))  # 4.0 = rough "max normal" kw
+    # Normalise to 0-10, then apply learned return-impact overlay. The
+    # baseline parser finds candidate relevance; the adaptive overlay decides
+    # whether historically similar articles actually moved stocks.
+    baseline_score = min(10.0, round(raw / 4.0 * 10.0, 2))  # 4.0 = rough "max normal" kw
+    adaptive = apply_adaptive_return_boost(baseline_score, title, summary, source)
+    score = adaptive["score"]
 
     return {
         "score": score,
+        "baseline_score": baseline_score,
         "kw": round(kw, 1),
         "src_weight": src_w,
         "event_bonus": event_bonus,
@@ -429,6 +461,7 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
         "blacklist_penalty": blacklist_penalty,
         "events": events_found,
         "n_events": n_distinct_events,
+        "adaptive": adaptive,
         "reason": "scored_penalized" if blacklist_penalty < 1.0 else "scored",
     }
 

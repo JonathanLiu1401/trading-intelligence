@@ -28,6 +28,16 @@ BATCH_PER_PASS = int(os.environ.get("GOOGLE_NEWS_BATCH_PER_PASS", "64"))
 # Skip a ticker if we polled it within this many seconds (prevents thrash on restart).
 PER_TICKER_COOLDOWN_SEC = 10
 USER_AGENT = "Mozilla/5.0 (Digital Intern Daemon)"
+BROAD_GOOGLE_NEWS_QUERIES = [
+    "AI capex balance sheet debt financing",
+    "data center lease obligations hyperscaler",
+    "AI infrastructure private credit SPV",
+    "Big Tech AI spending guidance cut",
+    "Nasdaq selloff AI bubble recession risk",
+    "semiconductor stocks guidance demand slowdown",
+    "credit spreads technology debt data centers",
+    "consumer weakness recession risk stock market",
+]
 
 
 def _load_tickers() -> list[str]:
@@ -68,6 +78,12 @@ def _load_tickers() -> list[str]:
                 _add(t)
     except Exception:
         pass
+
+    for q in BROAD_GOOGLE_NEWS_QUERIES:
+        key = f"QUERY:{q}"
+        if key not in seen:
+            seen.add(key)
+            tickers.append(key)
 
     return tickers
 
@@ -129,7 +145,10 @@ def _mark_seen(conn, aid: str, link: str, title: str, source: str):
 
 
 def _build_url(ticker: str) -> str:
-    q = quote_plus(f"{ticker} stock")
+    if ticker.startswith("QUERY:"):
+        q = quote_plus(ticker.removeprefix("QUERY:"))
+    else:
+        q = quote_plus(f"{ticker} stock")
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 

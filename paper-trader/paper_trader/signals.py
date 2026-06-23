@@ -544,6 +544,158 @@ def get_top_signals(n: int = 20, hours: int = 2, min_score: float = 4.0) -> list
     return out
 
 
+def get_active_research_brief(
+    tickers: list[str],
+    *,
+    themes: list[str] | None = None,
+    hours: int = 72,
+    min_score: float = 0.0,
+    scan_limit: int = 1600,
+    max_articles: int = 24,
+) -> dict:
+    """Build a bounded ArticleNet dossier for the live trader's LLM prompt.
+
+    This is deliberately active, not just "top feed rows": each decision cycle
+    names the current tickers/themes it needs investigated, then this function
+    searches the fresh ArticleNet corpus for corroborating or contradictory
+    evidence. It never runs local ML and never blocks trading on a feed hiccup.
+    """
+    conn = _connect_ro()
+    clean_tickers = list(dict.fromkeys(
+        t.strip().upper()
+        for t in (tickers or [])
+        if isinstance(t, str) and t.strip()
+    ))[:40]
+    clean_themes = [
+        th.strip()
+        for th in (themes or [])
+        if isinstance(th, str) and th.strip()
+    ][:8]
+    if not conn:
+        return {
+            "available": False,
+            "reason": "ArticleNet DB unavailable",
+            "tickers": clean_tickers,
+            "themes": clean_themes,
+            "articles": [],
+            "source_counts": {},
+            "newest_first_seen": None,
+            "window_hours": hours,
+        }
+
+    try:
+        hours_i = max(1, min(24 * 14, int(hours)))
+    except (TypeError, ValueError):
+        hours_i = 72
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours_i)).isoformat()
+    try:
+        score_expr = _effective_score_sql(conn)
+        rows = conn.execute(
+            "SELECT id, url, title, source, "
+            f"{score_expr} AS ai_score, urgency, first_seen, full_text "
+            "FROM articles "
+            f"WHERE first_seen >= ? AND {score_expr} >= ? "
+            "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%' "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (since, float(min_score), max(100, min(5000, int(scan_limit)))),
+        ).fetchall()
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        print(f"[signals] active research query failed (degrading): {e}")
+        return {
+            "available": False,
+            "reason": "ArticleNet active research query failed",
+            "tickers": clean_tickers,
+            "themes": clean_themes,
+            "articles": [],
+            "source_counts": {},
+            "newest_first_seen": None,
+            "window_hours": hours_i,
+        }
+    finally:
+        conn.close()
+
+    theme_terms = []
+    for theme in clean_themes:
+        terms = [
+            t.lower()
+            for t in re.split(r"[^A-Za-z0-9$.-]+", theme)
+            if len(t) >= 3
+        ][:8]
+        if terms:
+            theme_terms.append((theme, terms))
+
+    articles: list[dict] = []
+    source_counts: dict[str, int] = defaultdict(int)
+    newest = None
+    seen: set[str] = set()
+    for r in rows:
+        title = r["title"] or ""
+        full = _decompress(r["full_text"])
+        hay_raw = f"{title} {full}"
+        hay_up = hay_raw.upper()
+        hay_low = hay_raw.lower()
+        matched: list[str] = []
+
+        for ticker in clean_tickers:
+            if (
+                re.search(rf"(?:\$|\b){re.escape(ticker)}\b", hay_up)
+                or _alias_match(hay_raw, ticker)
+            ):
+                matched.append(ticker)
+
+        for theme, terms in theme_terms:
+            hits = sum(1 for term in terms if term in hay_low)
+            if hits >= max(1, min(3, len(terms))):
+                matched.append(theme)
+
+        if not matched:
+            continue
+        row_id = str(r["id"])
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        source = str(r["source"] or "unknown")
+        source_counts[source] += 1
+        first_seen = r["first_seen"]
+        if first_seen and (newest is None or first_seen > newest):
+            newest = first_seen
+        articles.append({
+            "id": r["id"],
+            "url": r["url"],
+            "title": title,
+            "source": source,
+            "ai_score": float(r["ai_score"] or 0.0),
+            "urgency": int(r["urgency"] or 0),
+            "first_seen": first_seen,
+            "summary": full[:280],
+            "matches": sorted(set(matched))[:8],
+            "tickers": sorted(_extract_tickers(hay_raw)),
+        })
+
+    articles.sort(
+        key=lambda a: (
+            float(a.get("ai_score") or 0.0),
+            int(a.get("urgency") or 0),
+            str(a.get("first_seen") or ""),
+        ),
+        reverse=True,
+    )
+    return {
+        "available": True,
+        "tickers": clean_tickers,
+        "themes": clean_themes,
+        "articles": articles[:max_articles],
+        "source_counts": dict(sorted(
+            source_counts.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )),
+        "newest_first_seen": newest,
+        "window_hours": hours_i,
+        "scanned": len(rows),
+    }
+
+
 def get_ticker_sentiment(ticker: str, hours: int = 4) -> dict:
     """Average score + counts of articles mentioning the ticker."""
     conn = _connect_ro()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -48,6 +49,40 @@ log = get_logger("article_aggregation_daemon")
 _running = True
 _store_lock = threading.Lock()
 _worker_last_ok: dict[str, float] = {}
+
+_MACRO_EVENT_RE = re.compile(
+    r"\b(?:ceasefire|truce|halt(?:s|ed|ing)?\s+war|end(?:s|ed|ing)?\s+"
+    r"(?:the\s+)?war|peace\s+deal|reopen(?:s|ed|ing)?\s+hormuz)\b",
+    re.I,
+)
+_MACRO_GEO_RE = re.compile(r"\b(?:iran|israel|hormuz|strait|war)\b", re.I)
+_MACRO_MARKET_RE = re.compile(
+    r"\b(?:oil|brent|wti|stocks?|futures?|nasdaq|s&p|market|prices?|"
+    r"soar(?:s|ed|ing)?|tumble(?:s|d|ing)?|rall(?:y|ies|ied))\b",
+    re.I,
+)
+
+
+def _is_breaking_macro_market_event(art: dict, score: float) -> bool:
+    """High-score geopolitical macro shocks/de-escalations that need alerts.
+
+    The ML urgency head can classify these as merely "relevant" because they
+    do not name a held ticker. For the trading stack, an Iran/Israel/Hormuz
+    war/ceasefire headline moving oil/futures is still urgent.
+    """
+    try:
+        if float(score) < 7.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    text = f"{art.get('title') or ''} {art.get('summary') or ''}"
+    if not text.strip():
+        return False
+    return (
+        bool(_MACRO_EVENT_RE.search(text))
+        and bool(_MACRO_GEO_RE.search(text))
+        and bool(_MACRO_MARKET_RE.search(text))
+    )
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -148,9 +183,10 @@ def _ingest(store: ArticleStore, articles: list[dict], source_tag: str) -> int:
         )
         art["_relevance_score"] = result["score"]
         art["_score_detail"] = result
-    relevant = [a for a in articles if a.get("_relevance_score", 0) >= 0.5]
+    # Recall-first ingest: ArticleNet should store the broad raw corpus and
+    # let scoring/search/alerts filter after aggregation.
     with _store_lock:
-        inserted = store.insert_batch(relevant)
+        inserted = store.insert_batch(articles)
     if inserted:
         log.info("[%s] +%d new articles from %d collected", source_tag, inserted, len(articles))
     return inserted
@@ -290,8 +326,11 @@ def _scorer_worker(store: ArticleStore) -> None:
                 if sc.needs_llm or (3.8 <= ml_score <= 4.3):
                     llm_candidates.append(art)
                     continue
-                is_urgent = 1 if sc.urgency >= 8.0 else 0
                 final = max(sc.relevance, sc.urgency, 0.01)
+                is_urgent = 1 if (
+                    sc.urgency >= 8.0
+                    or _is_breaking_macro_market_event(art, final)
+                ) else 0
                 ml_updates.append((aid, final, is_urgent))
 
             if ml_updates:
@@ -327,6 +366,28 @@ def _scorer_worker(store: ArticleStore) -> None:
         except Exception as e:
             log.warning("[scorer_worker] error: %s", e)
             _sleep(interval)
+
+
+def _alert_worker(store: ArticleStore) -> None:
+    interval = _env_seconds("ALERT_CHECK_INTERVAL", 20)
+    log.info("[alert_worker] started interval=%ss", interval)
+    from watchers.alert_agent import send_urgent_alert as _send_urgent_alert
+
+    last_ping = 0.0
+    while _running:
+        try:
+            with _store_lock:
+                urgent = store.get_unalerted_urgent()
+            if urgent:
+                log.info("[alert] %d urgent items -> dispatching", len(urgent))
+                _send_urgent_alert(urgent, store)
+            elif time.time() - last_ping >= 300:
+                log.debug("[alert] idle - no urgent items")
+                last_ping = time.time()
+            _worker_last_ok["alert"] = time.time()
+        except Exception as e:
+            log.warning("[alert_worker] error: %s", e)
+        _sleep(interval)
 
 
 def _ml_trainer_worker(store: ArticleStore) -> None:
@@ -415,7 +476,7 @@ def main() -> None:
         ),
     ]
 
-    known_workers = {name for name, *_ in workers} | {"stats", "purge", "scorer", "ml_trainer"}
+    known_workers = {name for name, *_ in workers} | {"stats", "purge", "scorer", "ml_trainer", "alert"}
     unknown_workers = sorted(requested - known_workers)
     if unknown_workers:
         log.warning("[article_aggregation] unknown DIGITAL_INTERN_WORKERS ignored: %s", unknown_workers)
@@ -438,6 +499,7 @@ def main() -> None:
         ("stats", _stats_worker),
         ("purge", _purge_worker),
         ("scorer", _scorer_worker),
+        ("alert", _alert_worker),
         ("ml_trainer", _ml_trainer_worker),
     ]
     if requested:

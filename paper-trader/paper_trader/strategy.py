@@ -66,6 +66,9 @@ ENTRY_COOLDOWN_AFTER_EXIT_S = int(os.environ.get(
 ENTRY_COOLDOWN_AFTER_ANY_TRADE_S = int(os.environ.get(
     "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_ANY_TRADE_S", str(30 * 60),
 ))
+MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S = int(os.environ.get(
+    "PAPER_TRADER_MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", str(72 * 3600),
+))
 MAX_POST_TRADE_SINGLE_NAME_PCT = float(os.environ.get(
     "PAPER_TRADER_MAX_POST_TRADE_SINGLE_NAME_PCT", "35",
 ))
@@ -258,8 +261,9 @@ def _is_quota_exhausted(text: str | None) -> bool:
     return any(m in low for m in _QUOTA_MARKERS)
 
 WATCHLIST = [
-    "LITE", "LNOK", "MUU", "DRAM", "SNDU",  # current real-account interests
+    "LITE", "LNOK", "MUU", "DRAM", "SNDU", "SNK",  # current real-account interests
     "NVDA", "AMD", "MU", "AMAT", "LRCX", "KLAC", "TSM", "ASML", "MRVL",  # semis
+    "BIRD",  # ArticleNet short-watch: Allbirds/Smartbird distress examples
     "SMH", "SOXX", "SPY", "QQQ",  # ETFs
     # Leveraged ETFs — 3x Bull
     "TQQQ", "UPRO", "SPXL", "UDOW", "URTY",
@@ -276,6 +280,44 @@ WATCHLIST = [
     "TSLL", "CONL", "BITU", "ETHU",
     # Leveraged Bear / Hedge
     "SQQQ", "SPXS", "SOXS", "TECS", "FNGD",
+]
+
+# Research-discovery surface. The curated WATCHLIST stays the price/portfolio
+# spine, but the decision cycle also scans a much wider ArticleNet ticker set
+# so fresh off-watchlist dislocations can be surfaced before they become
+# obvious hindsight. Only the hottest discovered names are price/quant fetched.
+RESEARCH_UNIVERSE_MULTIPLE = int(os.environ.get(
+    "PAPER_TRADER_RESEARCH_UNIVERSE_MULTIPLE", "100",
+))
+DISCOVERY_SIGNAL_LIMIT = int(os.environ.get(
+    "PAPER_TRADER_DISCOVERY_SIGNAL_LIMIT",
+    str(max(len(WATCHLIST) * RESEARCH_UNIVERSE_MULTIPLE, 2000)),
+))
+DISCOVERY_SIGNAL_HOURS = int(os.environ.get(
+    "PAPER_TRADER_DISCOVERY_SIGNAL_HOURS", "12",
+))
+DISCOVERY_SIGNAL_MIN_SCORE = float(os.environ.get(
+    "PAPER_TRADER_DISCOVERY_SIGNAL_MIN_SCORE", "3.0",
+))
+DISCOVERY_PRICE_CANDIDATES = int(os.environ.get(
+    "PAPER_TRADER_DISCOVERY_PRICE_CANDIDATES", "20",
+))
+DISCOVERY_QUANT_CANDIDATES = int(os.environ.get(
+    "PAPER_TRADER_DISCOVERY_QUANT_CANDIDATES", "10",
+))
+ACTIVE_RESEARCH_HOURS = int(os.environ.get(
+    "PAPER_TRADER_ACTIVE_RESEARCH_HOURS", "72",
+))
+ACTIVE_RESEARCH_SCAN_LIMIT = int(os.environ.get(
+    "PAPER_TRADER_ACTIVE_RESEARCH_SCAN_LIMIT", "1600",
+))
+ACTIVE_RESEARCH_THEMES = [
+    "AI capex balance sheet debt lease financing",
+    "data center credit private debt SPV financing",
+    "hyperscaler cloud spending guidance backlog",
+    "Nasdaq big tech selloff recession risk",
+    "semiconductor demand guidance inventory margin",
+    "consumer weakness unemployment recession credit spreads",
 ]
 
 # Subset used for live quant indicator computation. Mix of mega-caps + leveraged.
@@ -298,7 +340,7 @@ _LEVERAGED_ETFS_SL = frozenset({
     "LABU", "NAIL", "CURE", "DFEN", "HIBL", "MIDU", "TNA", "WANT",
     "FAS", "FOTU", "PILL", "RETL", "DPST", "KORU", "UTSL",
     "QLD", "SSO", "NVDU", "MSFU", "AMZU", "TSLL", "CONL", "BITU", "ETHU",
-    "SOXS", "TECS", "SPXU", "SQQQ", "SPXS", "FNGD",
+    "SOXS", "TECS", "SPXU", "SQQQ", "SPXS", "FNGD", "SNK",
 })
 _SL_PCT_STANDARD = 0.05
 _TP_PCT_STANDARD = 0.15
@@ -314,7 +356,8 @@ operator discipline enforced by the engine: no repeated same-ticker entry churn,
 no oversized single-name or sector pile-on, and no oversized leveraged ETF bet.
 You can:
 - Concentrate when evidence is exceptional, but only within the hard engine caps
-- Short stocks when the evidence is bearish
+- Short priceable stocks when the ArticleNet/news evidence is bearish, even if
+  the portfolio does not already own them
 - Hold options through expiry if you believe in the thesis
 - Keep cash when the available trades would only recycle a stale idea
 - Let losers run only when the thesis is still intact and risk is diversified
@@ -323,7 +366,7 @@ You can:
 LEVERAGE INSTRUMENTS AVAILABLE:
 - Leveraged ETFs 3x Bull: TQQQ (QQQ), UPRO/SPXL (SPY), UDOW (Dow), URTY (Russell), SOXL (semis), TECL (tech), FNGU (FANGs), CURE (healthcare), LABU (biotech), NAIL (homebuilders), DPST (banks), FAS (financials), DFEN (defense), TNA (small-cap), UTSL (utilities)
 - Leveraged ETFs 2x Bull: QLD (QQQ 2x), SSO (SPY 2x), NVDU (NVDA), MSFU (MSFT), AMZU (AMZN), TSLL (TSLA), CONL (COIN), LNOK (Nokia), BITU (BTC), ETHU (ETH)
-- Leveraged Bear/Hedge: SQQQ/SPXS (3x short index), SOXS (3x short semis), TECS (3x short tech), FNGD (3x short FANGs)
+- Leveraged Bear/Hedge: SQQQ/SPXS (3x short index), SOXS (3x short semis), TECS (3x short tech), FNGD (3x short FANGs), SNK (2x short SpaceX/SPCX)
 - For high-conviction directional trades, consider 2-3x leveraged ETFs instead of the underlying
 - For options-equivalent exposure: buy deep ITM LEAPS calls (delta >0.80) to simulate leveraged long
 - Risk: leveraged ETFs decay in sideways markets; best for strong trending moves only
@@ -339,6 +382,23 @@ THINK LIKE A HEDGE FUND MANAGER WHO WANTS ASYMMETRIC RETURNS.
 Small, safe trades will not outperform. Recycled, correlated trades will not
 outperform either. Take calculated risks across differentiated ideas.
 High conviction = large size. Low conviction = stay cash.
+
+ACTIVE RESEARCH REQUIREMENT:
+- Before every BUY, SELL, SHORT, COVER, option trade, or REBALANCE, first read
+  ACTIVE RESEARCH DOSSIER plus ArticleNet/news, event, macro, technical, and
+  portfolio-risk context.
+- Do not treat ArticleNet as a passive feed. Use it as a research corpus: look
+  for confirming and disconfirming evidence across sources, freshness, source
+  concentration, balance-sheet/capex/credit risk, earnings guidance, and macro
+  transmission.
+- Local ML may be unavailable or stale on this Mac. Let your LLM reasoning do
+  the research synthesis; ML scores are advisory metadata only.
+- If the active research dossier is stale, thin, one-source, or contradicts the
+  trade idea, prefer HOLD unless price/technical evidence is overwhelming and
+  explain the exception in reasoning.
+- For any AI/semis/Big Tech/index trade, explicitly account for AI-capex credit
+  risk, balance-sheet obligations, hyperscaler guidance, and recession
+  spillover before sizing.
 
 HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New long stock positions are
 automatically sold only during the regular market session when price falls 5%
@@ -372,6 +432,9 @@ a short stock position and uses the same stock buying-power field as BUY.
 For SELL, ticker must match an open long stock position. For COVER, ticker
 must match an open short stock position. For SELL_CALL/SELL_PUT, ticker must
 match an open option position (and strike/expiry for options).
+Do not express a fresh bearish thesis as SELL unless there is an open long;
+use SHORT for a priceable stock or a leveraged bear ETF for index/sector theses.
+Do not short private, unquoted, or unmapped names.
 
 TECHNICAL SIGNAL INTERPRETATION (use alongside news, not in isolation):
 - RSI > 70 = overbought — avoid new longs, consider reducing; RSI < 30 = oversold — potential
@@ -1243,6 +1306,157 @@ def _names_in_play(positions: list[dict], top_signals: list[dict],
     return held | mentioned | priority
 
 
+def _research_discovery(
+    articles: list[dict],
+    watchlist: list[str],
+    *,
+    target_size: int | None = None,
+    top_n: int = 20,
+) -> dict:
+    """Rank live-news tickers outside the curated watchlist.
+
+    This is the 100x-broader research layer: scan a much larger ArticleNet
+    article batch, extract every ticker the feed names, and only pass the
+    hottest discovered symbols forward for price/quant work. The target is a
+    universe-size contract, not a mandate to yfinance-fetch thousands of names
+    every cycle.
+    """
+    target = target_size or max(len(watchlist) * RESEARCH_UNIVERSE_MULTIPLE, 0)
+    watch = {str(t).upper() for t in watchlist if t}
+    heat: dict[str, dict[str, float | int | str | None]] = {}
+    for a in articles or []:
+        try:
+            score = float(a.get("ai_score") or a.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        try:
+            urg = float(a.get("urgency") or 0.0)
+        except (TypeError, ValueError):
+            urg = 0.0
+        article_heat = max(0.0, score) + max(0.0, urg) * 1.5
+        title = str(a.get("title") or "")
+        for raw in a.get("tickers") or []:
+            tk = str(raw or "").upper().strip()
+            if not tk or tk in watch:
+                continue
+            row = heat.setdefault(tk, {
+                "ticker": tk,
+                "heat": 0.0,
+                "n": 0,
+                "max_score": 0.0,
+                "max_urgency": 0.0,
+                "sample_title": None,
+            })
+            row["heat"] = float(row["heat"]) + article_heat
+            row["n"] = int(row["n"]) + 1
+            row["max_score"] = max(float(row["max_score"]), score)
+            row["max_urgency"] = max(float(row["max_urgency"]), urg)
+            if not row["sample_title"]:
+                row["sample_title"] = title[:140]
+
+    ranked = sorted(
+        heat.values(),
+        key=lambda r: (
+            float(r["heat"]),
+            float(r["max_score"]),
+            float(r["max_urgency"]),
+            int(r["n"]),
+            str(r["ticker"]),
+        ),
+        reverse=True,
+    )
+    return {
+        "target_size": target,
+        "watchlist_size": len(watch),
+        "multiple": RESEARCH_UNIVERSE_MULTIPLE,
+        "n_articles_scanned": len(articles or []),
+        "observed_off_watchlist": len(ranked),
+        "top": ranked[:top_n],
+    }
+
+
+def _research_discovery_prompt_block(discovery: dict | None) -> str | None:
+    if not discovery:
+        return None
+    rows = discovery.get("top") or []
+    if not rows:
+        return (
+            "RESEARCH DISCOVERY: "
+            f"target={discovery.get('target_size', 0)} tickers "
+            f"({discovery.get('multiple', RESEARCH_UNIVERSE_MULTIPLE)}x watchlist), "
+            f"scanned={discovery.get('n_articles_scanned', 0)} articles; "
+            "no off-watchlist ticker heat cleared extraction."
+        )
+    lines = [
+        "RESEARCH DISCOVERY: "
+        f"target={discovery.get('target_size', 0)} tickers "
+        f"({discovery.get('multiple', RESEARCH_UNIVERSE_MULTIPLE)}x watchlist), "
+        f"scanned={discovery.get('n_articles_scanned', 0)} articles, "
+        f"observed_off_watchlist={discovery.get('observed_off_watchlist', 0)}.",
+        "Hottest off-watchlist names to consider if priceable:",
+    ]
+    for r in rows[:8]:
+        lines.append(
+            f"  {r['ticker']}: heat={float(r['heat']):.1f} "
+            f"n={int(r['n'])} max_score={float(r['max_score']):.1f} "
+            f"urg={float(r['max_urgency']):.1f} "
+            f"title={str(r.get('sample_title') or '')[:100]}"
+        )
+    return "\n".join(lines)
+
+
+def _active_research_prompt_block(brief: dict | None) -> str | None:
+    """Render the per-cycle ArticleNet dossier the LLM must research first."""
+    if not brief:
+        return None
+    if not brief.get("available"):
+        reason = brief.get("reason") or "unavailable"
+        return (
+            "ACTIVE RESEARCH DOSSIER: UNAVAILABLE "
+            f"({reason}). Treat ArticleNet as blind this cycle; avoid fresh "
+            "risk unless the rest of the context is overwhelming."
+        )
+    articles = brief.get("articles") or []
+    window = brief.get("window_hours")
+    newest = brief.get("newest_first_seen") or "n/a"
+    scanned = brief.get("scanned", 0)
+    sources = brief.get("source_counts") or {}
+    src_line = ", ".join(
+        f"{src}:{cnt}" for src, cnt in list(sources.items())[:8]
+    ) or "none"
+    lines = [
+        "ACTIVE RESEARCH DOSSIER:",
+        f"  window={window}h scanned={scanned} matched={len(articles)} "
+        f"newest_first_seen={newest}",
+        f"  source_counts={src_line}",
+        "  mandate=Before trading, synthesize these ArticleNet/online-source "
+        "hits with macro, credit, earnings, and technical context; if evidence "
+        "is thin or one-sided, HOLD.",
+    ]
+    themes = brief.get("themes") or []
+    if themes:
+        lines.append("  active_themes=" + " | ".join(str(t) for t in themes[:6]))
+    if not articles:
+        lines.append(
+            "  no matching research hits; this is a yellow flag for any fresh "
+            "trade whose thesis depends on news/AI-credit/macro confirmation."
+        )
+        return "\n".join(lines)
+    for a in articles[:10]:
+        matches = ",".join(str(m) for m in (a.get("matches") or [])[:5])
+        tickers = ",".join(str(t) for t in (a.get("tickers") or [])[:5])
+        lines.append(
+            f"  [{float(a.get('ai_score') or 0.0):.1f}] "
+            f"urg={int(a.get('urgency') or 0)} "
+            f"src={a.get('source') or 'unknown'} "
+            f"seen={a.get('first_seen') or 'n/a'} "
+            f"match={matches or 'n/a'} "
+            f"tickers={tickers or 'n/a'} "
+            f"title={str(a.get('title') or '')[:130]}"
+        )
+    return "\n".join(lines)
+
+
 def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dict],
                    watch_prices: dict[str, float | None],
                    futures_prices: dict[str, float | None],
@@ -1259,7 +1473,9 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    event_calendar_block: str | None = None,
                    macro_calendar_block: str | None = None,
                    buying_power_block: str | None = None,
-                   exit_proximity_block: str | None = None) -> str:
+                   exit_proximity_block: str | None = None,
+                   research_discovery_block: str | None = None,
+                   active_research_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     # Granular trading-day phase (see market.market_phase). The header
     # historically carried only the binary MARKET_OPEN — but a decision at
@@ -1437,6 +1653,12 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     exit_proximity_section = (
         f"{exit_proximity_block}\n" if exit_proximity_block else ""
     )
+    research_section = (
+        f"{research_discovery_block}\n" if research_discovery_block else ""
+    )
+    active_research_section = (
+        f"{active_research_block}\n" if active_research_block else ""
+    )
 
     # Watchlist MACD breadth — one-line market-structure roll-up derived
     # from the same quant_signals the per-name TECHNICAL block renders.
@@ -1473,6 +1695,8 @@ PORTFOLIO:
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
+{active_research_section}
+{research_section}
 FUTURES:
 {chr(10).join(fut_lines)}
 
@@ -1843,6 +2067,70 @@ def _trade_discipline_guard(
     return True, ""
 
 
+def _minimum_hold_exit_guard(
+    decision: dict,
+    snapshot: dict,
+    store: Store,
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Block discretionary same-day exits while leaving hard stops untouched."""
+    action = (decision.get("action") or "").upper()
+    if action not in {"SELL", "COVER"}:
+        return True, ""
+    try:
+        total = float(snapshot.get("total_value") or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total < TRADE_DISCIPLINE_MIN_BOOK_VALUE:
+        return True, ""
+
+    ticker = str(decision.get("ticker") or "").upper()
+    if not ticker:
+        return False, "ticker required for exit discipline"
+    now = now or datetime.now(timezone.utc)
+
+    def _matches(p: dict) -> bool:
+        if str(p.get("ticker") or "").upper() != ticker:
+            return False
+        if p.get("type") != "stock":
+            return False
+        try:
+            qty = float(p.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return qty > 0 if action == "SELL" else qty < 0
+
+    positions = [p for p in snapshot.get("positions") or [] if _matches(p)]
+    if not any(p.get("opened_at") for p in positions):
+        try:
+            positions = [p for p in store.open_positions() if _matches(p)]
+        except Exception:
+            positions = []
+
+    opened = None
+    for pos in positions:
+        ts = _parse_trade_ts(pos.get("opened_at"))
+        if ts is None:
+            continue
+        opened = ts if opened is None else max(opened, ts)
+    if opened is None:
+        return True, ""
+
+    age_s = (now - opened).total_seconds()
+    if age_s < 0:
+        return True, ""
+    if age_s < MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S:
+        held_h = int(age_s // 3600)
+        wait_h = int((MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S - age_s + 3599) // 3600)
+        return (
+            False,
+            f"minimum-hold lock: {ticker} held {held_h}h; wait {wait_h}h "
+            "before discretionary exit unless the hard stop triggers",
+        )
+    return True, ""
+
+
 def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
     """Apply the decision against the paper book. Returns (status, detail)."""
     action = (decision.get("action", "HOLD") or "HOLD").upper()
@@ -1934,6 +2222,9 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             )
             return "FILLED", f"BUY {effective_qty:g} {ticker} @ {price:.2f}{suffix}"
         if action == "SELL":
+            ok, why = _minimum_hold_exit_guard(decision, snapshot, store)
+            if not ok:
+                return "BLOCKED", why
             notional = price * qty
             store.record_trade(ticker, "SELL", qty, price, reason)
             store.upsert_position(ticker, "stock", -qty, price)
@@ -1972,6 +2263,9 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             return "FILLED", f"SHORT {qty:g} {ticker} @ {price:.2f}"
 
         if action == "COVER":
+            ok, why = _minimum_hold_exit_guard(decision, snapshot, store)
+            if not ok:
+                return "BLOCKED", why
             notional = price * qty
             store.record_trade(ticker, "COVER", qty, price, reason)
             store.upsert_position(ticker, "stock", qty, price)
@@ -2120,6 +2414,7 @@ _WORD_TO_TICKER_LIVE: dict[str, str] = {
     "federal reserve": "TLT", "fed rate": "TLT", "treasury": "TLT",
     "gold": "GLD", "bitcoin": "BTC-USD", "crypto": "COIN",
     "defense": "DFEN", "biotech": "LABU",
+    "allbirds": "BIRD", "smartbird": "BIRD",
 }
 # Pre-compiled word-boundary patterns for `_WORD_TO_TICKER_LIVE` lookup.
 # A bare `keyword in title` substring match false-positively triggered on the
@@ -2141,7 +2436,7 @@ _LEVERAGED_ETFS_LIVE = {
     "TQQQ", "UPRO", "SPXL", "UDOW", "URTY", "SOXL", "TECL", "FNGU",
     "CURE", "LABU", "NAIL", "DPST", "FAS", "DFEN", "TNA", "UTSL",
     "QLD", "SSO", "NVDU", "MSFU", "AMZU", "TSLL", "CONL", "BITU", "ETHU",
-    "SQQQ", "SPXS", "SOXS", "TECS", "FNGD",
+    "SQQQ", "SPXS", "SOXS", "TECS", "FNGD", "SNK",
 }
 
 
@@ -2198,8 +2493,6 @@ def _ml_live_opinion(
             except (TypeError, ValueError):
                 a_urg = 0.0
             for tk in tickers:
-                if tk not in WATCHLIST:
-                    continue
                 ticker_scores[tk] = ticker_scores.get(tk, 0.0) + raw_score * sentiment
                 ticker_article_count[tk] = ticker_article_count.get(tk, 0) + 1
                 if a_urg > ticker_max_urgency.get(tk, 0.0):
@@ -2207,8 +2500,6 @@ def _ml_live_opinion(
 
         # Quant adjustments
         for tk, q in quant_sigs.items():
-            if tk not in WATCHLIST:
-                continue
             adj = 0.0
             rsi = q.get("rsi")
             macd = q.get("macd_signal")
@@ -2242,19 +2533,43 @@ def _ml_live_opinion(
         else:
             regime, regime_mult = "unknown", 1.0
 
-        # Pick best ticker above threshold
+        # Pick best directional ticker above threshold. The original advisory
+        # only selected positive scores, so bearish ArticleNet evidence could
+        # suppress a BUY but could never surface a SHORT. That made the
+        # fallback asymmetric exactly where news aggregation matters most.
         buy_ticker: str | None = None
+        short_ticker: str | None = None
         best_score = 1.0
+        worst_score = -1.0
         for tk, s in ticker_scores.items():
             adj_s = s * regime_mult
             px = watch_px.get(tk)
             if adj_s > best_score and px and px > 0:
                 best_score = adj_s
                 buy_ticker = tk
+            if adj_s < worst_score and px and px > 0:
+                worst_score = adj_s
+                short_ticker = tk
 
-        if not buy_ticker:
+        if not buy_ticker and not short_ticker:
             return {"action": "HOLD", "ticker": "",
                     "reasoning": f"ML+quant: no high-conviction signal; regime={regime}"}
+
+        if short_ticker and abs(worst_score) >= best_score:
+            q_short = quant_sigs.get(short_ticker, {})
+            news_count = ticker_article_count.get(short_ticker, 0)
+            news_urg = ticker_max_urgency.get(short_ticker, 0.0)
+            conviction = min(0.25, abs(worst_score) / 20.0)
+            return {
+                "action": "SHORT",
+                "ticker": short_ticker,
+                "reasoning": (
+                    f"ML+quant: {short_ticker} bearish_score={worst_score:.2f} "
+                    f"regime={regime} RSI={q_short.get('rsi', 'N/A')} "
+                    f"news_count={news_count} news_urg={news_urg:.1f} "
+                    f"conviction={conviction:.0%}"
+                ),
+            }
 
         q_buy = quant_sigs.get(buy_ticker, {})
         news_count = ticker_article_count.get(buy_ticker, 0)
@@ -2332,7 +2647,11 @@ def decide() -> dict:
     # Reset here so the per-cycle contract holds regardless of which arm fires.
     _last_claude_fail = None
     store = get_store()
-    market_open = market.is_market_open()
+    regular_market_open = market.is_market_open()
+    try:
+        market_open = market.is_tradable_window_open()
+    except Exception:
+        market_open = regular_market_open
 
     snap = _portfolio_snapshot(store)
     # Hard stop-loss guard — executes BEFORE Opus sees the prompt. Defined in
@@ -2342,21 +2661,45 @@ def decide() -> dict:
     auto_exits: list[str] = _check_and_execute_hard_exits(
         store,
         snap,
-        market_open=market_open,
+        market_open=regular_market_open,
     )
     if auto_exits:
         snap = _portfolio_snapshot(store)
 
     top = signals.get_top_signals(20, hours=2, min_score=4.0)
     urgent = signals.get_urgent_articles(minutes=30)
-    sents = signals.ticker_sentiments(WATCHLIST, hours=4)
-    watch_px = market.get_prices(WATCHLIST)
+    discovery_articles = signals.get_top_signals(
+        DISCOVERY_SIGNAL_LIMIT,
+        hours=DISCOVERY_SIGNAL_HOURS,
+        min_score=DISCOVERY_SIGNAL_MIN_SCORE,
+    )
+    discovery = _research_discovery(
+        discovery_articles,
+        WATCHLIST,
+        target_size=len(WATCHLIST) * RESEARCH_UNIVERSE_MULTIPLE,
+        top_n=DISCOVERY_PRICE_CANDIDATES,
+    )
+    discovery_tickers = [
+        str(r.get("ticker") or "").upper()
+        for r in (discovery.get("top") or [])
+        if r.get("ticker")
+    ]
+    price_universe = list(dict.fromkeys([
+        *WATCHLIST,
+        *discovery_tickers[:DISCOVERY_PRICE_CANDIDATES],
+    ]))
+    sents = signals.ticker_sentiments(price_universe, hours=4)
+    watch_px = market.get_prices(price_universe)
     fut_px = {f: market.get_futures_price(f) for f in FUTURES}
     sp500 = market.benchmark_sp500()
 
     # Quant signals (RSI/MACD/MA cross) — include held positions + curated subset.
     held_tickers = sorted({p["ticker"] for p in snap["positions"]})
-    quant_tickers = sorted(set(QUANT_TICKERS_LIVE) | set(held_tickers))
+    quant_tickers = sorted(
+        set(QUANT_TICKERS_LIVE)
+        | set(held_tickers)
+        | set(discovery_tickers[:DISCOVERY_QUANT_CANDIDATES])
+    )
     try:
         quant_sigs = get_quant_signals_live(quant_tickers)
     except Exception as e:
@@ -2366,6 +2709,35 @@ def decide() -> dict:
     # include urgent items at the top
     seen_ids = {s["id"] for s in top}
     merged = [a for a in urgent if a["id"] not in seen_ids] + top
+    ml_articles = list(merged)
+    seen_ml_ids = {a.get("id") for a in ml_articles}
+    for a in discovery_articles:
+        if a.get("id") in seen_ml_ids:
+            continue
+        ml_articles.append(a)
+        seen_ml_ids.add(a.get("id"))
+    research_discovery_block = _research_discovery_prompt_block(discovery)
+    active_research_block: str | None = None
+    try:
+        active_research_tickers = list(dict.fromkeys([
+            *(p.get("ticker") for p in snap.get("positions", []) if p.get("ticker")),
+            *WATCHLIST[:20],
+            *discovery_tickers[:DISCOVERY_PRICE_CANDIDATES],
+            "AAPL", "MSFT", "AMZN", "GOOGL", "META", "ORCL", "AVGO",
+        ]))
+        active_research = signals.get_active_research_brief(
+            active_research_tickers,
+            themes=ACTIVE_RESEARCH_THEMES,
+            hours=ACTIVE_RESEARCH_HOURS,
+            scan_limit=ACTIVE_RESEARCH_SCAN_LIMIT,
+        )
+        active_research_block = _active_research_prompt_block(active_research)
+    except Exception as e:
+        print(f"[strategy] active research failed (non-fatal): {e}")
+        active_research_block = _active_research_prompt_block({
+            "available": False,
+            "reason": str(e),
+        })
 
     # Behavioural self-review — feed the trader its own track record (payoff
     # ratio, disposition gap, capital-paralysis state, open-book alpha) so it
@@ -2665,7 +3037,7 @@ def decide() -> dict:
     ml_qualified, ml_qual_reason = _ml_is_qualified()
     if ml_qualified:
         try:
-            ml_op = _ml_live_opinion(merged, quant_sigs, snap, watch_px)
+            ml_op = _ml_live_opinion(ml_articles, quant_sigs, snap, watch_px)
             if ml_op:
                 ml_opinion_block = (
                     f"ML MODEL OPINION ({ml_qual_reason}):\n"
@@ -2691,7 +3063,9 @@ def decide() -> dict:
                              event_calendar_block=event_calendar_block,
                              macro_calendar_block=macro_calendar_block,
                              buying_power_block=buying_power_block,
-                             exit_proximity_block=exit_proximity_block)
+                             exit_proximity_block=exit_proximity_block,
+                             research_discovery_block=research_discovery_block,
+                             active_research_block=active_research_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"

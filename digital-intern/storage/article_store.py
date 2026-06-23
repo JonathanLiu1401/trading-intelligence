@@ -2554,6 +2554,61 @@ class ArticleStore:
         )
         params.append(limit_i * 3 if include_snippets else limit_i)
         rows = self.conn.execute(sql, params).fetchall()
+        if include_snippets and terms and len(rows) < limit_i:
+            # Active research fallback: the primary query is intentionally
+            # index-friendly (title/source/url only), but thesis searches like
+            # "AI capex balance sheet credit" often live in article snippets.
+            # Do a bounded recent-row pass, decompressing only a small candidate
+            # window, so ArticleNet behaves like a research corpus without
+            # reintroducing the old unbounded full_text scan hazard.
+            broader_clauses = [
+                f"first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+                f"{score_expr} >= ?",
+            ]
+            broader_params: list = [since, min_score_f]
+            if raw_ticker:
+                ticker_pat = _like(raw_ticker)
+                cashtag_pat = _like(f"${raw_ticker}")
+                broader_clauses.append(
+                    "(title LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' "
+                    "OR source LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\')"
+                )
+                broader_params.extend([
+                    ticker_pat, cashtag_pat, ticker_pat, ticker_pat,
+                ])
+            if raw_source:
+                broader_clauses.append("source LIKE ? ESCAPE '\\'")
+                broader_params.append(_like(raw_source))
+            broader_sql = (
+                "SELECT id, url, title, source, published, kw_score, ai_score, "
+                "ml_score, urgency, first_seen, score_source, time_sensitivity, "
+                f"{score_expr} AS effective_score, full_text "
+                "FROM articles WHERE "
+                + " AND ".join(broader_clauses)
+                + " ORDER BY effective_score DESC, urgency DESC, first_seen DESC "
+                "LIMIT ?"
+            )
+            broader_params.append(max(limit_i * 20, 200))
+            seen_ids = {r[0] for r in rows}
+            for cand in self.conn.execute(broader_sql, broader_params).fetchall():
+                if cand[0] in seen_ids:
+                    continue
+                snippet = _clean_snippet(
+                    decompress(cand[13]) if cand[13] is not None else "",
+                    limit=1200,
+                ).lower()
+                hay = " ".join([
+                    str(cand[2] or ""),
+                    str(cand[3] or ""),
+                    str(cand[1] or ""),
+                    snippet,
+                ]).lower()
+                hits = sum(1 for term in terms if term.lower() in hay)
+                if hits >= max(1, min(3, len(terms))):
+                    rows.append(cand)
+                    seen_ids.add(cand[0])
+                if len(rows) >= limit_i:
+                    break
 
         now = datetime.now(timezone.utc)
 

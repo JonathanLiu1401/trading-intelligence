@@ -778,18 +778,15 @@ def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
 
     An article that already carries ``_relevance_score`` is treated as
     pre-scored by its collector — the heuristic scorer is NOT re-run on it.
-    Synthetic operations alerts (the ``collector_rate_monitor`` SILENT
-    notifications, in particular) carry no portfolio tickers / financial
-    keywords, so ``_heuristic_score_article`` returns 0.0 on them and the
-    0.5 noise gate below silently dropped every one — the operations-alert
-    path was inert in production. The opt-in pre-scoring contract lets a
-    collector deliberately set its own ``kw_score`` (the same convention
-    ``vix_ts`` / ``dxy`` / ``sector_etf`` use via their direct-write
-    pattern) without bypassing this central insert path. Existing
-    collectors that DON'T set ``_relevance_score`` are byte-unchanged —
-    their articles are still heuristic-scored and 0.5-noise-gated exactly
-    as before. Backtest isolation is untouched (`store.insert_batch` is
-    the same call; the ``_LIVE_ONLY_CLAUSE`` read filter in the store is
+    Synthetic operations alerts and broad internet collection can carry no
+    portfolio tickers / financial keywords, so ``_heuristic_score_article`` may
+    return 0.0. That score is now metadata, not a pre-insert gate: ArticleNet
+    keeps the raw corpus and downstream search/alerts/prompts filter after
+    aggregation. The opt-in pre-scoring contract lets a collector deliberately
+    set its own ``kw_score`` (the same convention ``vix_ts`` / ``dxy`` /
+    ``sector_etf`` use via their direct-write pattern) without bypassing this
+    central insert path. Backtest isolation is untouched (`store.insert_batch`
+    is the same call; the ``_LIVE_ONLY_CLAUSE`` read filter in the store is
     where invariant #1 is enforced, not here)."""
     for art in articles:
         if "_relevance_score" in art:
@@ -800,10 +797,11 @@ def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
         )
         art["_relevance_score"] = result["score"]
         art["_score_detail"] = result
-    # filter obvious noise before inserting (heuristic score < 0.5)
-    relevant = [a for a in articles if a["_relevance_score"] >= 0.5]
+    # Recall-first ingest: ArticleNet is the raw research corpus. Do not drop
+    # low-score/noisy articles before storage; downstream scoring, search,
+    # alerting, and trader prompts decide what is relevant after aggregation.
     with _store_lock:
-        inserted = store.insert_batch(relevant)
+        inserted = store.insert_batch(articles)
     if inserted:
         log.info(f"[{source_tag}] +{inserted} new articles (from {len(articles)} collected)")
     return inserted
