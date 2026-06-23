@@ -22,6 +22,8 @@ PORTFOLIO_PATH = BASE_DIR / "config" / "portfolio.json"
 WATCHLIST_PATH = BASE_DIR / "config" / "watchlist.json"
 CURSOR_PATH = BASE_DIR / "data" / "google_news_cursor.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
+QUERY_BANK_PATH = BASE_DIR / "config" / "generated-query-banks" / "broad_search_queries_2026-06-23.txt"
+QUERY_BANK_LIMIT = int(os.environ.get("GOOGLE_NEWS_QUERY_BANK_LIMIT", "650"))
 
 # How many tickers to fetch per call.
 BATCH_PER_PASS = int(os.environ.get("GOOGLE_NEWS_BATCH_PER_PASS", "64"))
@@ -38,6 +40,30 @@ BROAD_GOOGLE_NEWS_QUERIES = [
     "credit spreads technology debt data centers",
     "consumer weakness recession risk stock market",
 ]
+
+
+def _load_query_bank(path: Path = QUERY_BANK_PATH, limit: int = QUERY_BANK_LIMIT) -> list[str]:
+    if limit <= 0 or not path.exists():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        q = line.strip()
+        if not q:
+            continue
+        if ". " in q[:8]:
+            q = q.split(". ", 1)[1].strip()
+        key = q.lower()
+        if q and key not in seen:
+            seen.add(key)
+            out.append(q)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _load_tickers() -> list[str]:
@@ -79,7 +105,7 @@ def _load_tickers() -> list[str]:
     except Exception:
         pass
 
-    for q in BROAD_GOOGLE_NEWS_QUERIES:
+    for q in [*BROAD_GOOGLE_NEWS_QUERIES, *_load_query_bank()]:
         key = f"QUERY:{q}"
         if key not in seen:
             seen.add(key)

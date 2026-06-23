@@ -14,16 +14,48 @@ MAX_RECORDS = 250       # GDELT API hard limit per query
 TIMESPAN = "10080"      # 7 days in minutes — maximise coverage; SQLite dedupes repeats
 REQUEST_TIMEOUT = 20
 MAX_WORKERS = int(os.environ.get("GDELT_MAX_WORKERS", "10"))  # default throttled from 30
-QUERY_BATCH_PER_PASS = int(os.environ.get("GDELT_QUERY_BATCH_PER_PASS", "0") or "0")
+QUERY_BATCH_PER_PASS = int(os.environ.get("GDELT_QUERY_BATCH_PER_PASS", "120") or "120")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 CURSOR_PATH = BASE_DIR / "data" / "gdelt_query_cursor.json"
+QUERY_BANK_PATH = BASE_DIR / "config" / "generated-query-banks" / "broad_search_queries_2026-06-23.txt"
+QUERY_BANK_LIMIT = int(os.environ.get("GDELT_QUERY_BANK_LIMIT", "650"))
+
+
+def _load_query_bank(path: Path = QUERY_BANK_PATH, limit: int = QUERY_BANK_LIMIT) -> list[str]:
+    """Load generated broad-search queries.
+
+    Lines may be numbered as ``001. query``. This is intentionally read at
+    import time so a collector restart applies query-bank updates without
+    adding request-path I/O.
+    """
+    if limit <= 0 or not path.exists():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        q = line.strip()
+        if not q:
+            continue
+        if ". " in q[:8]:
+            q = q.split(". ", 1)[1].strip()
+        key = q.lower()
+        if q and key not in seen:
+            seen.add(key)
+            out.append(q)
+        if len(out) >= limit:
+            break
+    return out
 
 # -------------------------------------------------------------------------
 # Query list — breadth > depth; each query returns up to 250 unique articles
 # -------------------------------------------------------------------------
-QUERY_GROUPS = [
+BASE_QUERY_GROUPS = [
     # --- Memory core ---
     "DRAM memory pricing", "NAND flash pricing", "HBM memory AI chips",
     "Micron Technology DRAM", "Micron earnings revenue",
@@ -263,6 +295,7 @@ QUERY_GROUPS = [
     "uranium price spot enrichment",
     "copper inventory LME shanghai",
 ]
+QUERY_GROUPS = list(dict.fromkeys(BASE_QUERY_GROUPS + _load_query_bank()))
 
 # Multi-language queries — GDELT v2 supports sourcelang=<Language> filter.
 # Each entry: (query_string, sourcelang) — sourcelang None means English/default.
