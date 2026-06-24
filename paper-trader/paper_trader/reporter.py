@@ -3725,7 +3725,7 @@ def _equity_freshness_line(store) -> str:
         ef = build_equity_freshness(
             store.get_portfolio(),
             store.equity_curve(limit=5000),
-            market.is_market_open(),
+            market.is_tradable_window_open(),
         )
         if not isinstance(ef, dict):
             return ""
@@ -3790,9 +3790,12 @@ def _heartbeat_line(store) -> str:
         # cause so a host-saturation storm is not mislabelled "RESTART
         # RECOMMENDED" (a restart only adds load — see runner_heartbeat).
         recent_reasons = [d.get("reasoning") for d in decs]
+        market_open, expected, cadence_context = _current_runner_cadence(store)
         hb = build_runner_heartbeat(
-            last_ts, market.is_market_open(), recent_actions=recent_actions,
-            recent_reasons=recent_reasons)
+            last_ts, market_open, recent_actions=recent_actions,
+            recent_reasons=recent_reasons,
+            expected_interval_s=expected,
+            cadence_context=cadence_context)
         if not isinstance(hb, dict):
             return ""
         verdict = hb.get("verdict")
@@ -3821,6 +3824,30 @@ def _heartbeat_line(store) -> str:
     except Exception as e:
         print(f"[reporter] heartbeat line skipped: {e}")
         return ""
+
+
+def _current_runner_cadence(store) -> tuple[bool, float, str]:
+    """Return the live runner cadence for Discord diagnostics."""
+    now_utc = datetime.now(timezone.utc)
+    tradable = bool(market.is_tradable_window_open(now_utc))
+    regular = bool(market.is_market_open(now_utc))
+    try:
+        from .analytics.dynamic_interval import compute_interval
+        positions = [
+            {"ticker": p.get("ticker")}
+            for p in (store.open_positions() or [])
+            if p.get("ticker")
+        ]
+        expected = float(compute_interval(positions, now=now_utc))
+    except Exception:
+        expected = 300.0 if regular else (1800.0 if tradable else 3600.0)
+    if regular:
+        ctx = "regular-market"
+    elif tradable:
+        ctx = "extended-hours"
+    else:
+        ctx = "market-closed"
+    return tradable, expected, ctx
 
 
 def _position_attention_line(store) -> str:
@@ -4789,13 +4816,13 @@ def _today_session_line(store, now: datetime | None = None) -> str:
     anchored to today's NYSE open (09:30 ET) so any hourly answers
     "today" without waiting until the 16:05 ET daily close.
 
-    Composes ``_window_delta`` **verbatim** (single source of truth — the
-    same math the ``_session_block`` portfolio Δ uses, just with a
-    different baseline, so this surface and the 1h SESSION block can
-    never disagree on direction). Pure store reads only — NO network (the
-    Discord-path discipline; the ``_drawdown_line`` / ``_benchmark_line``
-    precedent). Observational only, never gates, adds no caps (invariants
-    #2/#12).
+    Uses the change in deposit-adjusted P/L from the first post-open point to
+    latest, then percentages that movement against the current capital basis.
+    This keeps external cash flows out of today's trading P/L while matching
+    the report header's ``Capital`` framing. Pure store reads only — NO
+    network (the Discord-path discipline; the ``_drawdown_line`` /
+    ``_benchmark_line`` precedent). Observational only, never gates, adds no
+    caps (invariants #2/#12).
 
     Suppression — silence-when-nothing-actionable (the ``_next_session_line``
     closed-only precedent): today is not a trading day, the session has
@@ -4810,33 +4837,83 @@ def _today_session_line(store, now: datetime | None = None) -> str:
     precedent).
     """
     try:
-        since = _today_session_anchor_iso(now)
-        if not since:
+        d = _today_session_delta(store, now=now)
+        if not d:
             return ""
-        eq = _performance_equity_curve(store.equity_curve(limit=5000))
-        if not eq or len(eq) < 2:
-            return ""
-        last = eq[-1]
-        base = next((p for p in eq if (p.get("timestamp") or "") >= since),
-                    None)
-        if base is None or base is last:
-            return ""
-        d = _window_delta(eq, since)
-        if not d or "port_pct" not in d:
-            return ""
-        try:
-            b_tv = float(base.get("total_value") or 0.0)
-            l_tv = float(last.get("total_value") or 0.0)
-        except (TypeError, ValueError):
-            return ""
-        port_abs = l_tv - b_tv
-        seg = f"${port_abs:+.2f} ({d['port_pct']:+.2f}%)"
+        seg = f"${d['port_abs']:+.2f} ({d['port_pct']:+.2f}%)"
         if "alpha_pct" in d:
             seg += f" · alpha `{d['alpha_pct']:+.2f}%`"
-        return ("**TODAY** ◈ since 09:30 ET NYSE open\n"
+        label = d.get("label") or "since 09:30 ET NYSE open"
+        return (f"**TODAY** ◈ {label}\n"
                 f"> {seg}")
     except Exception as e:
         print(f"[reporter] today-session line skipped: {e}")
+        return ""
+
+
+def _today_session_delta(store, now: datetime | None = None) -> dict | None:
+    """Cash-flow-adjusted session P/L, percented against capital basis."""
+    since = _today_session_anchor_iso(now)
+    if not since:
+        return None
+    eq = equity_curve_with_capital_basis(
+        store.equity_curve(limit=5000), initial_cash=_INITIAL_EQUITY)
+    if not eq or len(eq) < 2:
+        return None
+    last = eq[-1]
+    base = next((p for p in eq if (p.get("timestamp") or "") >= since), None)
+    if base is None or base is last:
+        return None
+    try:
+        b_pnl = float(base.get("deposit_adjusted_pnl") or 0.0)
+        l_pnl = float(last.get("deposit_adjusted_pnl") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    try:
+        basis = float(last.get("capital_basis") or 0.0)
+    except (TypeError, ValueError):
+        basis = 0.0
+    if basis <= 0:
+        return None
+    port_abs = l_pnl - b_pnl
+    out = {
+        "port_abs": port_abs,
+        "port_pct": port_abs / basis * 100.0,
+        "label": _today_session_delta_label(base.get("timestamp"), since),
+    }
+    try:
+        b_sp = float(base.get("sp500_price") or 0.0)
+        l_sp = float(last.get("sp500_price") or 0.0)
+    except (TypeError, ValueError):
+        b_sp = l_sp = 0.0
+    if b_sp > 0 and l_sp > 0:
+        spy_pct = (l_sp / b_sp - 1.0) * 100.0
+        out["alpha_pct"] = out["port_pct"] - spy_pct
+    return out
+
+
+def _today_session_delta_label(base_ts: str | None, anchor_ts: str) -> str:
+    """Human label for the session baseline without overstating data coverage."""
+    try:
+        base_dt = datetime.fromisoformat((base_ts or "").replace("Z", "+00:00"))
+        anchor_dt = datetime.fromisoformat(anchor_ts.replace("Z", "+00:00"))
+    except Exception:
+        return "since 09:30 ET NYSE open"
+    if abs((base_dt - anchor_dt).total_seconds()) <= 60:
+        return "since 09:30 ET NYSE open"
+    hhmm = base_dt.astimezone(market.NY).strftime("%H:%M ET")
+    return f"since first post-open tick {hhmm}"
+
+
+def _today_session_pnl_code_line(store, now: datetime | None = None) -> str:
+    """Top-code-block version of today's session P/L for hourly/daily reports."""
+    try:
+        d = _today_session_delta(store, now=now)
+        if not d:
+            return ""
+        return f"Today P/L   ${d['port_abs']:+.2f} ({d['port_pct']:+.2f}%)\n"
+    except Exception as e:
+        print(f"[reporter] today-session code line skipped: {e}")
         return ""
 
 
@@ -5084,8 +5161,12 @@ def _last_real_decision_line(store) -> str:
     try:
         from .analytics.last_real_decision import build_last_real_decision
         row = store.last_real_decision()
-        market_open = market.is_market_open()
-        result = build_last_real_decision(row, market_open=market_open)
+        market_open, expected, _cadence_context = _current_runner_cadence(store)
+        result = build_last_real_decision(
+            row,
+            market_open=market_open,
+            open_interval_s=expected,
+        )
         if not isinstance(result, dict):
             return ""
         state = result.get("state")
@@ -5187,7 +5268,7 @@ def _portfolio_exposure_line(
     )
 
 
-_COMPACT_KEEP_BLOCKS = 12
+_COMPACT_KEEP_BLOCKS = int(os.environ.get("PAPER_TRADER_HOURLY_DIAGNOSTIC_BLOCKS", "0"))
 _COMPACT_KEEP_FULL = {"SESSION", "BEHAVIOURAL"}
 _COMPACT_PRIORITY = {
     "MARKET": 10,
@@ -5283,6 +5364,8 @@ def _compact_report_body(body: str) -> str:
                 item[0],
             ),
         )
+        if _COMPACT_KEEP_BLOCKS <= 0:
+            return top
         kept_idx = {idx for idx, _ in ranked[:_COMPACT_KEEP_BLOCKS]}
         omitted = len(raw_blocks) - len(kept_idx)
         # Restore original ordering among the kept blocks.
@@ -5360,6 +5443,7 @@ def send_hourly_summary() -> bool:
     ] or ["  (no trades yet)"]
 
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
+    today_pnl_line = _today_session_pnl_code_line(store)
     events_by_ticker = _earnings_events_by_ticker()
     # Equity curve in ascending order — read once per report so the
     # per-position α token can pick the entry-time SPY baseline without a
@@ -5377,6 +5461,7 @@ def send_hourly_summary() -> bool:
         f"Cash        ${pf['cash']:.2f}\n"
         f"{basis_line}"
         f"P/L         ${pl:+.2f} ({pl_pct:+.2f}%)\n"
+        f"{today_pnl_line}"
         f"{sp_line}\n"
         f"```\n"
         f"{_portfolio_exposure_line(positions, pf['total_value'], pf['cash'])}\n"
@@ -5763,6 +5848,7 @@ def send_daily_close() -> bool:
         realized_rt_line = ""
 
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
+    today_pnl_line = _today_session_pnl_code_line(store)
     events_by_ticker = _earnings_events_by_ticker()
     # Per-position α-vs-SPY since entry — same Discord-path discipline as
     # the hourly: read the equity curve once and pass it down.
@@ -5778,6 +5864,7 @@ def send_daily_close() -> bool:
         f"Equity         ${pf['total_value']:.2f}\n"
         f"Cash           ${pf['cash']:.2f}\n"
         f"Total P/L      ${pl:+.2f} ({pl_pct:+.2f}%)  {basis_note}\n"
+        f"{today_pnl_line}"
         f"{realized_rt_line}"
         f"Trades today   {n_trades}\n"
         f"{sp_line}\n"
