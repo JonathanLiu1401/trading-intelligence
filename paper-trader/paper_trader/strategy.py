@@ -2131,6 +2131,14 @@ def _minimum_hold_exit_guard(
     return True, ""
 
 
+# Actions that book a paper fill against a price. HOLD/REBALANCE never fill.
+_FILL_ACTIONS = frozenset({
+    "BUY", "SELL", "SHORT", "COVER",
+    "BUY_CALL", "BUY_PUT", "SELL_CALL", "SELL_PUT",
+    "BUY_CALL_SPREAD", "BUY_PUT_SPREAD", "SELL_CALL_SPREAD", "SELL_PUT_SPREAD",
+})
+
+
 def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
     """Apply the decision against the paper book. Returns (status, detail)."""
     action = (decision.get("action", "HOLD") or "HOLD").upper()
@@ -2139,6 +2147,17 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
 
     if action == "REBALANCE":
         return "HOLD", "REBALANCE not yet implemented; treated as HOLD"
+
+    # Hard gate: model output cannot mint stock/option fills when no equity
+    # trading period is live. RTH / pre / post / weekday overnight are fine.
+    # WEEKEND and HOLIDAY are impossible liquidity and must BLOCK.
+    if action in _FILL_ACTIONS and not market.is_any_trading_session_open():
+        phase = market.market_phase()
+        return (
+            "BLOCKED",
+            f"no trading session open (phase={phase}); "
+            f"cannot {action} outside RTH/pre/post/overnight",
+        )
 
     ticker = (decision.get("ticker") or "").upper()
     # Claude can emit a non-numeric qty (e.g. "all", "half"). Coerce defensively

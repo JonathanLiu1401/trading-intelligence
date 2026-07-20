@@ -97,6 +97,20 @@ def _isolate_data_dir(tmp_path, monkeypatch):
         raising=False,
     )
 
+    # Live _execute hard-blocks fills outside any equity trading session
+    # (WEEKEND/HOLIDAY). Pin tests open so existing fill assertions stay
+    # deterministic on weekends/holidays; session-closed coverage lives in
+    # tests/test_market_session_hard_block.py and must override this pin.
+    try:
+        import paper_trader.market as _mkt
+        monkeypatch.setattr(
+            _mkt, "is_any_trading_session_open",
+            lambda now=None: True,
+            raising=False,
+        )
+    except Exception:
+        pass
+
     yield data_dir
 
 

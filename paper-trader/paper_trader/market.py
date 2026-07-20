@@ -236,6 +236,48 @@ def is_market_open(now: datetime | None = None) -> bool:
     return _OPEN_MIN <= minutes < close_minute(now.date())
 
 
+def is_tradable_window_open(now: datetime | None = None) -> bool:
+    """True during regular + extended-hours stock trading windows.
+
+    This intentionally broadens the live paper-trader decision window without
+    changing ``is_market_open``'s existing regular-session semantics used by
+    NYSE-close diagnostics and closed-market-fill analytics.
+    """
+    return market_phase(now) in {
+        "PRE_MARKET",
+        "OPENING_BELL",
+        "MID_SESSION",
+        "CLOSING_HALF_HOUR",
+        "AFTER_CLOSE",
+    }
+
+
+# Live paper fills may happen in RTH, pre/post, or weekday overnight markets.
+# WEEKEND and HOLIDAY are never a tradable stock/options period for this book.
+_ANY_TRADING_SESSION_PHASES = frozenset({
+    "PRE_MARKET",
+    "OPENING_BELL",
+    "MID_SESSION",
+    "CLOSING_HALF_HOUR",
+    "AFTER_CLOSE",
+    "OVERNIGHT",
+})
+
+
+def is_any_trading_session_open(now: datetime | None = None) -> bool:
+    """True when *some* equity trading venue period is live.
+
+    Allowed: RTH, pre-market, after-hours, and weekday overnight.
+    Blocked: weekends and full NYSE holidays (no equity market open anywhere
+    for US single-name stock/options paper fills).
+
+    Hard gate for live ``strategy._execute`` fills. Distinct from
+    ``is_tradable_window_open`` (extended hours only) and ``is_market_open``
+    (RTH only).
+    """
+    return market_phase(now) in _ANY_TRADING_SESSION_PHASES
+
+
 def next_session_close(now: datetime | None = None) -> datetime | None:
     """The next NYSE session close after ``now`` (16:00 ET regular /
     13:00 ET half-day).
@@ -336,6 +378,33 @@ def next_session_open(now: datetime | None = None) -> datetime | None:
         candidate = (candidate + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+    return None
+
+
+def next_tradable_window_open(now: datetime | None = None) -> datetime | None:
+    """The next extended-hours trading window open after ``now``.
+
+    Uses the common 04:00 ET pre-market start on each non-holiday weekday.
+    Returns a UTC-aware datetime, or ``None`` when no tradable day is reachable
+    within 14 forward days.
+    """
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+    now_ny = now_utc.astimezone(NY)
+    candidate = now_ny.date()
+    for _ in range(14):
+        is_trading_day = (
+            candidate.weekday() < 5
+            and candidate not in NYSE_HOLIDAYS_2026
+        )
+        if is_trading_day:
+            open_dt_ny = datetime(
+                candidate.year, candidate.month, candidate.day,
+                _PRE_MARKET_OPEN_MIN // 60, _PRE_MARKET_OPEN_MIN % 60,
+                tzinfo=NY,
+            )
+            if open_dt_ny > now_ny:
+                return open_dt_ny.astimezone(UTC)
+        candidate = candidate + timedelta(days=1)
     return None
 
 

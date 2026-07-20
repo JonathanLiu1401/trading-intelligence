@@ -71,6 +71,45 @@ class TestIsMarketOpen:
         assert market.is_market_open(_ny(2026, 4, 3, 10, 0)) is False
 
 
+class TestIsTradableWindowOpen:
+    def test_premarket_returns_true(self):
+        assert market.is_tradable_window_open(_ny(2026, 5, 14, 8, 0)) is True
+
+    def test_after_hours_returns_true(self):
+        assert market.is_tradable_window_open(_ny(2026, 5, 14, 18, 30)) is True
+
+    def test_overnight_returns_false(self):
+        assert market.is_tradable_window_open(_ny(2026, 5, 14, 3, 59)) is False
+        assert market.is_tradable_window_open(_ny(2026, 5, 14, 20, 0)) is False
+
+    def test_weekend_and_holiday_return_false(self):
+        assert market.is_tradable_window_open(_ny(2026, 5, 16, 8, 0)) is False
+        assert market.is_tradable_window_open(_ny(2026, 11, 26, 8, 0)) is False
+
+    def test_any_trading_session_allows_overnight_weekday(self, monkeypatch):
+        # Undo conftest autouse pin so we exercise the real calendar helper.
+        monkeypatch.setattr(
+            market,
+            "is_any_trading_session_open",
+            lambda now=None: market.market_phase(now) in market._ANY_TRADING_SESSION_PHASES,
+        )
+        # Weekday overnight is a real 24h equity period for this book.
+        assert market.is_any_trading_session_open(_ny(2026, 5, 14, 2, 0)) is True
+        assert market.is_any_trading_session_open(_ny(2026, 5, 14, 10, 0)) is True
+        assert market.is_any_trading_session_open(_ny(2026, 5, 14, 18, 0)) is True
+
+    def test_any_trading_session_blocks_weekend_and_holiday(self, monkeypatch):
+        monkeypatch.setattr(
+            market,
+            "is_any_trading_session_open",
+            lambda now=None: market.market_phase(now) in market._ANY_TRADING_SESSION_PHASES,
+        )
+        # Sunday morning and Thanksgiving are not any trading market period.
+        assert market.is_any_trading_session_open(_ny(2026, 5, 17, 6, 21)) is False
+        assert market.is_any_trading_session_open(_ny(2026, 7, 19, 6, 21)) is False  # Sunday
+        assert market.is_any_trading_session_open(_ny(2026, 11, 26, 10, 0)) is False  # Thanksgiving
+
+
 class TestPriceCache:
     def setup_method(self):
         # The module-level cache leaks between tests; clear before each.
