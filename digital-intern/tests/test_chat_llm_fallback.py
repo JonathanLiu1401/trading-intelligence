@@ -3,37 +3,35 @@
 from dashboard import web_server
 
 
-def test_chat_model_candidates_include_both_backends_by_default(monkeypatch):
+def test_chat_model_candidates_default_to_grok(monkeypatch):
     monkeypatch.delenv("DIGITAL_INTERN_CHAT_MODELS", raising=False)
     monkeypatch.delenv("DIGITAL_INTERN_LLM_MODEL", raising=False)
 
     assert web_server._chat_model_candidates() == [
-        "gpt-5.5",
-        "claude-sonnet-4-6",
+        "grok-4.5",
     ]
 
 
 def test_chat_model_candidates_preserve_override_then_add_fallbacks(monkeypatch):
     monkeypatch.setenv(
         "DIGITAL_INTERN_CHAT_MODELS",
-        "claude-opus-4-7, gpt-5.5, claude-opus-4-7",
+        "grok-4.5, grok-4.20-multi-agent-0309, grok-4.5",
     )
 
     assert web_server._chat_model_candidates() == [
-        "claude-opus-4-7",
-        "gpt-5.5",
-        "claude-sonnet-4-6",
+        "grok-4.5",
+        "grok-4.20-multi-agent-0309",
     ]
 
 
-def test_call_chat_llm_falls_through_to_second_backend(monkeypatch):
+def test_call_chat_llm_uses_grok_backend(monkeypatch):
     calls = []
 
     def fake_call(prompt, model, timeout):
         calls.append((prompt, model, timeout))
-        if model == "gpt-5.5":
-            return None
-        return "answer"
+        if model == "grok-4.5":
+            return "answer"
+        return None
 
     monkeypatch.delenv("DIGITAL_INTERN_CHAT_MODELS", raising=False)
     monkeypatch.delenv("DIGITAL_INTERN_LLM_MODEL", raising=False)
@@ -42,11 +40,10 @@ def test_call_chat_llm_falls_through_to_second_backend(monkeypatch):
     text, model, failures = web_server._call_chat_llm("prompt", timeout=7)
 
     assert text == "answer"
-    assert model == "claude-sonnet-4-6"
-    assert failures == ["gpt-5.5"]
+    assert model == "grok-4.5"
+    assert failures == []
     assert calls == [
-        ("prompt", "gpt-5.5", 7),
-        ("prompt", "claude-sonnet-4-6", 7),
+        ("prompt", "grok-4.5", 7),
     ]
 
 
@@ -55,13 +52,12 @@ def test_unavailable_response_is_user_visible_not_error_json():
         "what is next?",
         [{"title": "NVDA launches new accelerator", "source": "Wire", "ai_score": 8.4}],
         "Equity $1000\nCash $500",
-        ["gpt-5.5", "claude-sonnet-4-6"],
+        ["grok-4.5"],
     )
 
     assert "LLM backends are unavailable" in response
     assert "NVDA launches new accelerator" in response
     assert "Paper trader snapshot" in response
-    assert "tries both Codex and Claude" in response
 
 
 def test_chat_deep_context_detection_only_for_bot_questions():

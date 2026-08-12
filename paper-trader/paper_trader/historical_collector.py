@@ -305,18 +305,16 @@ def _label_key(article: dict) -> str:
 
 
 def _label_batch(articles: list[dict]) -> list[tuple[float, int]]:
-    """Call Claude on a batch; return [(relevance, urgency), …] aligned with input."""
+    """Call Grok on a batch; return [(relevance, urgency), …] aligned with input."""
     lines = "\n".join(f"{i}: {a.get('title','')[:200]}"
                       for i, a in enumerate(articles))
     prompt = f"{_LABEL_SYSTEM}\n\n{lines}"
-    r = subprocess.run(
-        ["claude", "--model", "claude-sonnet-4-6", "--print",
-         "--permission-mode", "bypassPermissions"],
-        input=prompt, capture_output=True, text=True, timeout=60,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(f"claude rc={r.returncode}: {r.stderr.strip()[:200]}")
-    return _parse_labels(r.stdout, expected=len(articles))
+    # Primary: xAI Grok. Fallback: Cursor CLI Grok proxy (never Claude).
+    from .strategy import _claude_call, MODEL as _GROK_MODEL
+    raw = _claude_call(prompt, timeout_s=60, model=_GROK_MODEL)
+    if not raw:
+        raise RuntimeError("grok label call returned empty")
+    return _parse_labels(raw, expected=len(articles))
 
 
 def _parse_labels(raw: str, expected: int) -> list[tuple[float, int]]:

@@ -32,19 +32,64 @@ except Exception:  # pragma: no cover - stdlib-only module, import can't fail
     def host_saturated(*_a, **_k):
         return (False, "host_guard unavailable")
 
-MODEL = "gpt-5.5"
-FALLBACK_MODEL = "gpt-5.5"
+MODEL = os.environ.get("PAPER_TRADER_MODEL", "grok-4.5")
+FALLBACK_MODEL = os.environ.get("PAPER_TRADER_FALLBACK_MODEL", "grok-4.5")
 CODEX_AUTH_FALLBACK_MODEL = os.environ.get(
     "PAPER_TRADER_CODEX_AUTH_FALLBACK_MODEL",
-    "claude-sonnet-4-6",
+    "",
 )
-FALLBACK_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
-DECISION_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
-# Retry uses no timeout; Opus is given unlimited time to respond.
-RETRY_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
+# Grok HTTP path uses bounded timeouts; CLI paths still allow unlimited waits.
+FALLBACK_TIMEOUT_S = int(os.environ.get("PAPER_TRADER_FALLBACK_TIMEOUT_S", "180") or "180")
+DECISION_TIMEOUT_S = int(os.environ.get("PAPER_TRADER_DECISION_TIMEOUT_S", "180") or "180")
+# Retry uses the same bounded budget as the primary call.
+RETRY_TIMEOUT_S = int(os.environ.get("PAPER_TRADER_RETRY_TIMEOUT_S", "180") or "180")
 # Cap the raw-response excerpt we write back into decisions.reasoning. Long
 # enough to diagnose JSON / prose / truncation, short enough to keep the DB lean.
 RAW_CAPTURE_CHARS = 1000
+
+# OpenClaw / xAI login for direct Grok HTTP decisions. Prefer env overrides,
+# then the local OpenClaw auth-profiles store used by this Mac's main agent.
+XAI_API_BASE = os.environ.get("PAPER_TRADER_XAI_API_BASE", "https://api.x.ai/v1").rstrip("/")
+XAI_AUTH_PROFILES_PATH = Path(os.environ.get(
+    "PAPER_TRADER_XAI_AUTH_PROFILES",
+    str(Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"),
+))
+XAI_AUTH_PROFILE = os.environ.get(
+    "PAPER_TRADER_XAI_AUTH_PROFILE",
+    "xai:artintel1110@gmail.com",
+)
+# Cursor CLI OpenAI-compatible proxy (LaunchAgent com.cursor-agent-api).
+# Fallback ONLY when SuperGrok/xAI is rate-limited or credits are exhausted.
+# Still Grok 4.5 High, billed through Cursor — never Claude, never primary.
+CURSOR_API_BASE = os.environ.get(
+    "PAPER_TRADER_CURSOR_API_BASE", "http://127.0.0.1:4646/v1"
+).rstrip("/")
+CURSOR_MODEL = os.environ.get(
+    "PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.5-high"
+)
+CURSOR_FALLBACK = os.environ.get(
+    "PAPER_TRADER_CURSOR_FALLBACK", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# When the LLM path is unavailable, allow the qualified ML advisor to place
+# real BUY/SHORT entries instead of only logging HOLD.
+ML_DROUGHT_ALLOW_ENTRIES = os.environ.get(
+    "PAPER_TRADER_ML_DROUGHT_ALLOW_ENTRIES", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+ML_DROUGHT_BUY_CASH_PCT = float(os.environ.get(
+    "PAPER_TRADER_ML_DROUGHT_BUY_CASH_PCT", "0.15",
+))
+ML_DROUGHT_BUY_MAX_USD = float(os.environ.get(
+    "PAPER_TRADER_ML_DROUGHT_BUY_MAX_USD", "1500",
+))
+ML_DROUGHT_SHORT_CASH_PCT = float(os.environ.get(
+    "PAPER_TRADER_ML_DROUGHT_SHORT_CASH_PCT", "0.10",
+))
+ML_DROUGHT_SHORT_MAX_USD = float(os.environ.get(
+    "PAPER_TRADER_ML_DROUGHT_SHORT_MAX_USD", "1000",
+))
+ML_DROUGHT_MIN_CONFIDENCE = float(os.environ.get(
+    "PAPER_TRADER_ML_DROUGHT_MIN_CONFIDENCE", "0.35",
+))
 
 # Margin/leverage model for live paper stock BUYs. The book may spend current
 # cash plus 50% of net worth, with regular-stock leverage requested per trade
@@ -53,6 +98,16 @@ RAW_CAPTURE_CHARS = 1000
 STOCK_MARGIN_NET_WORTH_PCT = 0.50
 STOCK_BUY_MIN_LEVERAGE = 1.0
 STOCK_BUY_MAX_LEVERAGE = 20.0
+# Operator deployment target (Jonathan 2026-08-06): stay invested, use margin.
+# Cash should stay under 10% of net worth. Gross long exposure target is
+# 120%-150% of net worth (i.e. spend into the 1.5x BP sleeve). The engine
+# auto-boosts stock BUY leverage when the book is under-deployed so the
+# model cannot idle in cash without an explicit risk reason.
+MAX_IDLE_CASH_PCT = 0.10
+TARGET_GROSS_EXPOSURE_MIN = 1.20
+TARGET_GROSS_EXPOSURE_MAX = 1.50
+TARGET_GROSS_EXPOSURE_IDEAL = 1.35
+AUTO_LEVERAGE_WHEN_UNDERDEPLOYED = True
 
 # Hard operator discipline for the live paper book. These are deliberately
 # enforced in _execute(), not merely described to the model, because the live
@@ -61,22 +116,42 @@ TRADE_DISCIPLINE_MIN_BOOK_VALUE = float(os.environ.get(
     "PAPER_TRADER_DISCIPLINE_MIN_BOOK_VALUE", "5000",
 ))
 ENTRY_COOLDOWN_AFTER_EXIT_S = int(os.environ.get(
-    "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_EXIT_S", str(2 * 3600),
+    # Block same-name re-entry churn after a full/partial exit.
+    "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_EXIT_S", str(24 * 3600),
 ))
 ENTRY_COOLDOWN_AFTER_ANY_TRADE_S = int(os.environ.get(
-    "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_ANY_TRADE_S", str(30 * 60),
+    # Soft pause after any trade on the ticker (adds included).
+    "PAPER_TRADER_ENTRY_COOLDOWN_AFTER_ANY_TRADE_S", str(4 * 3600),
 ))
+# Default hold lock for discretionary exits. Jonathan 2026-08-07 mandate:
+# day-trader mode. 0 disables the multi-session office-worker lock so the
+# book can flatten ballast / rotate same day. Hard stops and thesis-kill still
+# work either way. Override via env if needed.
+# Permanent default 4h: blocks same-session panic flats (LITE 2026-08-10).
+# Override with PAPER_TRADER_MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S.
 MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S = int(os.environ.get(
-    "PAPER_TRADER_MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", str(72 * 3600),
+    "PAPER_TRADER_MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", str(4 * 3600),
 ))
+# Permanent anti-panic: do not sell/cover losers just because they are red.
+# Winners can still exit after min-hold. Underwater exits need hard stop,
+# real thesis-kill evidence, or long-option -50% premium kill.
+BLOCK_UNDERWATER_DISCRETIONARY_EXITS = os.environ.get(
+    "PAPER_TRADER_BLOCK_UNDERWATER_DISCRETIONARY_EXITS", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+UNDERWATER_EXIT_EPS = float(
+    os.environ.get("PAPER_TRADER_UNDERWATER_EXIT_EPS", "0.002")
+)  # 0.2% noise buffer vs avg_cost
+OPTION_PREMIUM_KILL_PCT = float(
+    os.environ.get("PAPER_TRADER_OPTION_PREMIUM_KILL_PCT", "0.50")
+)
 MAX_POST_TRADE_SINGLE_NAME_PCT = float(os.environ.get(
-    "PAPER_TRADER_MAX_POST_TRADE_SINGLE_NAME_PCT", "35",
+    "PAPER_TRADER_MAX_POST_TRADE_SINGLE_NAME_PCT", "70",
 ))
 MAX_POST_TRADE_SECTOR_PCT = float(os.environ.get(
-    "PAPER_TRADER_MAX_POST_TRADE_SECTOR_PCT", "45",
+    "PAPER_TRADER_MAX_POST_TRADE_SECTOR_PCT", "70",
 ))
 MAX_POST_TRADE_LEVERAGED_PCT = float(os.environ.get(
-    "PAPER_TRADER_MAX_POST_TRADE_LEVERAGED_PCT", "20",
+    "PAPER_TRADER_MAX_POST_TRADE_LEVERAGED_PCT", "70",
 ))
 
 # ML advisor gate — when the backtest ML model's median alpha consistently
@@ -128,6 +203,247 @@ def _llm_subprocess_env(use_codex: bool) -> dict[str, str]:
             str(Path.home() / ".codex"),
         )
     return env
+
+
+def _uses_xai_http(model: str | None = None) -> bool:
+    name = (model or MODEL or "").strip().lower()
+    return name.startswith("grok-") or name.startswith("xai/")
+
+
+# Failure-cause globals must be bound before any function uses `global` on them
+# (annotated assignment after a prior global use breaks py_compile).
+_quota_exhausted = False
+_last_claude_fail = None  # str | None; set by _claude_call failure paths
+
+def _normalize_model_name(model: str | None = None) -> str:
+    name = (model or MODEL or "").strip()
+    if name.startswith("xai/"):
+        return name.split("/", 1)[1]
+    return name
+
+
+def _load_xai_access_token() -> str | None:
+    """Resolve a bearer token for api.x.ai from env or OpenClaw auth profiles."""
+    for key in ("PAPER_TRADER_XAI_API_KEY", "XAI_API_KEY"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    try:
+        raw = json.loads(Path(XAI_AUTH_PROFILES_PATH).read_text())
+    except Exception as e:
+        print(f"[strategy] xAI auth profiles unreadable: {e}")
+        return None
+    profiles = raw.get("profiles") if isinstance(raw, dict) else None
+    if not isinstance(profiles, dict):
+        return None
+    preferred = [
+        XAI_AUTH_PROFILE,
+        "xai:default",
+        "xai",
+    ]
+    candidates = []
+    for key in preferred:
+        if key and key in profiles:
+            candidates.append((key, profiles[key]))
+    for key, value in profiles.items():
+        if str(key).startswith("xai:") or (
+            isinstance(value, dict) and str(value.get("provider", "")).lower() == "xai"
+        ):
+            if (key, value) not in candidates:
+                candidates.append((key, value))
+    now_ms = int(time.time() * 1000)
+    for key, value in candidates:
+        if not isinstance(value, dict):
+            continue
+        token = (
+            value.get("access")
+            or value.get("accessToken")
+            or value.get("apiKey")
+            or value.get("api_key")
+            or value.get("token")
+        )
+        if not token:
+            continue
+        expires = value.get("expires")
+        try:
+            exp_i = int(expires) if expires is not None else None
+        except (TypeError, ValueError):
+            exp_i = None
+        if exp_i is not None and exp_i < now_ms:
+            print(f"[strategy] xAI auth profile expired: {key}")
+            continue
+        return str(token)
+    return None
+
+
+def _cursor_fallback_enabled() -> bool:
+    return bool(CURSOR_FALLBACK)
+
+
+def _load_cursor_api_key() -> str | None:
+    """Optional client key for the local Cursor proxy."""
+    for key in ("PAPER_TRADER_CURSOR_API_KEY", "CURSOR_API_KEY"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    env_path = Path.home() / ".cursor-agent-api" / "env"
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export CURSOR_API_KEY="):
+                line = line[len("export ") :]
+            if line.startswith("CURSOR_API_KEY="):
+                return line.split("=", 1)[1].strip().strip("'").strip('"')
+    except Exception:
+        pass
+    return None
+
+
+def _openai_compatible_chat(
+    *,
+    base_url: str,
+    model_id: str,
+    prompt: str,
+    timeout_s: int | None,
+    token: str | None,
+    label: str,
+) -> str | None:
+    """Shared chat/completions helper for xAI primary and Cursor fallback."""
+    global _last_claude_fail
+    payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are the paper trader decision engine. "
+                    "Return only one JSON object. No markdown fences."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "PaperTrader-LLM/1.0",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = json.dumps(payload).encode("utf-8")
+    req = __import__("urllib.request", fromlist=["Request"]).Request(
+        f"{base_url}/chat/completions",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    timeout = timeout_s if timeout_s is not None else DECISION_TIMEOUT_S
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        choices = data.get("choices") or []
+        if not choices:
+            _last_claude_fail = "empty_stdout"
+            return None
+        message = choices[0].get("message") or {}
+        text = (message.get("content") or "").strip()
+        if not text:
+            _last_claude_fail = "empty_stdout"
+            return None
+        return text
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        print(f"[strategy] {label} HTTP err (rc={e.code}): {(err_body or str(e))[:300]}")
+        e._paper_trader_body = err_body  # type: ignore[attr-defined]
+        raise
+    except Exception as e:
+        msg = str(e).lower()
+        if "timed out" in msg or "timeout" in msg:
+            print(f"[strategy] {label} HTTP timeout after {timeout}s")
+            _last_claude_fail = "timeout"
+        else:
+            print(f"[strategy] {label} HTTP exception: {e}")
+            _last_claude_fail = "exception"
+        raise
+
+
+def _xai_http_call(prompt: str, timeout_s: int | None, model: str) -> str | None:
+    """Call Grok over the OpenAI-compatible xAI HTTP API using OpenClaw login."""
+    global _last_claude_fail, _quota_exhausted
+    token = _load_xai_access_token()
+    if not token:
+        print("[strategy] xAI auth missing; cannot call Grok HTTP API")
+        _last_claude_fail = "cli_missing"
+        return None
+    model_id = _normalize_model_name(model)
+    try:
+        return _openai_compatible_chat(
+            base_url=XAI_API_BASE,
+            model_id=model_id,
+            prompt=prompt,
+            timeout_s=timeout_s,
+            token=token,
+            label="xAI",
+        )
+    except Exception as e:
+        import urllib.error
+
+        if isinstance(e, urllib.error.HTTPError):
+            err_body = getattr(e, "_paper_trader_body", "") or ""
+            if not err_body:
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    err_body = ""
+            combined = f"{e} {err_body}".lower()
+            if any(s in combined for s in ("401", "unauthorized", "authentication", "invalid api key")):
+                _last_claude_fail = "nonzero_rc"
+            elif any(
+                s in combined
+                for s in ("429", "quota", "rate limit", "usage limit", "credit")
+            ):
+                _quota_exhausted = True
+            else:
+                _last_claude_fail = "nonzero_rc"
+        return None
+
+
+def _cursor_http_call(prompt: str, timeout_s: int | None) -> str | None:
+    """Call Grok via local Cursor CLI proxy — SuperGrok backup only."""
+    global _last_claude_fail
+    if not _cursor_fallback_enabled():
+        return None
+    model_id = (CURSOR_MODEL or "cursor-grok-4.5-high").strip()
+    try:
+        text = _openai_compatible_chat(
+            base_url=CURSOR_API_BASE,
+            model_id=model_id,
+            prompt=prompt,
+            timeout_s=timeout_s,
+            token=_load_cursor_api_key(),
+            label="Cursor",
+        )
+        if text:
+            print(f"[strategy] Cursor Grok fallback OK (model={model_id})")
+            _last_claude_fail = None
+        return text
+    except Exception:
+        return None
 
 # Tracks the most recent LLM subprocess so a new _claude_call can kill a
 # lingering one from a prior cycle. Overlapping calls compete for the same API
@@ -221,27 +537,6 @@ def claude_call_state() -> dict:
 # at the top of every cycle and surfaces it as summary["quota_exhausted"] so
 # runner._cycle can fire ONE Discord alarm per outage. _claude_call is called
 # only from decide(), so a single module global is race-free here.
-_quota_exhausted = False
-
-# Set by _claude_call on EVERY failure path with a short, specific cause code
-# (None on success). decide() reads this when raw is None to write a more
-# diagnostic reason into decisions.reasoning. Five buckets are emitted today,
-# all collapsing into the previous one-size-fits-all "claude returned no
-# response (timeout/empty)" line:
-#   * "timeout"      — subprocess.TimeoutExpired (full DECISION_TIMEOUT_S hit;
-#                      Opus / network / CLI wedged on the wire)
-#   * "nonzero_rc"   — proc.returncode != 0 with no quota marker (CLI crashed
-#                      or hit a transient API error; quota gets its own path)
-#   * "empty_stdout" — rc=0 but stdout was empty (CLI completed without
-#                      producing text — model-level empty response, distinct
-#                      from a timeout; usually a one-cycle blip)
-#   * "cli_missing"  — `claude` not in PATH at call time
-#   * "exception"    — Popen/communicate raised
-# Reset to None at the TOP of every _claude_call (not just on success) so a
-# success after a failure cannot leak the stale code into the next cycle.
-# Per-call, never sticky — distinct from _quota_exhausted (sticky-by-design).
-# The new no_decision_reasons sub-buckets key off the suffix in parentheses.
-_last_claude_fail: str | None = None
 
 # Tight marker set — matched case-insensitively against the claude CLI's
 # stdout/stderr ONLY on a non-zero exit. Kept precise so an unrelated failure
@@ -350,17 +645,62 @@ _TP_PCT_LEVERAGED = 0.25
 SYSTEM_PROMPT = """You are managing a paper trading portfolio. Use the live
 portfolio value, cash balance, positions, and buying-power fields in CONTEXT as
 the source of truth for account size.
+STANDING OPERATOR MANDATE (Jonathan 2026-08-07) — HARD:
+- You are a DAY TRADER using real multi-source knowledge + leverage, not a
+  passive office-worker portfolio manager buying boring ballast.
+- Active goal: climb equity back to $10,000 (~+$640 from the hole), then stop
+  pressing. Prefer defined-risk options (debit spreads / high-conviction
+  calls-puts on NVDA/QQQ first) over adding more cash-bleed shares.
+- First clean up dead weight: flatten CAT; treat AMZN as a trade not a career;
+  free BP before new option debits. Do not buy CAT/AMZN/etc just because gross
+  exposure is under 120% or a construction sleeve is underweight.
+- Construction targets and "stay invested" pressure are SECONDARY to catalyst +
+  tape. No catalyst today = HOLD, not nibble TQQQ/shares to look busy.
+- If LLM/ML drought: HOLD or hard-exit only. Drought-fallback share dribbles
+  are banned as a personality.
+- Options risk budget while climbing to $10k: about $800-$1000 premium at risk.
+  Kill long premium only at about -50% debit or REAL thesis-kill evidence (not
+  vibes). Active trading on winners is fine; losers are held through normal noise.
+  Engine permanently blocks underwater panic sells.
+If OPERATOR STANDING ORDERS appear in CONTEXT, they outrank generic
+construction/deployment nagging when the two conflict.
 Your ONLY goal is maximum profit after churn, concentration, and avoidable
 drawdown. You have autonomy over timing, thesis, and sizing inside the hard
 operator discipline enforced by the engine: no repeated same-ticker entry churn,
 no oversized single-name or sector pile-on, and no oversized leveraged ETF bet.
 You can:
+- Trade like a day trader on ENTRIES and WINNERS. Do NOT panic-sell losers just
+  because the candle is red. Engine blocks underwater discretionary exits unless
+  hard stop, real thesis-kill evidence, or option premium -50% kill. If thesis is
+  intact, HOLD and wait for recovery. Flatten ballast / take winners freely
+- ISSUER MAP IS MANDATORY: never buy a ticker because a headline keyword matches
+  the symbol letters. `TV` is Grupo Televisa, not "television" / FCC local-TV
+  policy. `OPEN` is Opendoor, not "open source" / OpenAI. For short/ambiguous
+  tickers, name the real issuer in reasoning or the engine will BLOCK the entry
+- Read DURABLE TRADE MEMORY every cycle before acting. Remember your own recent
+  orders and lessons. Do not amnesia-rebuy/resell the same ticker without new
+  evidence that explicitly overrides the prior memory
 - Concentrate when evidence is exceptional, but only within the hard engine caps
 - Short priceable stocks when the ArticleNet/news evidence is bearish, even if
   the portfolio does not already own them
-- Hold options through expiry if you believe in the thesis
-- Keep cash when the available trades would only recycle a stale idea
-- Let losers run only when the thesis is still intact and risk is diversified
+- Hold options through expiry if you believe in the thesis, or sell them early
+  when the move is in / thesis is done / theta or IV crush is the bigger risk
+- Idle cash is a failure mode. Keep cash under 10% of net worth unless every
+  actionable idea is blocked by hard engine gates (issuer map, cooldown,
+  concentration, no price). Prefer deploying into differentiated high-conviction
+  names over parking cash
+- Target 120%-150% gross long exposure vs net worth by using stock buying power
+  (cash + 50% net-worth margin) and explicit stock leverage. Ideal ~135%. Do not
+  sit at 0-1x if BP and thesis support more
+- Use leverage smartly: prefer requested leverage 1.2x-3x on high-conviction
+  liquid mega-caps when under-deployed; use 2-3x leveraged ETFs only as bounded
+  sleeves for index/sector thrust, not as a cash-parking substitute
+- Only stay heavy cash when the tape has no valid differentiated idea AND risk
+  gates block every alternative — explain that explicitly in reasoning
+- HARD RULE (Jonathan 2026-08-10, permanent): do not buy high and sell low.
+  If a position goes red, HOLD and wait for it to go back up unless hard stop /
+  real thesis-kill evidence / option -50% kill. No "largest drag", "weakening",
+  or same-session panic flats on losers
 - Take leveraged ETF positions (MUU, LNOK, etc.) only as bounded sleeves
 
 LEVERAGE INSTRUMENTS AVAILABLE:
@@ -369,19 +709,50 @@ LEVERAGE INSTRUMENTS AVAILABLE:
 - Leveraged Bear/Hedge: SQQQ/SPXS (3x short index), SOXS (3x short semis), TECS (3x short tech), FNGD (3x short FANGs), SNK (2x short SpaceX/SPCX)
 - For high-conviction directional trades, consider 2-3x leveraged ETFs instead of the underlying
 - For options-equivalent exposure: buy deep ITM LEAPS calls (delta >0.80) to simulate leveraged long
+- OPTIONS ARE FIRST-CLASS INSTRUMENTS (same autonomy as stocks):
+  * Read OPTIONS DESK in CONTEXT before choosing shares vs options.
+  * Prefer BUY_CALL / BUY_PUT when conviction is high and defined premium risk
+    is a better expression than full share notional (LEAPS proxy, swing call/put,
+    event debit). Prefer shares when you need no expiry, SHORT borrow, or the chain
+    is illiquid.
+  * Always send strike + expiry (YYYY-MM-DD) on option actions.
+  * Contract multiplier is 100: premium cost = mid * qty * 100.
+  * Long option premium (BUY_CALL/BUY_PUT opens, buy-to-cover, debit verticals)
+    uses the same buying power as stocks: cash + 50% net worth (1.5x when all cash).
+    Cash may go negative within that BP limit.
+  * SELL_CALL: close long calls OR open covered call if long >=100 sh/ct.
+  * SELL_PUT: close long puts OR open cash-secured put (cash covers strike*100-premium).
+  * BUY_CALL/BUY_PUT against short option lots = buy-to-cover.
+  * Verticals: BUY_CALL_SPREAD / BUY_PUT_SPREAD / SELL_CALL_SPREAD / SELL_PUT_SPREAD
+    with long_strike+short_strike (or strike+width) + expiry + qty.
+  * Naked short calls blocked; use covered calls or call credit spreads.
+  * Size premium budget against buying power explicitly in reasoning; do not ignore DTE/theta.
+  * Use chain snapshots (IV, mid, delta proxy, cost/contract) when present.
+Advanced option fields:
+- Vertical spreads require ticker, qty, expiry, and either long_strike+short_strike or strike+width or legs:[{action,strike}x2].
+- Covered call: SELL_CALL with strike+expiry while long stock covers contracts*100 shares.
+- Cash-secured put: SELL_PUT with strike+expiry; cash must cover strike*100*qty - premium (CSP stays cash-secured; long premium may use margin BP).
+- Short option qty is stored negative; BUY_* on that strike/expiry covers/closes short.
 - Risk: leveraged ETFs decay in sideways markets; best for strong trending moves only
 
 POSITION SIZING GUIDANCE:
-- High conviction (RSI+MACD+MA all aligned): up to 25-35% portfolio
-- Medium conviction (2/3 signals aligned): 10-20%
-- Low conviction / leveraged ETF: max 5-10%
+- High conviction (RSI+MACD+MA all aligned): up to 50-70% portfolio, use leverage
+  so the book moves toward 120%-150% gross exposure
+- Medium conviction (2/3 signals aligned): 15-35%, still prefer deploying idle cash
+  rather than leaving >10% cash
+- Low conviction / leveraged ETF: size within the same hard caps (max 70%)
 - Do not rebuy a ticker right after selling it unless a genuinely new catalyst appears
 - Never go 100% into one ticker or leveraged ETF
+- If CONTEXT shows cash_pct > 10% or gross_exposure < 120%, deploy only into a
+  fresh high-conviction catalyst/options expression — or HOLD with an explicit
+  reason. Do not fill the hole with boring ballast / construction underweights.
+  Do not "wait and see" with a fat cash pile when a real idea exists either
 
 THINK LIKE A HEDGE FUND MANAGER WHO WANTS ASYMMETRIC RETURNS.
 Small, safe trades will not outperform. Recycled, correlated trades will not
 outperform either. Take calculated risks across differentiated ideas.
-High conviction = large size. Low conviction = stay cash.
+High conviction = large size + smart leverage. Low conviction = small size, not
+all-cash paralysis.
 
 ACTIVE RESEARCH REQUIREMENT:
 - Before every BUY, SELL, SHORT, COVER, option trade, or REBALANCE, first read
@@ -407,17 +778,22 @@ automatically covered when price rises 5% above entry (10% for leveraged ETFs).
 The 15% / 25% take-profit level is advisory context only: when a position reaches
 that level, decide dynamically from the stock's thesis, momentum, news, and prior
 trade history whether to hold, trim, cover, or sell. Do not dump winners just
-because a static take-profit marker was hit.
+because a static take-profit marker was hit. Discretionary same-day exits are
+gated by the minimum-hold lock unless a hard stop or explicit thesis-kill reason
+is present. Same-ticker re-entry after an exit is cooldown-gated.
 
 Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 
 {
-  "action": "BUY" | "SELL" | "SHORT" | "COVER" | "BUY_CALL" | "BUY_PUT" | "SELL_CALL" | "SELL_PUT" | "HOLD" | "REBALANCE",
+  "action": "BUY" | "SELL" | "SHORT" | "COVER" | "BUY_CALL" | "BUY_PUT" | "SELL_CALL" | "SELL_PUT" | "BUY_CALL_SPREAD" | "BUY_PUT_SPREAD" | "SELL_CALL_SPREAD" | "SELL_PUT_SPREAD" | "HOLD" | "REBALANCE",
   "ticker": "NVDA",
   "qty": 0.5,
   "leverage": 1,               // optional for BUY stock only, 1-20x; effective exposure = qty * leverage
-  "strike": 900,             // only for option actions
-  "expiry": "2026-05-30",    // only for option actions, YYYY-MM-DD
+  "strike": 900,             // option single-leg OR spread base strike
+  "expiry": "2026-05-30",    // option actions, YYYY-MM-DD
+  "long_strike": 180,        // vertical spreads
+  "short_strike": 190,       // vertical spreads
+  "width": 10,               // alt to long/short_strike for verticals
   "confidence": 0.85,
   "reasoning": "1-3 sentences why"
 }
@@ -426,12 +802,17 @@ Return JSON with your decision. No limits on qty, strike, or cash used.
 For BUY on regular stocks, you may set "leverage" from 1x to 20x. The paper
 trader applies the leverage to stock exposure only: qty=2, leverage=5 buys
 10 effective shares. Buying power includes cash plus 50% margin on current
-portfolio net worth.
+portfolio net worth (max ~1.5x when fully used). Prefer leverage >=1.2x when
+cash is above 10% or gross exposure is below 120%, unless concentration or
+issuer gates block it. The engine may auto-boost under-deployed tiny stock BUYs
+toward the 120%-150% target within remaining buying power and hard caps.
 For SHORT, qty is the positive share count to sell short; it opens or adds to
 a short stock position and uses the same stock buying-power field as BUY.
 For SELL, ticker must match an open long stock position. For COVER, ticker
-must match an open short stock position. For SELL_CALL/SELL_PUT, ticker must
-match an open option position (and strike/expiry for options).
+must match an open short stock position. For SELL_CALL/SELL_PUT: closes a matching long option if present; otherwise opens a
+covered call (requires long stock) or cash-secured put (requires cash collateral).
+For BUY_CALL/BUY_PUT against a short option lot: buy-to-cover. Vertical spread actions
+open both legs atomically (long + short) with defined risk.
 Do not express a fresh bearish thesis as SELL unless there is an open long;
 use SHORT for a priceable stock or a leveraged bear ETF for index/sector theses.
 Do not short private, unquoted, or unmapped names.
@@ -871,6 +1252,37 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
     # Reset per-call so a success after a failure cannot leak the stale code
     # into the next cycle's diagnostic reason text.
     _last_claude_fail = None
+    # HARD RULE 2026-08-04: Claude/Anthropic spend forbidden unless explicitly re-enabled.
+    _m = (model or MODEL or "").strip().lower()
+    if (
+        _m.startswith("claude")
+        or _m.startswith("anthropic/")
+        or "sonnet" in _m
+        or "opus" in _m
+        or "haiku" in _m
+        or (not _uses_xai_http(model) and not _m.startswith("gpt-"))
+    ):
+        if not _uses_xai_http(model) and not _m.startswith("gpt-"):
+            print(
+                f"[strategy] BLOCKED Claude/non-Grok model={model!r}; "
+                "forcing grok-4.5 (Claude spend disabled 2026-08-04)"
+            )
+            model = "grok-4.5"
+    if _uses_xai_http(model):
+        # Primary: xAI SuperGrok. Fallback: Cursor CLI Grok (same model family).
+        result = None
+        if not _quota_exhausted:
+            result = _xai_http_call(prompt, timeout_s=timeout_s, model=model)
+            if result:
+                return result
+        elif _cursor_fallback_enabled():
+            print(
+                "[strategy] xAI quota flag set; trying Cursor Grok fallback "
+                f"(model={CURSOR_MODEL})"
+            )
+        if _cursor_fallback_enabled():
+            return _cursor_http_call(prompt, timeout_s=timeout_s)
+        return None
     use_codex = model.startswith("gpt-")
     cli = "codex" if use_codex else "claude"
     cli_bin = _cli_path(cli)
@@ -1339,6 +1751,14 @@ def _research_discovery(
             tk = str(raw or "").upper().strip()
             if not tk or tk in watch:
                 continue
+            # Belt-and-suspenders: never promote article false-positives into
+            # the priced research universe (GAAP/CNBC/LLC etc.).
+            try:
+                from paper_trader.signals import _NOT_TICKERS as _junk
+                if tk in _junk:
+                    continue
+            except Exception:
+                pass
             row = heat.setdefault(tk, {
                 "ticker": tk,
                 "heat": 0.0,
@@ -1464,6 +1884,7 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    quant_signals: dict[str, dict] | None = None,
                    self_review_block: str | None = None,
                    track_record_block: str | None = None,
+                   durable_memory_block: str | None = None,
                    repeat_loser_block: str | None = None,
                    thesis_drift_block: str | None = None,
                    risk_mirror_block: str | None = None,
@@ -1475,7 +1896,8 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    buying_power_block: str | None = None,
                    exit_proximity_block: str | None = None,
                    research_discovery_block: str | None = None,
-                   active_research_block: str | None = None) -> str:
+                   active_research_block: str | None = None,
+                   options_desk_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     # Granular trading-day phase (see market.market_phase). The header
     # historically carried only the binary MARKET_OPEN — but a decision at
@@ -1507,8 +1929,9 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
         age = _hold_age_str(p.get("opened_at"))
         age_token = f" held={age}" if age else ""
         if p["type"] in ("call", "put"):
+            side = "SHORT " if float(p.get("qty") or 0) < 0 else ""
             pos_lines.append(
-                f"  {p['ticker']} {p['type'].upper()} {p['strike']} {p['expiry']}: "
+                f"  {side}{p['ticker']} {p['type'].upper()} {p['strike']} {p['expiry']}: "
                 f"qty={p['qty']} avg={p['avg_cost']:.2f} mark={p['current_price']:.2f} "
                 f"P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%){age_token}{stale_suffix}"
             )
@@ -1565,6 +1988,11 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # aggregate mirror so the trader sees its concrete history on the exact
     # names in play before market data biases it.
     track_section = f"{track_record_block}\n" if track_record_block else ""
+    # Durable order/lesson memory so the model cannot amnesia-trade.
+    # Observational only (invariants #2/#12).
+    durable_memory_section = (
+        f"{durable_memory_block}\n" if durable_memory_block else ""
+    )
     # Per-name losing-streak watch — same observational/advisory contract as
     # track_record (invariants #2/#12). Placed immediately after the per-name
     # closed-trade memory because it is the same dimension (per-name history)
@@ -1659,6 +2087,12 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     active_research_section = (
         f"{active_research_block}\n" if active_research_block else ""
     )
+    # Options desk — chain snapshots + strategy skills + open-option facts.
+    # Observational only (AGENTS.md #2/#12). Placed with the other advisory
+    # mirrors so Opus can choose options vs shares with real chain context.
+    options_desk_section = (
+        f"{options_desk_block}\n" if options_desk_block else ""
+    )
 
     # Watchlist MACD breadth — one-line market-structure roll-up derived
     # from the same quant_signals the per-name TECHNICAL block renders.
@@ -1686,12 +2120,12 @@ MARKET_OPEN: {market_open}
 PORTFOLIO:
   cash: ${snapshot['cash']:.2f}
   margin available (50% net worth): ${snapshot.get('margin_available', 0.0):.2f}
-  stock buying power: ${snapshot.get('stock_buying_power', snapshot['cash']):.2f}
+  buying power (stocks + long option premium): ${snapshot.get('stock_buying_power', snapshot['cash']):.2f}
   open positions value: ${snapshot['open_value']:.2f}
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{construction_section}{event_section}{macro_section}{bp_section}{exit_proximity_section}
+{review_section}{track_section}{durable_memory_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{construction_section}{event_section}{macro_section}{bp_section}{exit_proximity_section}{options_desk_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1889,17 +2323,131 @@ def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
             return False, f"cover qty {qty} exceeds held short {held_short} for {ticker} stock"
 
     if action in ("SELL_CALL", "SELL_PUT"):
-        opt_type = "call" if action == "SELL_CALL" else "put" if action == "SELL_PUT" else "stock"
-        matches = [
-            p for p in snapshot["positions"]
-            if p["ticker"] == ticker and p["type"] == opt_type
-        ]
-        if not matches:
-            return False, f"no open {opt_type} position in {ticker} to close"
-        held = sum(p["qty"] for p in matches)
-        if qty > held + 1e-6:
-            return False, f"sell qty {qty} exceeds held {held} for {ticker} {opt_type}"
+        try:
+            from .analytics.options_structures import classify_sell_option
+            cls = classify_sell_option(decision, snapshot)
+        except Exception as e:
+            return False, f"option sell classify failed: {e}"
+        if cls.get("mode") == "blocked":
+            return False, cls.get("reason") or "option sell blocked"
+        if cls.get("mode") == "close_long":
+            match = cls.get("match") or {}
+            held = float(match.get("qty") or 0.0)
+            if qty > held + 1e-6:
+                return False, (
+                    f"sell qty {qty} exceeds held {held} for {ticker} "
+                    f"{cls.get('otype')} {match.get('strike')} {match.get('expiry')}"
+                )
+        return True, ""
+
+    if action in ("BUY_CALL", "BUY_PUT"):
+        try:
+            from .analytics.options_structures import classify_buy_option
+            cls = classify_buy_option(decision, snapshot)
+        except Exception as e:
+            return False, f"option buy classify failed: {e}"
+        if cls.get("mode") == "blocked":
+            return False, cls.get("reason") or "option buy blocked"
+        if cls.get("mode") == "close_short":
+            held = float(cls.get("held_short") or 0.0)
+            if qty > held + 1e-6:
+                return False, f"buy-to-cover qty {qty} exceeds short {held}"
+        return True, ""
+
+    if action in (
+        "BUY_CALL_SPREAD", "BUY_PUT_SPREAD", "SELL_CALL_SPREAD", "SELL_PUT_SPREAD",
+    ):
+        try:
+            from .analytics.options_structures import parse_vertical_spread, price_vertical_spread
+            from . import market as _m
+            spec = parse_vertical_spread(decision)
+            if not spec.get("ok"):
+                return False, spec.get("reason") or "invalid spread"
+            priced = price_vertical_spread(_m, spec)
+            if not priced.get("ok"):
+                return False, priced.get("reason") or "spread unpriceable"
+            cash = float(snapshot.get("cash") or 0.0)
+            buying_power = _margin_buying_power(snapshot)
+            if priced.get("is_debit"):
+                need = abs(float(priced.get("cash_delta") or 0.0))
+                if buying_power + 1e-6 < need:
+                    return False, (
+                        f"insufficient cash/buying power for debit spread "
+                        f"(available ${buying_power:.2f}, need ${need:.2f})"
+                    )
+            else:
+                max_loss = float(priced.get("max_loss") or 0.0)
+                credit = float(priced.get("cash_delta") or 0.0)
+                if buying_power + credit + 1e-6 < max_loss:
+                    return False, (
+                        f"insufficient cash/buying power buffer for credit spread max loss "
+                        f"(bp ${buying_power:.2f} + credit ${credit:.2f} < max_loss ${max_loss:.2f})"
+                    )
+        except Exception as e:
+            return False, f"spread pretrade failed: {e}"
+        return True, ""
+
     return True, ""
+
+
+
+def _gross_long_exposure_usd(snapshot: dict) -> float:
+    """Sum of long stock/option market values (shorts net against cash separately)."""
+    total = 0.0
+    for p in (snapshot.get("positions") or []):
+        try:
+            qty = float(p.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        mv = p.get("market_value")
+        try:
+            if mv is not None:
+                total += max(0.0, float(mv))
+                continue
+        except (TypeError, ValueError):
+            pass
+        mult = 100.0 if p.get("type") in ("call", "put") else 1.0
+        try:
+            px = float(p.get("current_price") or p.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        total += max(0.0, px * qty * mult)
+    return total
+
+
+def _deployment_metrics(snapshot: dict) -> dict:
+    """Cash% and gross long exposure multiple vs net worth."""
+    try:
+        cash = float(snapshot.get("cash") or 0.0)
+    except (TypeError, ValueError):
+        cash = 0.0
+    try:
+        total = float(snapshot.get("total_value") or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    gross = _gross_long_exposure_usd(snapshot)
+    cash_pct = (cash / total) if total > 1e-9 else (1.0 if cash > 0 else 0.0)
+    gross_x = (gross / total) if total > 1e-9 else 0.0
+    underdeployed = (
+        total > 1e-9 and (
+            cash_pct > MAX_IDLE_CASH_PCT + 1e-9
+            or gross_x + 1e-9 < TARGET_GROSS_EXPOSURE_MIN
+        )
+    )
+    return {
+        "cash": cash,
+        "total_value": total,
+        "gross_long_usd": gross,
+        "cash_pct": cash_pct,
+        "gross_exposure_x": gross_x,
+        "underdeployed": underdeployed,
+        "target_min_x": TARGET_GROSS_EXPOSURE_MIN,
+        "target_max_x": TARGET_GROSS_EXPOSURE_MAX,
+        "target_ideal_x": TARGET_GROSS_EXPOSURE_IDEAL,
+        "max_idle_cash_pct": MAX_IDLE_CASH_PCT,
+    }
 
 
 def _stock_buy_leverage(decision: dict) -> float:
@@ -1914,8 +2462,114 @@ def _stock_buy_leverage(decision: dict) -> float:
     return max(STOCK_BUY_MIN_LEVERAGE, min(STOCK_BUY_MAX_LEVERAGE, lev))
 
 
+def _auto_boost_stock_buy_leverage(
+    *,
+    decision: dict,
+    snapshot: dict,
+    price: float,
+    qty: float,
+    requested_leverage: float,
+) -> tuple[float, str]:
+    """If the book is under-deployed, raise stock BUY leverage toward 120-150%.
+
+    Smart bounds:
+    - only regular stocks (not leveraged ETF tickers)
+    - respect remaining stock buying power
+    - respect single-name 70% hard cap on post-trade market value
+    - do not lower an already-higher requested leverage
+    - clamp to STOCK_BUY_MAX_LEVERAGE
+    Returns (leverage, note). Note empty when no boost applied.
+    """
+    if not AUTO_LEVERAGE_WHEN_UNDERDEPLOYED:
+        return requested_leverage, ""
+    ticker = (decision.get("ticker") or "").upper()
+    if not ticker or ticker in _LEVERAGED_ETFS_SL:
+        return requested_leverage, ""
+    if price <= 0 or qty <= 0:
+        return requested_leverage, ""
+    metrics = _deployment_metrics(snapshot)
+    if not metrics["underdeployed"]:
+        return requested_leverage, ""
+
+    total = metrics["total_value"]
+    if total <= 1e-9:
+        return requested_leverage, ""
+
+    requested_notional = price * qty * requested_leverage
+    # Only juice tiny/token buys. If the model already sized a meaningful
+    # sleeve (>=15% of book or >=50% of the ideal deploy gap), respect it.
+    buying_power = _stock_buying_power(snapshot)
+    gap_to_ideal = max(
+        0.0,
+        TARGET_GROSS_EXPOSURE_IDEAL * total - metrics["gross_long_usd"],
+    )
+    gap_to_max = max(
+        0.0,
+        TARGET_GROSS_EXPOSURE_MAX * total - metrics["gross_long_usd"],
+    )
+    if requested_notional + 1e-9 >= 0.15 * total:
+        return requested_leverage, ""
+    meaningful_gap = gap_to_ideal if gap_to_ideal > 0 else gap_to_max
+    if meaningful_gap > 0 and requested_notional + 1e-9 >= 0.50 * meaningful_gap:
+        return requested_leverage, ""
+
+    target_add = min(
+        gap_to_ideal if gap_to_ideal > 0 else gap_to_max,
+        gap_to_max,
+        buying_power,
+    )
+    if target_add <= requested_notional + 1e-6:
+        min_add = min(
+            buying_power,
+            max(0.0, (metrics["cash"] - MAX_IDLE_CASH_PCT * total)),
+        )
+        if min_add <= requested_notional + 1e-6:
+            return requested_leverage, ""
+        target_add = min_add
+
+    existing_mv = 0.0
+    for p in (snapshot.get("positions") or []):
+        if (p.get("ticker") or "").upper() != ticker:
+            continue
+        if str(p.get("type") or "stock") != "stock":
+            continue
+        try:
+            q = float(p.get("qty") or 0.0)
+            px = float(p.get("current_price") or p.get("avg_cost") or price)
+            existing_mv += max(0.0, q * px)
+        except (TypeError, ValueError):
+            continue
+    max_name_mv = 0.70 * total
+    name_room = max(0.0, max_name_mv - existing_mv)
+    target_add = min(target_add, name_room, buying_power)
+    if target_add <= price * qty + 1e-6:
+        return requested_leverage, ""
+
+    raw_lev = target_add / (price * qty)
+    floor = 1.5 if metrics["cash_pct"] > MAX_IDLE_CASH_PCT else requested_leverage
+    boosted = max(requested_leverage, floor, raw_lev)
+    boosted = max(STOCK_BUY_MIN_LEVERAGE, min(STOCK_BUY_MAX_LEVERAGE, boosted))
+    max_lev_bp = buying_power / (price * qty) if price * qty > 0 else requested_leverage
+    max_lev_name = name_room / (price * qty) if price * qty > 0 else requested_leverage
+    boosted = min(boosted, max_lev_bp, max_lev_name)
+    boosted = max(STOCK_BUY_MIN_LEVERAGE, min(STOCK_BUY_MAX_LEVERAGE, boosted))
+    if boosted <= requested_leverage + 1e-9:
+        return requested_leverage, ""
+    note = (
+        f"auto_leverage {requested_leverage:g}x→{boosted:g}x "
+        f"(cash={metrics['cash_pct']*100:.1f}% gross={metrics['gross_exposure_x']:.2f}x "
+        f"target={TARGET_GROSS_EXPOSURE_MIN:.2f}-{TARGET_GROSS_EXPOSURE_MAX:.2f}x)"
+    )
+    return boosted, note
+
+
 def _stock_buying_power(snapshot: dict) -> float:
-    """Cash plus 50% margin on current net worth for regular-stock BUYs."""
+    """Cash plus 50% margin on current net worth.
+
+    Used for regular-stock BUY/SHORT and long option premium (BUY_CALL/BUY_PUT
+    opens, buy-to-cover shorts, and debit verticals). Same 1.5x-at-all-cash
+    economics: BP = cash + 0.50 * net_worth.
+    """
     if "stock_buying_power" in snapshot:
         try:
             return float(snapshot["stock_buying_power"])
@@ -1924,6 +2578,16 @@ def _stock_buying_power(snapshot: dict) -> float:
     cash = float(snapshot.get("cash") or 0.0)
     total = float(snapshot.get("total_value") or 0.0)
     return cash + max(0.0, total) * STOCK_MARGIN_NET_WORTH_PCT
+
+
+def _margin_buying_power(snapshot: dict) -> float:
+    """Alias for the shared cash+50% net-worth buying power."""
+    return _stock_buying_power(snapshot)
+
+
+def _margin_available(snapshot: dict) -> float:
+    total = float(snapshot.get("total_value") or 0.0)
+    return max(0.0, total) * STOCK_MARGIN_NET_WORTH_PCT
 
 
 def _parse_trade_ts(value: str | None) -> datetime | None:
@@ -2067,16 +2731,378 @@ def _trade_discipline_guard(
     return True, ""
 
 
+# Ambiguous / keyword-collision tickers that historically produced dumb
+# catalyst→symbol maps (e.g. FCC "local TV" story → Grupo Televisa `TV`).
+_AMBIGUOUS_ENTRY_TICKERS = frozenset({
+    "TV", "AI", "DD", "OPEN", "CASH", "REAL", "LIFE", "GOOD", "SOUL", "DATA",
+    "NEXT", "PLAY", "MOVE", "BEST", "CARE", "FOOD", "LAND", "FUND", "GOLD",
+    "TECH", "NEWS", "GAME", "APP", "NET", "BOX", "RUN", "FAST", "SAFE", "TRUE",
+    "FREE", "HOME", "WORK", "TIME", "WAVE", "BIRD", "BEAM", "CUBE", "LEAF",
+    "MOON", "SNOW", "FIRE", "WIND", "ROCK", "SHIP", "STAR", "SUN", "SKY", "BIG",
+    "YOU", "LOVE", "HOPE", "IDEA", "GROW", "UNIT", "SPOT", "BILL", "TEAM",
+})
+
+# Issuer phrases that must appear in the entry reasoning for selected tickers.
+# Keep these multi-token / distinctive so plain English words do not "count".
+_ISSUER_REQUIRED_ALIASES: dict[str, tuple[str, ...]] = {
+    "TV": ("grupo televisa", "televisa", "televisaunivision"),
+    "AI": ("c3.ai", "c3 ai", "c3ai"),
+    "OPEN": ("opendoor", "open door"),
+    "DD": ("dupont", "du pont"),
+    "SPOT": ("spotify",),
+    "BILL": ("bill.com", "billcom", "bill holdings"),
+    "NET": ("cloudflare",),
+    "APP": ("applovin", "app lovin"),
+    "BOX": ("box, inc", "box inc", "box enterprise"),
+    "YOU": ("clear secure", "clearsecure"),
+}
+
+# If these catalyst phrases appear, the ticker must NOT be a keyword-collision
+# name unless the real issuer is also named.
+_CATALYST_TICKER_DENYLIST: tuple[tuple[tuple[str, ...], frozenset[str], str], ...] = (
+    (
+        ("fcc", "local tv", "ownership cap", "broadcast ownership", "station group",
+         "nexstar", "sinclair", "tegna", "gray television", "gray media", "local broadcast"),
+        frozenset({"TV"}),
+        "US local-broadcast/FCC catalyst does not map to Grupo Televisa (TV)",
+    ),
+    (
+        ("artificial intelligence", "generative ai", "ai chip", "ai capex", "openai",
+         "large language model", "llm "),
+        frozenset({"AI"}),
+        "generic AI-theme catalyst is not enough to buy ticker AI without naming the issuer",
+    ),
+    (
+        ("open source", "open-source", "open ai", "openai"),
+        frozenset({"OPEN"}),
+        "open/AI keyword catalyst does not map to Opendoor (OPEN) without naming the issuer",
+    ),
+)
+
+
+def _entry_text_blob(decision: dict) -> str:
+    parts = [
+        decision.get("reasoning"),
+        decision.get("catalyst"),
+        decision.get("issuer"),
+        decision.get("company"),
+        decision.get("entity"),
+        decision.get("thesis"),
+        decision.get("reason"),
+    ]
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _entry_issuer_catalyst_guard(decision: dict) -> tuple[bool, str]:
+    """Hard-block keyword→ticker puns and catalyst/entity mismatches on entries.
+
+    The live book bought Grupo Televisa (`TV`) off an FCC local-TV ownership
+    story. That is not a soft prompt failure — it is an issuer map failure.
+    Enforce entity naming for ambiguous tickers and denylist known bad pairs.
+    """
+    action = str(decision.get("action") or "").upper()
+    if action not in {
+        "BUY", "SHORT", "BUY_CALL", "BUY_PUT",
+        "BUY_CALL_SPREAD", "BUY_PUT_SPREAD", "SELL_CALL_SPREAD", "SELL_PUT_SPREAD",
+        # Opening short options / CSP / covered call still need a real underlying thesis.
+        "SELL_PUT", "SELL_CALL",
+    }:
+        return True, ""
+
+    ticker = str(decision.get("ticker") or "").upper().strip()
+    if not ticker:
+        return True, ""
+
+    blob = _entry_text_blob(decision)
+    if not blob.strip():
+        if ticker in _AMBIGUOUS_ENTRY_TICKERS or ticker in _ISSUER_REQUIRED_ALIASES:
+            return (
+                False,
+                f"issuer/catalyst required: ambiguous ticker {ticker} entry needs "
+                f"named issuer + real catalyst in reasoning",
+            )
+        return True, ""
+
+    # Known bad catalyst→ticker pairs first (precise failure text).
+    for keys, denied_tickers, msg in _CATALYST_TICKER_DENYLIST:
+        if ticker not in denied_tickers:
+            continue
+        if any(k in blob for k in keys):
+            aliases = _ISSUER_REQUIRED_ALIASES.get(ticker) or ()
+            if aliases and any(a in blob for a in aliases):
+                continue
+            return False, f"issuer/catalyst mismatch: {msg}"
+
+    aliases = _ISSUER_REQUIRED_ALIASES.get(ticker)
+    ambiguous = ticker in _AMBIGUOUS_ENTRY_TICKERS or len(ticker) <= 2
+    if aliases and ambiguous:
+        if not any(a in blob for a in aliases):
+            return (
+                False,
+                f"issuer/catalyst mismatch: ticker {ticker} requires naming the real "
+                f"issuer in reasoning (e.g. '{aliases[0]}'), not a sector keyword pun",
+            )
+
+    # Generic short/ambiguous ticker rule: require at least one meaningful
+    # entity token so pure "TV breakout" / "AI is hot" entries die here.
+    if ambiguous and not aliases:
+        tokens = {
+            t for t in "".join(ch if ch.isalnum() else " " for ch in blob).split()
+            if t.isalpha()
+        }
+        filler = {
+            "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
+            "from", "this", "that", "is", "are", "be", "as", "at", "by", "it",
+            "into", "over", "under", "strong", "high", "low", "buy", "sell",
+            "long", "short", "call", "put", "stock", "shares", "catalyst",
+            "news", "score", "fresh", "breakout", "momentum", "technical",
+        }
+        meaningful = {
+            t for t in tokens
+            if t != ticker.lower() and t not in filler and len(t) >= 4
+        }
+        if not meaningful:
+            return (
+                False,
+                f"issuer/catalyst mismatch: ambiguous ticker {ticker} entry needs "
+                f"a named company/entity in reasoning, not bare keyword momentum",
+            )
+
+    return True, ""
+
+
+def _reason_blob(decision: dict) -> str:
+    return " ".join(
+        str(decision.get(k) or "")
+        for k in ("reasoning", "reason", "catalyst", "thesis", "notes")
+    ).lower()
+
+
+def _is_hard_stop_exit(decision: dict) -> bool:
+    blob = _reason_blob(decision)
+    return any(
+        m in blob
+        for m in (
+            "hard stop",
+            "hard_sl",
+            "hard-sl",
+            "stop loss",
+            "stop-loss",
+            "risk limit",
+            "margin call",
+        )
+    )
+
+
+def _is_map_failure_exit(decision: dict) -> bool:
+    blob = _reason_blob(decision)
+    return any(
+        m in blob
+        for m in (
+            "issuer/catalyst map failure",
+            "issuer map failure",
+            "wrong entity",
+            "wrong issuer",
+            "false positive ticker",
+        )
+    )
+
+
+def _is_thesis_kill_exit(decision: dict) -> bool:
+    """Real thesis/catalyst death only — not vibes or P&L discomfort.
+
+    2026-08-10 failure mode: model said "thesis break / long leg -17% / largest
+    drag / weakening" and panic-sold losers. Those phrases alone are NOT enough.
+    """
+    blob = _reason_blob(decision)
+    if not blob.strip():
+        return False
+    # Map failure is always a valid early flatten.
+    if _is_map_failure_exit(decision):
+        return True
+
+    kill_frame = any(
+        m in blob
+        for m in (
+            "thesis kill",
+            "thesis-kill",
+            "thesis is dead",
+            "thesis broken",
+            "broken thesis",
+            "invalid thesis",
+            "invalidated thesis",
+            "thesis invalid",
+            "catalyst failed",
+            "catalyst is dead",
+            "catalyst broken",
+            "edge gone",
+            "setup broken",
+            "no longer valid",
+        )
+    )
+    evidence = any(
+        m in blob
+        for m in (
+            "trading halt",
+            "halted",
+            "going concern",
+            "bankrupt",
+            "bankruptcy",
+            "delist",
+            "fraud",
+            "restatement",
+            "accounting scandal",
+            "guidance cut",
+            "downgrade",
+            "structural break",
+            "regime change",
+            "sec charge",
+            "indictment",
+            "missed earnings",
+            "revenue miss",
+            "eps miss",
+            "contract lost",
+            "customer lost",
+            "ceo resign",
+            "data contradict",
+            "thesis falsified",
+            "wrong issuer",
+            "wrong entity",
+        )
+    )
+    if evidence:
+        return True
+    if not kill_frame:
+        return False
+    # Reject pure panic / mark-to-market language even if "thesis broken" is present.
+    panic_marks = (
+        "largest drag",
+        "went red",
+        "deep red",
+        "deeply red",
+        "long leg",
+        "marked down",
+        "mark down",
+        "paper hands",
+        "uncomfortable",
+        "weakening",
+        "fading",
+        "underwater",
+        "red candle",
+    )
+    if any(m in blob for m in panic_marks):
+        return False
+    # Require some non-boilerplate content beyond the kill phrase itself.
+    stripped = blob
+    for tok in (
+        "thesis", "kill", "broken", "break", "breaks", "invalid", "invalidated",
+        "dead", "gone", "failed", "catalyst", "edge", "setup", "the", "is", "a",
+        "an", "to", "for", "and", "or", "of", "on", "in", "no", "longer", "valid",
+    ):
+        stripped = stripped.replace(tok, " ")
+    words = [w for w in stripped.split() if len(w) > 2]
+    return len(words) >= 2
+
+
+def _position_mark_and_cost(pos: dict, live_price: float | None = None) -> tuple[float, float]:
+    try:
+        avg = float(pos.get("avg_cost") or 0.0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    if live_price is not None:
+        try:
+            mark = float(live_price)
+        except (TypeError, ValueError):
+            mark = 0.0
+    else:
+        try:
+            mark = float(pos.get("current_price") or 0.0)
+        except (TypeError, ValueError):
+            mark = 0.0
+    return mark, avg
+
+
+def _is_underwater_position(
+    pos: dict,
+    *,
+    side: str,
+    live_price: float | None = None,
+) -> bool:
+    mark, avg = _position_mark_and_cost(pos, live_price)
+    if mark <= 0 or avg <= 0:
+        return False
+    eps = max(0.0, float(UNDERWATER_EXIT_EPS))
+    if side == "long":
+        return mark < avg * (1.0 - eps)
+    return mark > avg * (1.0 + eps)
+
+
+def _option_premium_kill_hit(pos: dict, live_price: float | None = None) -> bool:
+    mark, avg = _position_mark_and_cost(pos, live_price)
+    if mark <= 0 or avg <= 0:
+        return False
+    return ((avg - mark) / avg) + 1e-12 >= float(OPTION_PREMIUM_KILL_PCT)
+
+
+def _underwater_discretionary_exit_guard(
+    decision: dict,
+    pos: dict,
+    *,
+    side: str,
+    live_price: float | None = None,
+    is_option: bool = False,
+) -> tuple[bool, str]:
+    """Permanent anti-panic: block sell-low / cover-high discretionary exits.
+
+    Allowed underwater exits only:
+      - hard stop language (engine hard-SL path still independent)
+      - map-failure / real thesis-kill evidence
+      - long option premium down >= OPTION_PREMIUM_KILL_PCT
+    Winners are not blocked here.
+    """
+    if not BLOCK_UNDERWATER_DISCRETIONARY_EXITS:
+        return True, ""
+    if not _is_underwater_position(pos, side=side, live_price=live_price):
+        return True, ""
+    if _is_hard_stop_exit(decision):
+        return True, ""
+    if is_option and side == "long" and _option_premium_kill_hit(pos, live_price):
+        return True, ""
+    if _is_thesis_kill_exit(decision):
+        return True, ""
+    kind = "option" if is_option else "stock"
+    return (
+        False,
+        (
+            f"underwater panic-sell blocked on {kind}: hold the red and wait for "
+            f"recovery unless hard stop, real thesis-kill evidence, or option "
+            f"-{int(OPTION_PREMIUM_KILL_PCT * 100)}% premium kill"
+        ),
+    )
+
+
 def _minimum_hold_exit_guard(
     decision: dict,
     snapshot: dict,
     store: Store,
     *,
     now: datetime | None = None,
+    position_type: str = "stock",
+    match_pos: dict | None = None,
 ) -> tuple[bool, str]:
-    """Block discretionary same-day exits while leaving hard stops untouched."""
+    """Hold lock for discretionary exits (stocks + optional option rows).
+
+    Default 4h. Hard SL still owns forced risk exits independently.
+    Real thesis-kill / map-failure / hard-stop language bypasses the lock.
+    Pure "weakening / largest drag / went red" language does NOT bypass.
+    """
+    if MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S <= 0:
+        return True, ""
     action = (decision.get("action") or "").upper()
-    if action not in {"SELL", "COVER"}:
+    if action not in {"SELL", "COVER", "SELL_CALL", "SELL_PUT"}:
+        return True, ""
+
+    if _is_hard_stop_exit(decision) or _is_thesis_kill_exit(decision):
         return True, ""
     try:
         total = float(snapshot.get("total_value") or 0.0)
@@ -2090,23 +3116,34 @@ def _minimum_hold_exit_guard(
         return False, "ticker required for exit discipline"
     now = now or datetime.now(timezone.utc)
 
-    def _matches(p: dict) -> bool:
-        if str(p.get("ticker") or "").upper() != ticker:
-            return False
-        if p.get("type") != "stock":
-            return False
-        try:
-            qty = float(p.get("qty") or 0.0)
-        except (TypeError, ValueError):
-            return False
-        return qty > 0 if action == "SELL" else qty < 0
+    if match_pos is not None:
+        positions = [match_pos]
+    else:
+        want_long = action in {"SELL", "SELL_CALL", "SELL_PUT"}
 
-    positions = [p for p in snapshot.get("positions") or [] if _matches(p)]
-    if not any(p.get("opened_at") for p in positions):
-        try:
-            positions = [p for p in store.open_positions() if _matches(p)]
-        except Exception:
-            positions = []
+        def _matches(p: dict) -> bool:
+            if str(p.get("ticker") or "").upper() != ticker:
+                return False
+            ptype = str(p.get("type") or "")
+            if position_type == "stock":
+                if ptype != "stock":
+                    return False
+            else:
+                # option path: call/put rows
+                if ptype not in {"call", "put"}:
+                    return False
+            try:
+                qty = float(p.get("qty") or 0.0)
+            except (TypeError, ValueError):
+                return False
+            return qty > 0 if want_long else qty < 0
+
+        positions = [p for p in snapshot.get("positions") or [] if _matches(p)]
+        if not any(p.get("opened_at") for p in positions):
+            try:
+                positions = [p for p in store.open_positions() if _matches(p)]
+            except Exception:
+                positions = []
 
     opened = None
     for pos in positions:
@@ -2121,12 +3158,12 @@ def _minimum_hold_exit_guard(
     if age_s < 0:
         return True, ""
     if age_s < MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S:
-        held_h = int(age_s // 3600)
+        held_h = max(0, int(age_s // 3600))
         wait_h = int((MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S - age_s + 3599) // 3600)
         return (
             False,
             f"minimum-hold lock: {ticker} held {held_h}h; wait {wait_h}h "
-            "before discretionary exit unless the hard stop triggers",
+            "before discretionary exit unless hard stop / real thesis-kill",
         )
     return True, ""
 
@@ -2147,6 +3184,11 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
 
     if action == "REBALANCE":
         return "HOLD", "REBALANCE not yet implemented; treated as HOLD"
+
+    # Hard issuer/catalyst map gate before any fill path (stocks + options).
+    ok, why = _entry_issuer_catalyst_guard(decision)
+    if not ok:
+        return "BLOCKED", why
 
     # Hard gate: model output cannot mint stock/option fills when no equity
     # trading period is live. RTH / pre / post / weekday overnight are fine.
@@ -2185,6 +3227,13 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             return "BLOCKED", f"no price for {ticker}"
         if action == "BUY":
             leverage = _stock_buy_leverage(decision)
+            leverage, boost_note = _auto_boost_stock_buy_leverage(
+                decision=decision,
+                snapshot=snapshot,
+                price=price,
+                qty=qty,
+                requested_leverage=leverage,
+            )
             effective_qty = round(qty * leverage, 8)
             notional = price * effective_qty
             ok, why = _trade_discipline_guard(
@@ -2199,14 +3248,17 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
                     "BLOCKED",
                     f"insufficient cash/buying power (cash ${snapshot['cash']:.2f}, "
                     f"margin ${max(0.0, float(snapshot.get('total_value') or 0.0) * STOCK_MARGIN_NET_WORTH_PCT):.2f}, "
-                    f"available ${buying_power:.2f}, need ${notional:.2f})",
+                    f"available ${buying_power:.2f}, need ${notional:.2f}",
                 )
             trade_reason = reason
-            if leverage != STOCK_BUY_MIN_LEVERAGE:
-                trade_reason = (
-                    f"{reason} [leverage={leverage:g}x; requested_qty={qty:g}; "
-                    f"effective_qty={effective_qty:g}]"
-                ).strip()
+            if leverage != STOCK_BUY_MIN_LEVERAGE or boost_note:
+                extra = (
+                    f"leverage={leverage:g}x; requested_qty={qty:g}; "
+                    f"effective_qty={effective_qty:g}"
+                )
+                if boost_note:
+                    extra = f"{extra}; {boost_note}"
+                trade_reason = f"{reason} [{extra}]".strip()
             store.record_trade(ticker, "BUY", effective_qty, price, trade_reason)
             store.upsert_position(ticker, "stock", effective_qty, price)
             # Stamp hard SL/TP on the just-opened (or blended) lot. Pass
@@ -2235,13 +3287,36 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             # would desync portfolio.positions_json from the positions table
             # (a dashboard read would see the new cash but the pre-trade list).
             store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
-            suffix = (
-                f" ({leverage:g}x leverage from requested qty {qty:g})"
-                if leverage != STOCK_BUY_MIN_LEVERAGE else ""
-            )
+            if leverage != STOCK_BUY_MIN_LEVERAGE or boost_note:
+                suffix = f" ({leverage:g}x leverage from requested qty {qty:g}"
+                if boost_note:
+                    suffix += f"; {boost_note}"
+                suffix += ")"
+            else:
+                suffix = ""
             return "FILLED", f"BUY {effective_qty:g} {ticker} @ {price:.2f}{suffix}"
         if action == "SELL":
             ok, why = _minimum_hold_exit_guard(decision, snapshot, store)
+            if not ok:
+                return "BLOCKED", why
+            long_pos = next(
+                (
+                    p for p in snapshot.get("positions") or []
+                    if str(p.get("ticker") or "").upper() == ticker
+                    and str(p.get("type") or "") == "stock"
+                    and float(p.get("qty") or 0.0) > 0
+                ),
+                {
+                    "ticker": ticker,
+                    "type": "stock",
+                    "qty": qty,
+                    "avg_cost": 0.0,
+                    "current_price": price,
+                },
+            )
+            ok, why = _underwater_discretionary_exit_guard(
+                decision, long_pos, side="long", live_price=price, is_option=False,
+            )
             if not ok:
                 return "BLOCKED", why
             notional = price * qty
@@ -2285,6 +3360,26 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             ok, why = _minimum_hold_exit_guard(decision, snapshot, store)
             if not ok:
                 return "BLOCKED", why
+            short_pos = next(
+                (
+                    p for p in snapshot.get("positions") or []
+                    if str(p.get("ticker") or "").upper() == ticker
+                    and str(p.get("type") or "") == "stock"
+                    and float(p.get("qty") or 0.0) < 0
+                ),
+                {
+                    "ticker": ticker,
+                    "type": "stock",
+                    "qty": -qty,
+                    "avg_cost": 0.0,
+                    "current_price": price,
+                },
+            )
+            ok, why = _underwater_discretionary_exit_guard(
+                decision, short_pos, side="short", live_price=price, is_option=False,
+            )
+            if not ok:
+                return "BLOCKED", why
             notional = price * qty
             store.record_trade(ticker, "COVER", qty, price, reason)
             store.upsert_position(ticker, "stock", qty, price)
@@ -2292,83 +3387,197 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             return "FILLED", f"COVER {qty:g} {ticker} @ {price:.2f}"
 
     if action in ("BUY_CALL", "BUY_PUT"):
-        otype = "call" if action == "BUY_CALL" else "put"
-        strike = decision.get("strike")
-        expiry = decision.get("expiry")
-        if not (strike and expiry):
-            return "BLOCKED", "option trade missing strike/expiry"
-        # Claude can emit a non-numeric strike ("ATM", "OTM", a description).
-        # An unguarded float() would raise ValueError and abort the whole
-        # decide() cycle (no decision row, no equity point); record a clean
-        # BLOCKED instead so the operator can diagnose what came back.
-        try:
-            strike_f = float(strike)
-        except (TypeError, ValueError):
-            return "BLOCKED", f"strike not numeric: {strike!r}"
+        from .analytics.options_structures import classify_buy_option
+        cls = classify_buy_option(decision, snapshot)
+        if cls.get("mode") == "blocked":
+            return "BLOCKED", cls.get("reason") or "option buy blocked"
+        otype = cls["otype"]
+        strike_f = float(cls["strike"])
+        expiry = cls["expiry"]
         opt_px = market.get_option_price(ticker, expiry, strike_f, otype)
         if not opt_px:
-            return "BLOCKED", f"no option price for {ticker} {expiry} {strike} {otype}"
-        notional = opt_px * qty * 100
-        if snapshot["cash"] - notional < 0:
-            return "BLOCKED", f"insufficient cash (have ${snapshot['cash']:.2f}, need ${notional:.2f})"
-        store.record_trade(ticker, action, qty, opt_px, reason, expiry=expiry,
-                           strike=strike_f, option_type=otype)
-        store.upsert_position(ticker, otype, qty, opt_px, expiry=expiry, strike=strike_f)
-        # positions=None: see the stock-BUY branch — end-of-cycle re-mark
-        # writes the post-trade blend (with the new option contract).
+            return "BLOCKED", f"no option price for {ticker} {expiry} {strike_f} {otype}"
+        notional = float(opt_px) * qty * 100.0
+
+        if cls.get("mode") == "close_short":
+            held = float(cls.get("held_short") or 0.0)
+            if qty > held + 1e-6:
+                return "BLOCKED", f"buy-to-cover qty {qty} exceeds short {held}"
+            buying_power = _margin_buying_power(snapshot)
+            if buying_power - notional < -1e-6:
+                return "BLOCKED", (
+                    f"insufficient cash/buying power to buy-to-cover "
+                    f"(cash ${snapshot['cash']:.2f}, margin ${_margin_available(snapshot):.2f}, "
+                    f"available ${buying_power:.2f}, need ${notional:.2f})"
+                )
+            store.record_trade(
+                ticker, action, qty, float(opt_px), reason,
+                expiry=expiry, strike=strike_f, option_type=otype,
+            )
+            store.upsert_position(ticker, otype, qty, float(opt_px), expiry=expiry, strike=strike_f)
+            store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
+            return (
+                "FILLED",
+                f"BUY_TO_COVER {qty:g} {ticker} {strike_f}{otype[0].upper()} {expiry} @ {float(opt_px):.2f}",
+            )
+
+        buying_power = _margin_buying_power(snapshot)
+        if buying_power - notional < -1e-6:
+            return "BLOCKED", (
+                f"insufficient cash/buying power "
+                f"(cash ${snapshot['cash']:.2f}, margin ${_margin_available(snapshot):.2f}, "
+                f"available ${buying_power:.2f}, need ${notional:.2f})"
+            )
+        store.record_trade(
+            ticker, action, qty, float(opt_px), reason,
+            expiry=expiry, strike=strike_f, option_type=otype,
+        )
+        store.upsert_position(ticker, otype, qty, float(opt_px), expiry=expiry, strike=strike_f)
         store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
-        return "FILLED", f"{action} {qty} {ticker} {strike_f}{otype[0].upper()} {expiry} @ {opt_px:.2f}"
+        return "FILLED", f"{action} {qty:g} {ticker} {strike_f}{otype[0].upper()} {expiry} @ {float(opt_px):.2f}"
 
     if action in ("SELL_CALL", "SELL_PUT"):
-        otype = "call" if action == "SELL_CALL" else "put"
-        strike = decision.get("strike")
-        expiry = decision.get("expiry")
-        # Same non-numeric-strike guard as the BUY path above: an unguarded
-        # float() inside the list comprehension would crash the cycle.
-        strike_f: float | None = None
-        if strike:
-            try:
-                strike_f = float(strike)
-            except (TypeError, ValueError):
-                return "BLOCKED", f"strike not numeric: {strike!r}"
-        candidates = [p for p in snapshot["positions"]
-                      if p["ticker"] == ticker and p["type"] == otype
-                      and (strike_f is None or p["strike"] == strike_f)
-                      and (not expiry or p["expiry"] == expiry)]
-        if not candidates:
-            return "BLOCKED", f"no matching open {otype} for {ticker}"
-        # If strike/expiry are unspecified and multiple contracts match, refuse
-        # to pick — silently closing the "first" contract could exit the wrong
-        # leg and lose intended exposure.
-        if len(candidates) > 1 and (not strike or not expiry):
-            legs = ", ".join(f"{p['strike']}{otype[0].upper()} {p['expiry']}" for p in candidates)
-            return "BLOCKED", f"ambiguous {otype} close for {ticker}; specify strike+expiry (open: {legs})"
-        match = candidates[0]
-        # Cash flow must be bounded by what's actually held in the matched
-        # contract — pre-trade check sums across all strikes/expiries and
-        # would otherwise let qty over-credit cash here.
-        if qty > match["qty"] + 1e-6:
-            return "BLOCKED", (
-                f"sell qty {qty} exceeds held {match['qty']} for "
-                f"{ticker} {match['strike']}{otype[0].upper()} {match['expiry']}"
+        from .analytics.options_structures import classify_sell_option, csp_collateral_required
+        cls = classify_sell_option(decision, snapshot)
+        if cls.get("mode") == "blocked":
+            return "BLOCKED", cls.get("reason") or "option sell blocked"
+        otype = cls["otype"]
+        mode = cls["mode"]
+
+        if mode == "close_long":
+            match = cls["match"]
+            if qty > float(match.get("qty") or 0.0) + 1e-6:
+                return "BLOCKED", (
+                    f"sell qty {qty} exceeds held {match.get('qty')} for "
+                    f"{ticker} {match.get('strike')}{otype[0].upper()} {match.get('expiry')}"
+                )
+            live_px = market.get_option_price(ticker, match["expiry"], match["strike"], otype)
+            if live_px is not None:
+                opt_px = float(live_px)
+            elif _option_expired(match["expiry"]):
+                opt_px = _expired_intrinsic(ticker, otype, match["strike"])
+            else:
+                opt_px = float(match["avg_cost"])
+            ok, why = _minimum_hold_exit_guard(
+                decision,
+                snapshot,
+                store,
+                match_pos=match,
+                position_type="option",
             )
-        live_px = market.get_option_price(ticker, match["expiry"], match["strike"], otype)
-        if live_px is not None:
-            opt_px = live_px
-        elif _option_expired(match["expiry"]):
-            # Closing an expired contract settles at intrinsic, never at the
-            # avg_cost breakeven the old `or match["avg_cost"]` produced.
-            opt_px = _expired_intrinsic(ticker, otype, match["strike"])
+            if not ok:
+                return "BLOCKED", why
+            ok, why = _underwater_discretionary_exit_guard(
+                decision,
+                match,
+                side="long",
+                live_price=float(opt_px),
+                is_option=True,
+            )
+            if not ok:
+                return "BLOCKED", why
+            notional = opt_px * qty * 100.0
+            store.record_trade(
+                ticker, action, qty, opt_px, reason,
+                expiry=match["expiry"], strike=float(match["strike"]), option_type=otype,
+            )
+            store.upsert_position(
+                ticker, otype, -qty, opt_px,
+                expiry=match["expiry"], strike=float(match["strike"]),
+            )
+            store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
+            return (
+                "FILLED",
+                f"{action} {qty:g} {ticker} {match['strike']}{otype[0].upper()} {match['expiry']} @ {opt_px:.2f}",
+            )
+
+        strike_f = float(cls["strike"])
+        expiry = cls["expiry"]
+        opt_px = market.get_option_price(ticker, expiry, strike_f, otype)
+        if not opt_px:
+            return "BLOCKED", f"no option price for {ticker} {expiry} {strike_f} {otype}"
+        opt_px = float(opt_px)
+        credit = opt_px * qty * 100.0
+        if mode == "open_csp":
+            collat = csp_collateral_required(strike_f, qty, opt_px)
+            if float(snapshot["cash"]) + 1e-6 < collat:
+                return "BLOCKED", (
+                    f"insufficient cash for CSP collateral (need ${collat:.2f} net of premium, "
+                    f"have ${snapshot['cash']:.2f})"
+                )
+        store.record_trade(
+            ticker, action, qty, opt_px, reason,
+            expiry=expiry, strike=strike_f, option_type=otype,
+        )
+        store.upsert_position(ticker, otype, -qty, opt_px, expiry=expiry, strike=strike_f)
+        store.update_portfolio(snapshot["cash"] + credit, snapshot["total_value"])
+        label = "COVERED_CALL" if mode == "open_covered_call" else "CSP"
+        return (
+            "FILLED",
+            f"{label} {action} {qty:g} {ticker} {strike_f}{otype[0].upper()} {expiry} @ {opt_px:.2f}",
+        )
+
+    if action in (
+        "BUY_CALL_SPREAD", "BUY_PUT_SPREAD", "SELL_CALL_SPREAD", "SELL_PUT_SPREAD",
+    ):
+        from .analytics.options_structures import parse_vertical_spread, price_vertical_spread
+        spec = parse_vertical_spread(decision)
+        if not spec.get("ok"):
+            return "BLOCKED", spec.get("reason") or "invalid spread"
+        priced = price_vertical_spread(market, spec)
+        if not priced.get("ok"):
+            return "BLOCKED", priced.get("reason") or "spread unpriceable"
+        qty_s = float(priced["qty"])
+        expiry = priced["expiry"]
+        otype = priced["otype"]
+        long_k = float(priced["long_strike"])
+        short_k = float(priced["short_strike"])
+        long_px = float(priced["long_px"])
+        short_px = float(priced["short_px"])
+        cash_delta = float(priced["cash_delta"])
+        cash_after = float(snapshot["cash"]) + cash_delta
+        buying_power = _margin_buying_power(snapshot)
+        bp_after = buying_power + cash_delta
+        if priced.get("is_debit"):
+            # Debit verticals spend premium; allow shared cash+50% NW margin BP.
+            if bp_after < -1e-6:
+                return "BLOCKED", (
+                    f"insufficient cash/buying power for debit spread "
+                    f"(cash ${snapshot['cash']:.2f}, margin ${_margin_available(snapshot):.2f}, "
+                    f"available ${buying_power:.2f}, need ${abs(cash_delta):.2f})"
+                )
         else:
-            opt_px = match["avg_cost"]
-        notional = opt_px * qty * 100
-        store.record_trade(ticker, action, qty, opt_px, reason,
-                           expiry=match["expiry"], strike=match["strike"], option_type=otype)
-        store.upsert_position(ticker, otype, -qty, opt_px,
-                              expiry=match["expiry"], strike=match["strike"])
-        # positions=None: see the stock-BUY branch.
-        store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
-        return "FILLED", f"{action} {qty} {ticker} {match['strike']}{otype[0].upper()} {match['expiry']} @ {opt_px:.2f}"
+            max_loss = float(priced.get("max_loss") or 0.0)
+            # Credit vertical residual risk still needs BP buffer after credit.
+            if bp_after + 1e-6 < max_loss:
+                return "BLOCKED", (
+                    f"insufficient cash/buying power buffer for credit spread max loss "
+                    f"(bp_after ${bp_after:.2f} < max_loss ${max_loss:.2f})"
+                )
+        buy_action = "BUY_CALL" if otype == "call" else "BUY_PUT"
+        sell_action = "SELL_CALL" if otype == "call" else "SELL_PUT"
+        store.record_trade(
+            ticker, buy_action, qty_s, long_px,
+            f"{action} long leg | {reason}",
+            expiry=expiry, strike=long_k, option_type=otype,
+        )
+        store.record_trade(
+            ticker, sell_action, qty_s, short_px,
+            f"{action} short leg | {reason}",
+            expiry=expiry, strike=short_k, option_type=otype,
+        )
+        store.upsert_position(ticker, otype, qty_s, long_px, expiry=expiry, strike=long_k)
+        store.upsert_position(ticker, otype, -qty_s, short_px, expiry=expiry, strike=short_k)
+        store.update_portfolio(cash_after, snapshot["total_value"])
+        return (
+            "FILLED",
+            (
+                f"{action} {qty_s:g} {ticker} {long_k}/{short_k} {expiry} "
+                f"long@{long_px:.2f} short@{short_px:.2f} cash_delta={cash_delta:+.2f} "
+                f"max_loss={float(priced.get('max_loss') or 0):.2f} "
+                f"max_gain={float(priced.get('max_gain') or 0):.2f}"
+            ),
+        )
 
     return "BLOCKED", f"unknown action {action}"
 
@@ -2611,18 +3820,60 @@ def _ml_live_opinion(
         return None
 
 
+def _ml_drought_position_qty(
+    action: str,
+    ticker: str,
+    snap: dict,
+    watch_px: dict,
+    confidence: float,
+) -> float | None:
+    """Conservative share count for ML drought entries."""
+    try:
+        price = float(watch_px.get(ticker) or 0.0)
+    except (TypeError, ValueError):
+        price = 0.0
+    if price <= 0:
+        try:
+            price = float(market.get_price(ticker) or 0.0)
+        except Exception:
+            price = 0.0
+    if price <= 0 or not math.isfinite(price):
+        return None
+    buying_power = max(0.0, _stock_buying_power(snap))
+    if action == "BUY":
+        budget = min(
+            buying_power * max(0.0, ML_DROUGHT_BUY_CASH_PCT),
+            ML_DROUGHT_BUY_MAX_USD,
+            buying_power,
+        )
+        # Scale by confidence, but keep a usable floor once ML is allowed.
+        budget *= max(ML_DROUGHT_MIN_CONFIDENCE, min(1.0, confidence))
+        if ticker in _LEVERAGED_ETFS_LIVE:
+            budget = min(budget, buying_power * 0.10, 750.0)
+    else:
+        budget = min(
+            buying_power * max(0.0, ML_DROUGHT_SHORT_CASH_PCT),
+            ML_DROUGHT_SHORT_MAX_USD,
+            buying_power,
+        )
+        budget *= max(ML_DROUGHT_MIN_CONFIDENCE, min(1.0, confidence))
+    if budget < price:
+        return None
+    qty = math.floor((budget / price) * 10000) / 10000
+    return qty if qty > 0 else None
+
+
 def _ml_drought_decision(
     ml_op: dict | None,
     snap: dict,
     watch_px: dict,
     drought_reason: str,
 ) -> dict | None:
-    """Convert the qualified ML advisor output into a safe drought fallback.
+    """Convert the qualified ML advisor output into a drought fallback decision.
 
-    This is used only after the LLM path fails. It records the ML advisor's
-    view without allowing a new BUY to be placed while the model layer is down.
-    Risk-reducing non-BUY opinions still degrade to HOLD here because the
-    normal LLM/autonomy layer did not validate the action.
+    Used only after the LLM path fails. When ML drought entries are enabled,
+    qualified BUY/SHORT opinions can open conservative paper positions. HOLD
+    still remains the safe default for weak/unknown ML opinions.
     """
     if not isinstance(ml_op, dict):
         return None
@@ -2633,6 +3884,40 @@ def _ml_drought_decision(
         f"{base_reason} [ml-drought-fallback: LLM unavailable; "
         f"{drought_reason}]"
     )
+
+    conf_raw = ml_op.get("confidence")
+    try:
+        confidence = float(conf_raw) if conf_raw is not None else 0.45
+    except (TypeError, ValueError):
+        confidence = 0.45
+    if not math.isfinite(confidence):
+        confidence = 0.45
+    confidence = max(0.0, min(1.0, confidence))
+
+    if action in ("BUY", "SHORT") and ML_DROUGHT_ALLOW_ENTRIES and ticker:
+        qty = _ml_drought_position_qty(action, ticker, snap, watch_px, confidence)
+        if qty is not None and qty > 0:
+            return {
+                "action": action,
+                "ticker": ticker,
+                "qty": qty,
+                "leverage": 1,
+                "confidence": max(confidence, ML_DROUGHT_MIN_CONFIDENCE),
+                "reasoning": (
+                    reason
+                    + f" (ML drought entry authorized: {action} {qty:g} {ticker})"
+                ),
+            }
+        return {
+            "action": "HOLD",
+            "ticker": "",
+            "confidence": confidence,
+            "reasoning": (
+                reason
+                + f" (ML wanted {action} {ticker or '?'} but drought sizing "
+                f"could not allocate a valid qty)"
+            ),
+        }
 
     if action != "BUY":
         return {
@@ -2797,6 +4082,32 @@ def decide() -> dict:
         track_record_block = tr.get("prompt_block")
     except Exception as e:
         print(f"[strategy] track-record failed (non-fatal): {e}")
+
+    durable_memory_block: str | None = None
+    try:
+        from .analytics.durable_trade_memory import (
+            build_durable_memory_prompt_block,
+            refresh_lessons_log,
+        )
+        try:
+            refresh_lessons_log()
+        except Exception as e:
+            print(f"[strategy] durable-memory refresh failed (non-fatal): {e}")
+        names_for_mem = set()
+        try:
+            names_for_mem = set(_names_in_play(snap.get("positions") or [], merged, WATCHLIST))
+        except Exception:
+            for p in (snap.get("positions") or []):
+                if p.get("ticker"):
+                    names_for_mem.add(str(p.get("ticker")).upper())
+        durable_memory_block = build_durable_memory_prompt_block(
+            order_limit=12,
+            lesson_limit=6,
+            names_in_play=names_for_mem or None,
+        )
+    except Exception as e:
+        print(f"[strategy] durable-memory block failed (non-fatal): {e}")
+        durable_memory_block = None
 
     # Per-name losing-streak watch — composed from the same trades ledger as
     # track_record (single source of truth, invariant #10). Scoped to the SAME
@@ -3050,6 +4361,26 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] exit-proximity failed (non-fatal): {e}")
 
+    # Options desk — first-class option awareness for the live decision.
+    # Bounded chain fetches for held + names-in-play underlyings (swing ~45d
+    # and LEAPS ~365d tenors). Observational only; degrade-safe.
+    options_desk_block: str | None = None
+    try:
+        from .analytics.options_desk import build_options_desk
+        od = build_options_desk(
+            snap,
+            watch_px,
+            _names_in_play(snap.get("positions") or [], merged, WATCHLIST),
+            max_underlyings=3,
+            fetch_chains=True,
+        )
+        options_desk_block = od.get("prompt_block")
+        if od.get("summary"):
+            print(f"[strategy] options-desk: {od.get('summary')}")
+    except Exception as e:
+        print(f"[strategy] options-desk failed (non-fatal): {e}")
+
+
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
     ml_op: dict | None = None
@@ -3063,7 +4394,10 @@ def decide() -> dict:
                     f"  Action: {ml_op['action']}"
                     + (f" {ml_op['ticker']}" if ml_op.get("ticker") else "")
                     + f"\n  Reasoning: {ml_op['reasoning']}\n"
-                    "This is an advisory opinion only. You retain full autonomy over the final decision."
+                    "This is an advisory opinion only. You retain full autonomy over the final decision.\n"
+                    "If the ML lean is bullish/bearish with real conviction, also consider expressing "
+                    "it via BUY_CALL / BUY_PUT using OPTIONS DESK chain snapshots (LEAPS proxy or "
+                    "swing) when premium risk is the better fit than full share notional."
                 )
                 print(f"[strategy] ML advisor: {ml_op['action']} {ml_op.get('ticker', '')}")
         except Exception as e:
@@ -3073,6 +4407,7 @@ def decide() -> dict:
                              quant_signals=quant_sigs,
                              self_review_block=self_review_block,
                              track_record_block=track_record_block,
+                             durable_memory_block=durable_memory_block,
                              repeat_loser_block=repeat_loser_block,
                              thesis_drift_block=thesis_drift_block,
                              risk_mirror_block=risk_mirror_block,
@@ -3084,7 +4419,8 @@ def decide() -> dict:
                              buying_power_block=buying_power_block,
                              exit_proximity_block=exit_proximity_block,
                              research_discovery_block=research_discovery_block,
-                             active_research_block=active_research_block)
+                             active_research_block=active_research_block,
+                             options_desk_block=options_desk_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"
@@ -3150,14 +4486,14 @@ def decide() -> dict:
     # spawning the Sonnet fallback would just add another 1.5GB subprocess to
     # the storm we are trying to dodge.
     if raw is None and not host_sat:
-        print("[strategy] Opus timeout — trying Sonnet fallback")
+        print("[strategy] primary model empty — trying fallback model")
         fb_payload = _build_fallback_payload(snap, merged, quant_sigs)
         fb_prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT (condensed):\n{fb_payload}"
         raw = _claude_call(fb_prompt, timeout_s=FALLBACK_TIMEOUT_S,
                            model=FALLBACK_MODEL)
         if raw:
             fallback_used = True
-            print("[strategy] Sonnet fallback returned response")
+            print("[strategy] fallback model returned response")
             decision = _parse_decision(raw)
 
     # Conditional one-shot retry: Claude returned text but it wasn't parseable.
@@ -3180,7 +4516,7 @@ def decide() -> dict:
     # JSON nudge retry for Sonnet fallback parse failure
     elif not decision and fallback_used and _should_retry_parse(raw) and fb_prompt is not None:
         retried = True
-        print("[strategy] Sonnet fallback parse failed; retrying with JSON-only nudge")
+        print("[strategy] fallback parse failed; retrying with JSON-only nudge")
         retry_raw = _claude_call(fb_prompt + _RETRY_SUFFIX, timeout_s=RETRY_TIMEOUT_S,
                                  model=FALLBACK_MODEL)
         retry_decision = _parse_decision(retry_raw) if retry_raw else None
@@ -3297,7 +4633,7 @@ def decide() -> dict:
         # Make it visible in the DB / dashboard that this decision came from
         # the Sonnet fallback (condensed context), not the full Opus pass.
         decision = {**decision,
-                    "reasoning": f"{decision.get('reasoning', '')} [sonnet-fallback]"}
+                    "reasoning": f"{decision.get('reasoning', '')} [model-fallback]"}
     store.record_decision(
         market_open,
         len(merged),
@@ -3311,6 +4647,28 @@ def decide() -> dict:
     final = _portfolio_snapshot(store)
     store.record_equity_point(final["total_value"], final["cash"], sp500)
     summary["snapshot"] = final
+
+    # Durable trade learning: local JSONL always; claude-mem worker on FILLED.
+    # Non-fatal — never blocks the decision cycle.
+    try:
+        from .analytics.claude_mem_trades import record_trade_learning
+        if status in ("FILLED", "BLOCKED") and str(decision.get("action") or "").upper() != "HOLD":
+            mem = record_trade_learning(
+                decision=decision,
+                status=status,
+                detail=str(detail) if detail is not None else None,
+                snapshot_before=snap,
+                snapshot_after=final,
+                push_remote=(status == "FILLED"),
+            )
+            summary["trade_memory"] = {
+                "ok": mem.get("ok"),
+                "local_path": mem.get("local_path"),
+                "remote_ok": (mem.get("remote") or {}).get("ok"),
+            }
+    except Exception as e:
+        print(f"[strategy] trade-memory failed (non-fatal): {e}")
+
     return summary
 
 

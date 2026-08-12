@@ -36,6 +36,16 @@
     <string>.</string>
     <key>PAPER_TRADER_DASHBOARD_PREWARM</key>
     <string>0</string>
+    <key>PAPER_TRADER_MODEL</key>
+    <string>grok-4.5</string>
+    <key>PAPER_TRADER_FALLBACK_MODEL</key>
+    <string>grok-4.5</string>
+    <key>PAPER_TRADER_CURSOR_FALLBACK</key>
+    <string>1</string>
+    <key>PAPER_TRADER_CURSOR_API_BASE</key>
+    <string>http://127.0.0.1:4646/v1</string>
+    <key>PAPER_TRADER_CURSOR_MODEL</key>
+    <string>cursor-grok-4.5-high</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
     <key>PATH</key>

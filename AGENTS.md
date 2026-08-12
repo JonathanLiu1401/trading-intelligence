@@ -109,13 +109,16 @@ Hard rules for this machine:
   in `DIGITAL_INTERN_WORKERS=web_server` mode.
 - `/intern/chat` is served by the Digital Intern `8080` service. Its
   LaunchAgent must include `PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
-  `DIGITAL_INTERN_LLM_MODEL=gpt-5.5`,
-  `DIGITAL_INTERN_CODEX_REASONING_EFFORT=xhigh`, and
-  `DIGITAL_INTERN_CHAT_LLM_TIMEOUT=45`. The helper
-  `digital-intern/core/claude_cli.py` also resolves `/usr/local/bin/codex`
-  directly because launchd's default PATH does not include it. A focused
-  Playwright test on 2026-06-08 verified the chat UI returns a real
-  `gpt-5.5` response through the Tailscale URL, not the degraded fallback.
+  `DIGITAL_INTERN_LLM_MODEL=grok-4.5` (xAI SuperGrok primary),
+  `DIGITAL_INTERN_CURSOR_FALLBACK=1`,
+  `DIGITAL_INTERN_CURSOR_API_BASE=http://127.0.0.1:4646/v1`,
+  `DIGITAL_INTERN_CURSOR_MODEL=cursor-grok-4.5-high`, and
+  `DIGITAL_INTERN_CHAT_LLM_TIMEOUT=45`. Cursor Grok is fallback-only when
+  SuperGrok credits/rate limits fail — never primary, never Claude.
+  Paper Trader uses the same pattern via `PAPER_TRADER_*` / strategy.py.
+  Grok multi-agent discovery (`collectors/grok_multiagent_discovery.py`)
+  shares the same Cursor proxy fallback. LaunchAgent `com.cursor-agent-api`
+  must be running for the local OpenAI-compatible proxy.
 - Never print, paste, commit, or summarize tokens, API keys, OAuth payloads,
   credential files, or raw auth/profile JSON.
 

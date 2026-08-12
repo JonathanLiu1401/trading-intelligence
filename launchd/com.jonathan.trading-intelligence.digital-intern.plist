@@ -28,11 +28,15 @@
     <key>DIGITAL_INTERN_EMBEDDED_WEB</key>
     <string>1</string>
     <key>DIGITAL_INTERN_LLM_MODEL</key>
-    <string>gpt-5.5</string>
+    <string>grok-4.5</string>
     <key>DIGITAL_INTERN_CHAT_LLM_TIMEOUT</key>
     <string>45</string>
-    <key>DIGITAL_INTERN_CODEX_REASONING_EFFORT</key>
-    <string>xhigh</string>
+    <key>DIGITAL_INTERN_CURSOR_FALLBACK</key>
+    <string>1</string>
+    <key>DIGITAL_INTERN_CURSOR_API_BASE</key>
+    <string>http://127.0.0.1:4646/v1</string>
+    <key>DIGITAL_INTERN_CURSOR_MODEL</key>
+    <string>cursor-grok-4.5-high</string>
     <key>PYTHONPATH</key>
     <string>.</string>
     <key>PYTHONUNBUFFERED</key>
