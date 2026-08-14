@@ -252,6 +252,11 @@ def maybe_execute_friday_closer(
         except Exception:
             pass
 
+    # 2026-08-14 Jonathan: NVDA/QQQ Friday-weekly hard-send is REVOKED.
+    # Keep wrong-issuer flatten; do not auto-open another NVDA/QQQ weekly.
+    # Return silently so the reporter cannot stamp this as AUTO RISK EXIT.
+    return notes
+
     if not ppi_window_open(ts):
         notes.append("closer armed; waiting for Thu 08:45 ET PPI tape")
         return notes

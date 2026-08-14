@@ -96,7 +96,7 @@ def build_options_risk(snapshot: dict | None, watch_prices: dict | None = None) 
 
         flags = []
         if prem_budget_pct > 35:
-            flags.append("HIGH_LONG_PREMIUM (>35% equity in leftover long option mark; does not block 8/14 new debit)")
+            flags.append("HIGH_LONG_PREMIUM (>35% equity in leftover long option mark)")
         if csp_cash_pct > 80:
             flags.append("CSP_COLLATERAL_TIGHT (>80% cash reserved by short put strikes)")
         for lot in lots:
@@ -111,7 +111,7 @@ def build_options_risk(snapshot: dict | None, watch_prices: dict | None = None) 
             "  leftover_long_option_mark=$%.2f (%.1f%% equity; NOT the new-debit cap)  short_option_mark=$%.2f" % (
                 leftover_mark, prem_budget_pct, short_prem
             ),
-            "  new 8/14 debit remaining=$%.2f of $%.0f. Do not HOLD the Friday weekly because Sep mark is already on." % (
+            "  leftover new-debit budget leftover=$%.2f of $%.0f (informational only; no NVDA/QQQ hard-send)." % (
                 new_debit_left, NEW_DEBIT_CAP
             ),
             "  CSP strike collateral notionally=$%.2f (%.1f%% cash)  covered_call_shares_reserved=%.0f" % (
@@ -150,8 +150,8 @@ def build_options_risk(snapshot: dict | None, watch_prices: dict | None = None) 
         else:
             lines.append("  risk flags: none")
         lines.append(
-            "  Budget guide: leftover Sep mark is already spent. New Friday weekly "
-            "debit cap is $800 and is independent of leftover mark. Prefer one 8/14 spread."
+            "  Budget guide: leftover option mark is already spent. There is no "
+            "NVDA/QQQ Friday-weekly obligation. Diversify; do not pile the same factor."
         )
 
         return {
