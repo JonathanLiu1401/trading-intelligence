@@ -31,7 +31,7 @@ MODEL = os.environ.get(
     "DIGITAL_INTERN_X_SEARCH_MODEL",
     os.environ.get("DIGITAL_INTERN_LLM_MODEL", "grok-4.6"),
 )
-HTTP_TIMEOUT_S = int(os.environ.get("DIGITAL_INTERN_X_SEARCH_TIMEOUT_S", "90"))
+HTTP_TIMEOUT_S = int(os.environ.get("DIGITAL_INTERN_X_SEARCH_TIMEOUT_S", "180"))
 MAX_TWEETS = int(os.environ.get("DIGITAL_INTERN_X_SEARCH_MAX_TWEETS", "24"))
 LOOKBACK_HOURS = int(os.environ.get("DIGITAL_INTERN_X_SEARCH_LOOKBACK_HOURS", "24"))
 
