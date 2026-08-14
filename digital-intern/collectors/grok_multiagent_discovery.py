@@ -90,52 +90,13 @@ def _ensure_dirs() -> None:
 
 
 def _load_xai_token() -> str | None:
-    for key in ("PAPER_TRADER_XAI_API_KEY", "XAI_API_KEY"):
-        value = (os.environ.get(key) or "").strip()
-        if value:
-            return value
+    """Same OpenClaw/env token path as intern Grok calls (JSON + SQLite)."""
     try:
-        raw = json.loads(XAI_AUTH_PROFILES_PATH.read_text())
+        from core.claude_cli import _load_xai_access_token
+        return _load_xai_access_token()
     except Exception as e:
-        print(f"[grok_discovery] auth profiles unreadable: {e}")
+        print(f"[grok_discovery] xAI token load failed: {e}")
         return None
-    profiles = raw.get("profiles") if isinstance(raw, dict) else None
-    if not isinstance(profiles, dict):
-        return None
-    preferred = [XAI_AUTH_PROFILE, "xai:default", "xai"]
-    candidates: list[tuple[str, Any]] = []
-    for key in preferred:
-        if key and key in profiles:
-            candidates.append((key, profiles[key]))
-    for key, value in profiles.items():
-        if str(key).startswith("xai:") or (
-            isinstance(value, dict) and str(value.get("provider", "")).lower() == "xai"
-        ):
-            if (key, value) not in candidates:
-                candidates.append((key, value))
-    now_ms = int(time.time() * 1000)
-    for key, value in candidates:
-        if not isinstance(value, dict):
-            continue
-        token = (
-            value.get("access")
-            or value.get("accessToken")
-            or value.get("apiKey")
-            or value.get("api_key")
-            or value.get("token")
-        )
-        if not token:
-            continue
-        expires = value.get("expires")
-        try:
-            exp_i = int(expires) if expires is not None else None
-        except (TypeError, ValueError):
-            exp_i = None
-        if exp_i is not None and exp_i < now_ms:
-            print(f"[grok_discovery] expired auth profile: {key}")
-            continue
-        return str(token)
-    return None
 
 
 def _load_cursor_api_key() -> str | None:

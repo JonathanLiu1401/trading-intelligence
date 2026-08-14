@@ -58,6 +58,7 @@ from collectors.sec_activist_collector import collect as collect_sec_activist
 from collectors.sec_prospectus_collector import collect_sec_prospectus
 from collectors.google_news import collect_google_news
 from collectors.nitter_collector import collect_nitter
+from collectors.x_search_collector import collect_x_search
 from collectors.substack_collector import collect_substack
 from collectors.finnhub_collector import collect_finnhub
 from collectors.alphavantage_collector import collect_alphavantage
@@ -212,6 +213,7 @@ SEC_ENFORCEMENT_INTERVAL = 900    # SEC enforcement: litigation, admin proceedin
 SEC_KEYWORD_INTERVAL  = 3600      # SEC 8-K keyword event scanner (layoffs/M&A/breach) once per hour
 GOOGLE_NEWS_INTERVAL = _env_seconds("GOOGLE_NEWS_INTERVAL", 10)  # high-throughput default: Google News ticker pass every 10s
 NITTER_INTERVAL     = 60          # high-throughput mode: Nitter twitter mirror every 1min
+X_SEARCH_INTERVAL   = _env_seconds("X_SEARCH_INTERVAL", 300)  # xAI x_search tweets every 5min
 SUBSTACK_INTERVAL   = 600         # Substack newsletters every 10min
 FINNHUB_INTERVAL    = 120         # Finnhub per-ticker company news every 2min
 ALPHAVANTAGE_INTERVAL = 1800      # AlphaVantage NEWS_SENTIMENT every 30min (free=25/day)
@@ -387,7 +389,7 @@ SUPERVISOR_STATE_PATH = BASE_DIR / "logs" / "supervisor_state.json"
 # has never logged anything yet.
 ALL_WORKERS = (
     "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft", "sec_xbrl",
-    "google_news", "nitter", "substack",
+    "google_news", "nitter", "x_search", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "yahoo_trending", "wikipedia", "wiki_pageviews", "macro_calendar", "tic", "short_interest",
     "fed_press", "ecb_press", "boj_press", "boe_press", "eia", "shipping_intelligence", "bls", "bea", "g10_cb", "global_reg", "whitehouse", "robinhood_popular",
@@ -417,6 +419,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_enforcement": SEC_ENFORCEMENT_INTERVAL,
     "sec_keyword": SEC_KEYWORD_INTERVAL,
     "google_news": GOOGLE_NEWS_INTERVAL, "nitter": NITTER_INTERVAL,
+    "x_search": X_SEARCH_INTERVAL,
     "substack": SUBSTACK_INTERVAL, "finnhub": FINNHUB_INTERVAL,
     "alphavantage": ALPHAVANTAGE_INTERVAL, "polygon": POLYGON_INTERVAL,
     "massive": MASSIVE_INTERVAL, "newsapi": NEWSAPI_INTERVAL,
@@ -1229,6 +1232,27 @@ def nitter_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(NITTER_INTERVAL)
+
+
+# ── Worker: X/Twitter via xAI x_search — every 5min ─────────────────────────
+def x_search_worker(store: ArticleStore):
+    log.info("[x_search_worker] started")
+    bo = Backoff("x_search", base=20.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_x_search()
+            _ingest(store, articles, "x_search")
+            try:
+                source_health.record_result("x_search", len(articles))
+            except Exception as he:
+                log.warning(f"[x_search_worker] source_health error: {he}")
+            _worker_last_ok["x_search"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[x_search_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(X_SEARCH_INTERVAL)
 
 
 # ── Worker: Substack newsletters — every 10min ──────────────────────────────
@@ -5434,6 +5458,7 @@ def main():
         ("sec_keyword", sec_keyword_worker),
         ("google_news", google_news_worker),
         ("nitter",      nitter_worker),
+        ("x_search",    x_search_worker),
         ("substack",    substack_worker),
         ("finnhub",     finnhub_worker),
         ("alphavantage", alphavantage_worker),

@@ -130,6 +130,86 @@ def _normalize_model_name(model: str | None) -> str:
     return name
 
 
+def _read_openclaw_auth_profiles_sqlite(db_path: Path) -> dict | None:
+    """Read the OpenClaw auth-profile token sink (SQLite, not the JSON name)."""
+    try:
+        import sqlite3
+
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT store_json FROM auth_profile_store "
+                "ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        raw = json.loads(row[0])
+        return raw if isinstance(raw, dict) else None
+    except Exception as e:
+        print(f"[claude_cli] xAI auth sqlite unreadable ({db_path}): {e}")
+        return None
+
+
+def _read_openclaw_auth_profiles() -> dict | None:
+    """Load OpenClaw auth profiles from JSON file or the SQLite token sink.
+
+    OpenClaw 2026+ stores secrets in ``openclaw-agent.sqlite`` under the
+    logical name ``auth-profiles.json``. The JSON file is often absent on
+    VPS installs (only the SQLite WAL store exists), which previously
+    made intern Grok calls fail closed.
+    """
+    path = Path(XAI_AUTH_PROFILES_PATH)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text())
+            if isinstance(raw, dict) and raw.get("profiles"):
+                return raw
+        except Exception as e:
+            print(f"[claude_cli] xAI auth profiles unreadable: {e}")
+    candidates: list[Path] = []
+    if path.suffix.lower() == ".sqlite":
+        candidates.append(path)
+    else:
+        candidates.append(path.with_name("openclaw-agent.sqlite"))
+        candidates.append(path.parent / "openclaw-agent.sqlite")
+    default_sqlite = Path(
+        os.environ.get(
+            "DIGITAL_INTERN_XAI_AUTH_SQLITE",
+            os.environ.get(
+                "PAPER_TRADER_XAI_AUTH_SQLITE",
+                str(
+                    Path.home()
+                    / ".openclaw"
+                    / "agents"
+                    / "main"
+                    / "agent"
+                    / "openclaw-agent.sqlite"
+                ),
+            ),
+        )
+    )
+    candidates.append(default_sqlite)
+    seen: set[Path] = set()
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except Exception:
+            resolved = cand
+        if resolved in seen or not cand.is_file():
+            continue
+        seen.add(resolved)
+        loaded = _read_openclaw_auth_profiles_sqlite(cand)
+        if loaded and loaded.get("profiles"):
+            return loaded
+    print(
+        f"[claude_cli] xAI auth profiles unreadable: no JSON or SQLite store at {path}"
+    )
+    return None
+
+
 def _load_xai_access_token() -> str | None:
     """Resolve a bearer token for api.x.ai from env or OpenClaw auth profiles."""
     for key in (
@@ -140,10 +220,8 @@ def _load_xai_access_token() -> str | None:
         value = (os.environ.get(key) or "").strip()
         if value:
             return value
-    try:
-        raw = json.loads(XAI_AUTH_PROFILES_PATH.read_text())
-    except Exception as e:
-        print(f"[claude_cli] xAI auth profiles unreadable: {e}")
+    raw = _read_openclaw_auth_profiles()
+    if not raw:
         return None
     profiles = raw.get("profiles") if isinstance(raw, dict) else None
     if not isinstance(profiles, dict):
