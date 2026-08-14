@@ -1,8 +1,8 @@
 {
   "indices": ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX", "^FTSE", "^GDAXI", "^N225", "^HSI", "000001.SS"],
   "crypto": ["BTC-USD", "ETH-USD", "SOL-USD"],
-  "commodities": ["GC=F", "CL=F", "SI=F", "NG=F"],
-  "bonds": ["^TNX", "^TYX"],
+  "commodities": ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZC=F"],
+  "bonds": ["^TNX", "^TYX", "TLT", "IEF", "HYG", "LQD"],
   "forex": ["EURUSD=X", "JPY=X", "CNY=X"],
   "memory_core": ["MU", "WDC", "STX"],
   "semis_equipment": ["LRCX", "AMAT", "KLAC", "ASML", "TOELY"],
@@ -10,7 +10,24 @@
   "memory_options_focus": ["MU"],
   "korean": ["005930.KS", "000660.KS"],
   "japanese": ["6758.T", "9984.T", "6501.T", "6752.T"],
-  "etfs": ["SMH", "SOXX", "PSI", "SPY", "QQQ", "IWM"],
+  "etfs": ["SMH", "SOXX", "PSI", "SPY", "QQQ", "IWM", "XLK", "XLF", "XLV", "XLE", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE", "XLU"],
+  "sector_etfs": ["XLK", "XLF", "XLV", "XLE", "XLI", "XLC", "XLY", "XLP", "XLB", "XLRE", "XLU", "XBI", "KBE", "XOP", "ITA", "XHB"],
+  "healthcare": ["LLY", "UNH", "JNJ", "ABBV", "MRK", "PFE", "AMGN", "VRTX", "ISRG", "TMO", "HUM", "CI", "CVS", "MDT"],
+  "financials": ["JPM", "BAC", "WFC", "GS", "MS", "C", "V", "MA", "BLK", "SCHW", "AXP", "PGR"],
+  "energy": ["XOM", "CVX", "COP", "EOG", "SLB", "OXY", "MPC", "VLO", "XLE", "XOP"],
+  "utilities_power": ["NEE", "SO", "DUK", "AEP", "CEG", "VST", "NRG", "EXC", "XLU"],
+  "industrials_defense": ["CAT", "DE", "GE", "HON", "ETN", "UNP", "UPS", "LMT", "RTX", "NOC", "GD", "BA"],
+  "materials_mining": ["FCX", "NEM", "GOLD", "RIO", "BHP", "VALE", "ALB", "MP", "XLB"],
+  "consumer": ["WMT", "COST", "TGT", "HD", "MCD", "SBUX", "NKE", "PG", "KO", "PEP", "PM", "XLP", "XLY"],
+  "real_estate": ["PLD", "AMT", "EQIX", "DLR", "SPG", "O", "WELL", "XLRE"],
   "portfolio": ["LITE", "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS"],
-  "keywords": ["DRAM", "NAND", "HBM", "HBM3E", "HBM4", "memory", "semiconductor", "foundry", "KOSPI", "Micron", "SK Hynix", "SK hynix", "000660.KS", "Samsung", "Samsung Electronics", "005930.KS", "Kioxia", "Western Digital", "LPDDR", "Fed", "inflation", "CPI", "earnings", "recession", "GDP", "interest rate", "tariff", "China", "export controls", "AI chips"]
+  "keywords": [
+    "DRAM", "NAND", "HBM", "HBM3E", "HBM4", "memory", "semiconductor", "foundry",
+    "KOSPI", "Micron", "SK Hynix", "SK hynix", "000660.KS", "Samsung", "Samsung Electronics",
+    "005930.KS", "Kioxia", "Western Digital", "LPDDR", "Fed", "inflation", "CPI", "earnings",
+    "recession", "GDP", "interest rate", "tariff", "China", "export controls", "AI chips",
+    "sector rotation", "defensive sectors", "healthcare stocks", "bank earnings", "oil prices",
+    "utilities", "power demand", "data center power", "GLP-1", "biotech", "REITs",
+    "consumer staples", "industrials", "defense stocks", "copper", "lithium", "gold"
+  ]
 }

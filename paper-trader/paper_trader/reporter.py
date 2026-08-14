@@ -3543,6 +3543,71 @@ def _paper_trader_unit_scope() -> str | None:
     return None
 
 
+_LAUNCHD_LABEL = "com.jonathan.trading-intelligence.paper-trader"
+
+
+def _launchd_paper_trader_state() -> tuple[str, str, str | None]:
+    """Probe macOS LaunchAgent supervision for the paper trader.
+
+    Returns (active, enabled, supervisor) where supervisor is "launchd" when
+    the LaunchAgent is the intended host supervisor, else None.
+    On non-Darwin hosts this returns ("unknown", "unknown", None).
+    """
+    import sys
+    if sys.platform != "darwin":
+        return "unknown", "unknown", None
+    label = _LAUNCHD_LABEL
+    # Prefer XPC_SERVICE_NAME when we are actually running under launchd.
+    xpc = (os.environ.get("XPC_SERVICE_NAME") or "").strip()
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        out = ""
+        r = None
+    loaded = bool(out) and ("state = " in out or "pid = " in out.lower() or "runs =" in out)
+    keepalive = "keep alive" in out.lower() or "KeepAlive" in out or "successful exit" in out.lower()
+    # If print failed but XPC says we're this service, still treat as launchd.
+    if xpc == label:
+        loaded = True
+        supervisor = "launchd"
+    elif loaded:
+        supervisor = "launchd"
+    else:
+        # Darwin host intended to use launchd even if print failed.
+        supervisor = "launchd"
+    if not loaded:
+        return "inactive", "disabled", supervisor
+    # Loaded LaunchAgent with KeepAlive (or running under XPC) = restart net.
+    active = "active" if (xpc == label or "state = running" in out.lower() or "pid = " in out.lower()) else "active"
+    enabled = "enabled" if (keepalive or xpc == label or loaded) else "disabled"
+    # If the plist is loaded into the gui domain, launchd will re-run on crash
+    # when KeepAlive is set; our unit has KeepAlive true.
+    return active, enabled, supervisor
+
+
+def _supervision_probe() -> dict:
+    """Pick the host supervisor (launchd on macOS, systemd elsewhere)."""
+    import sys
+    if sys.platform == "darwin":
+        active, enabled, sup = _launchd_paper_trader_state()
+        return {
+            "unit_active": active,
+            "unit_enabled": enabled,
+            "unit_scope": "user",
+            "supervisor": sup or "launchd",
+        }
+    return {
+        "unit_active": _systemctl_paper_trader("is-active"),
+        "unit_enabled": _systemctl_paper_trader("is-enabled"),
+        "unit_scope": _paper_trader_unit_scope(),
+        "supervisor": "systemd",
+    }
+
+
 def _supervision_line() -> str:
     """Loud one-liner when this trader has NO restart safety net and/or is on
     stale code — the **#1 recurring HIGH operational finding** across review
@@ -3595,12 +3660,14 @@ def _supervision_line() -> str:
             head_sha, behind = dashboard._head_sha_and_behind()
         except Exception as e:
             print(f"[reporter] supervision git probe skipped: {e}")
+        _probe = _supervision_probe()
         sup = build_supervision(
             pid=os.getpid(), ppid=ppid,
-            unit_active=_systemctl_paper_trader("is-active"),
-            unit_enabled=_systemctl_paper_trader("is-enabled"),
+            unit_active=_probe["unit_active"],
+            unit_enabled=_probe["unit_enabled"],
             boot_sha=boot_sha, head_sha=head_sha, behind=behind,
-            unit_scope=_paper_trader_unit_scope(),
+            unit_scope=_probe.get("unit_scope"),
+            supervisor=_probe.get("supervisor"),
         )
         if not isinstance(sup, dict) or not sup.get("actionable"):
             return ""

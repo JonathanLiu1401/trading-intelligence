@@ -10,6 +10,7 @@ match.
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -920,6 +921,69 @@ class TestExecuteBuy:
         assert pos["qty"] == 10
         assert fresh_store.get_portfolio()["cash"] == 0.0
 
+    def test_stock_buy_auto_leverage_when_underdeployed(self, fresh_store, monkeypatch):
+        # All-cash book: 1-share 1x buy should be auto-boosted toward the
+        # 120-150% deployment mandate within BP and the 70% name cap.
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {
+            "cash": 1000.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 1500.0,
+            "positions": [],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "AMD",
+            "qty": 1,
+            "leverage": 1,
+            "reasoning": "deploy cash",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        pos = fresh_store.open_positions()[0]
+        # 70% name cap on $1000 book => max $700 => 7 shares at $100.
+        assert pos["qty"] == 7
+        assert "auto_leverage" in detail
+        assert fresh_store.get_portfolio()["cash"] == 300.0
+
+    def test_stock_buy_no_auto_leverage_when_target_met(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        # Net worth 1000, gross longs already 1300 (1.3x), cash 5%.
+        snap = {
+            "cash": 50.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 550.0,
+            "positions": [
+                {
+                    "ticker": "NVDA",
+                    "type": "stock",
+                    "qty": 7.0,
+                    "avg_cost": 100.0,
+                    "current_price": 100.0,
+                    "market_value": 700.0,
+                },
+                {
+                    "ticker": "AMZN",
+                    "type": "stock",
+                    "qty": 6.0,
+                    "avg_cost": 100.0,
+                    "current_price": 100.0,
+                    "market_value": 600.0,
+                },
+            ],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "AMD",
+            "qty": 1,
+            "leverage": 1,
+            "reasoning": "small add",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert "BUY 1" in detail
+        assert "auto_leverage" not in detail
+
     def test_buy_blocked_when_no_price(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: None)
         snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
@@ -1005,6 +1069,76 @@ class TestExecuteBuy:
         assert status == "BLOCKED"
         assert "churn cooldown" in detail
 
+class TestIssuerCatalystGuard:
+    """Keyword->ticker puns must hard-block before fill (TV/FCC incident)."""
+
+    def test_tv_fcc_local_broadcast_is_blocked(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 2.8)
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        snap = {
+            "cash": 10000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 15000.0,
+            "positions": [],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "TV",
+            "qty": 350,
+            "reasoning": (
+                "score-10 FCC catalyst shredding local TV ownership caps; "
+                "US broadcast deregulation tailwind"
+            ),
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "issuer/catalyst mismatch" in detail
+        assert fresh_store.open_positions() == []
+
+    def test_tv_with_televisa_issuer_named_is_allowed(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 2.8)
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "ENTRY_COOLDOWN_AFTER_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "ENTRY_COOLDOWN_AFTER_ANY_TRADE_S", 0)
+        snap = {
+            "cash": 10000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 15000.0,
+            "positions": [],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "TV",
+            "qty": 100,
+            "reasoning": (
+                "Grupo Televisa (TV) advertising rebound in Mexico with "
+                "improving free cash flow; issuer-specific thesis"
+            ),
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED", detail
+        assert any(p["ticker"] == "TV" for p in fresh_store.open_positions())
+
+    def test_ambiguous_ticker_without_issuer_is_blocked(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 10.0)
+        snap = {
+            "cash": 10000.0,
+            "total_value": 10000.0,
+            "stock_buying_power": 15000.0,
+            "positions": [],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "OPEN",
+            "qty": 50,
+            "reasoning": "open source AI momentum breakout",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "issuer/catalyst" in detail
+
+
+
 
 class TestExecutePortfolioJsonConsistency:
     """``_execute`` updates cash mid-cycle but MUST NOT overwrite
@@ -1036,6 +1170,7 @@ class TestExecutePortfolioJsonConsistency:
         assert pf["positions"] == seeded
 
     def test_sell_does_not_clobber_seeded_positions_json(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
         seeded = [
             {"ticker": "AMD", "type": "stock", "qty": 5, "avg_cost": 100.0,
              "current_price": 120.0, "unrealized_pl": 100.0, "market_value": 600.0},
@@ -1092,6 +1227,7 @@ class TestExecutePortfolioJsonConsistency:
 
 class TestExecuteSell:
     def test_sell_increases_cash_and_closes_position(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
         monkeypatch.setattr(market, "get_price", lambda t: 120.0)
         # Seed position: 5 @ 100. Snapshot reflects the open position.
         fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
@@ -1107,6 +1243,177 @@ class TestExecuteSell:
         assert pf["cash"] == 1100.0
         # Position fully closed.
         assert fresh_store.open_positions() == []
+
+    def test_sell_under_minimum_hold_is_blocked_when_lock_enabled(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 72 * 3600)
+        monkeypatch.setattr(market, "get_price", lambda t: 120.0)
+        fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
+        snap = {
+            "cash": 9500.0, "total_value": 10000.0,
+            "positions": [{"ticker": "AMD", "type": "stock", "qty": 5,
+                           "avg_cost": 100.0}],
+        }
+        decision = {"action": "SELL", "ticker": "AMD", "qty": 5,
+                    "reasoning": "mild discomfort"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "minimum-hold lock" in detail
+        assert fresh_store.open_positions()[0]["qty"] == pytest.approx(5.0)
+
+    def test_sell_same_day_allowed_when_min_hold_disabled(self, fresh_store, monkeypatch):
+        # Default day-trade mode: no forced multi-day hold.
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(market, "get_price", lambda t: 120.0)
+        fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
+        snap = {
+            "cash": 9500.0, "total_value": 10000.0,
+            "positions": [{"ticker": "AMD", "type": "stock", "qty": 5,
+                           "avg_cost": 100.0}],
+        }
+        decision = {"action": "SELL", "ticker": "AMD", "qty": 5,
+                    "reasoning": "take profit same day"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert detail.startswith("SELL 5")
+        assert fresh_store.open_positions() == []
+
+    def test_sell_after_minimum_hold_is_allowed(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 72 * 3600)
+        monkeypatch.setattr(market, "get_price", lambda t: 120.0)
+        fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
+        old_open = (
+            datetime.now(timezone.utc) - timedelta(hours=73)
+        ).isoformat()
+        with fresh_store._lock:
+            fresh_store.conn.execute(
+                "UPDATE positions SET opened_at=? WHERE ticker='AMD'",
+                (old_open,),
+            )
+            fresh_store.conn.commit()
+        snap = {
+            "cash": 9500.0, "total_value": 10000.0,
+            "positions": [{"ticker": "AMD", "type": "stock", "qty": 5,
+                           "avg_cost": 100.0, "opened_at": old_open}],
+        }
+        decision = {"action": "SELL", "ticker": "AMD", "qty": 5,
+                    "reasoning": "actual thesis changed"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert detail.startswith("SELL 5")
+        assert fresh_store.open_positions() == []
+
+
+
+
+class TestUnderwaterPanicSellGuard:
+    """Permanent Jonathan 2026-08-10 rule: do not sell low / cover high on vibes."""
+
+    def test_underwater_stock_sell_blocked_on_weakening(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "BLOCK_UNDERWATER_DISCRETIONARY_EXITS", True)
+        monkeypatch.setattr(market, "get_price", lambda t: 85.0)
+        fresh_store.upsert_position("LITE", "stock", qty=4, avg_cost=100.0)
+        snap = {
+            "cash": 5000.0, "total_value": 10000.0,
+            "positions": [{
+                "ticker": "LITE", "type": "stock", "qty": 4,
+                "avg_cost": 100.0, "current_price": 85.0,
+            }],
+        }
+        decision = {
+            "action": "SELL", "ticker": "LITE", "qty": 4,
+            "reasoning": "largest drag / weakening tape / thesis break long leg -17%",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "underwater panic-sell blocked" in detail
+        assert fresh_store.open_positions()[0]["qty"] == pytest.approx(4.0)
+
+    def test_underwater_stock_sell_allowed_on_hard_stop(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "BLOCK_UNDERWATER_DISCRETIONARY_EXITS", True)
+        monkeypatch.setattr(market, "get_price", lambda t: 85.0)
+        fresh_store.upsert_position("LITE", "stock", qty=4, avg_cost=100.0)
+        snap = {
+            "cash": 5000.0, "total_value": 10000.0,
+            "positions": [{
+                "ticker": "LITE", "type": "stock", "qty": 4,
+                "avg_cost": 100.0, "current_price": 85.0,
+            }],
+        }
+        decision = {
+            "action": "SELL", "ticker": "LITE", "qty": 4,
+            "reasoning": "hard stop hit at -8%",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert detail.startswith("SELL")
+
+    def test_underwater_stock_sell_allowed_on_real_thesis_kill(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "BLOCK_UNDERWATER_DISCRETIONARY_EXITS", True)
+        monkeypatch.setattr(market, "get_price", lambda t: 85.0)
+        fresh_store.upsert_position("LITE", "stock", qty=4, avg_cost=100.0)
+        snap = {
+            "cash": 5000.0, "total_value": 10000.0,
+            "positions": [{
+                "ticker": "LITE", "type": "stock", "qty": 4,
+                "avg_cost": 100.0, "current_price": 85.0,
+            }],
+        }
+        decision = {
+            "action": "SELL", "ticker": "LITE", "qty": 4,
+            "reasoning": "thesis kill: company issued guidance cut and lost major contract",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+
+    def test_winner_stock_sell_still_allowed(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "BLOCK_UNDERWATER_DISCRETIONARY_EXITS", True)
+        monkeypatch.setattr(market, "get_price", lambda t: 120.0)
+        fresh_store.upsert_position("NVDA", "stock", qty=2, avg_cost=100.0)
+        snap = {
+            "cash": 5000.0, "total_value": 10000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 2,
+                "avg_cost": 100.0, "current_price": 120.0,
+            }],
+        }
+        decision = {
+            "action": "SELL", "ticker": "NVDA", "qty": 2,
+            "reasoning": "take profit",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+
+    def test_underwater_cover_blocked(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(strategy, "BLOCK_UNDERWATER_DISCRETIONARY_EXITS", True)
+        monkeypatch.setattr(market, "get_price", lambda t: 120.0)
+        fresh_store.upsert_position("AMD", "stock", qty=-3, avg_cost=100.0)
+        snap = {
+            "cash": 5000.0, "total_value": 10000.0,
+            "positions": [{
+                "ticker": "AMD", "type": "stock", "qty": -3,
+                "avg_cost": 100.0, "current_price": 120.0,
+            }],
+        }
+        decision = {
+            "action": "COVER", "ticker": "AMD", "qty": 3,
+            "reasoning": "went red, largest drag, weakening",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "underwater panic-sell blocked" in detail
+
+    def test_is_thesis_kill_rejects_panic_phrasing(self):
+        assert strategy._is_thesis_kill_exit({
+            "reasoning": "thesis break / long leg -17% / largest drag / weakening",
+        }) is False
+        assert strategy._is_thesis_kill_exit({
+            "reasoning": "thesis kill after guidance cut and revenue miss",
+        }) is True
 
 
 class TestExecuteShort:
@@ -1130,6 +1437,7 @@ class TestExecuteShort:
         assert pos["take_profit_price"] == pytest.approx(85.0)
 
     def test_cover_decreases_cash_and_closes_short(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
         monkeypatch.setattr(market, "get_price", lambda t: 90.0)
         fresh_store.upsert_position("AMD", "stock", qty=-3, avg_cost=100.0)
         snap = {"cash": 1300.0, "total_value": 1000.0,
@@ -1140,6 +1448,32 @@ class TestExecuteShort:
         assert status == "FILLED"
         assert detail.startswith("COVER 3")
         assert fresh_store.get_portfolio()["cash"] == pytest.approx(1030.0)
+        assert fresh_store.open_positions() == []
+
+    def test_cover_under_minimum_hold_is_blocked_when_lock_enabled(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 72 * 3600)
+        monkeypatch.setattr(market, "get_price", lambda t: 90.0)
+        fresh_store.upsert_position("AMD", "stock", qty=-3, avg_cost=100.0)
+        snap = {"cash": 1300.0, "total_value": 10000.0,
+                "positions": [{"ticker": "AMD", "type": "stock", "qty": -3}]}
+        decision = {"action": "COVER", "ticker": "AMD", "qty": 3,
+                    "reasoning": "paper hands"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "minimum-hold lock" in detail
+        assert fresh_store.open_positions()[0]["qty"] == pytest.approx(-3.0)
+
+    def test_cover_same_day_allowed_when_min_hold_disabled(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 0)
+        monkeypatch.setattr(market, "get_price", lambda t: 90.0)
+        fresh_store.upsert_position("AMD", "stock", qty=-3, avg_cost=100.0)
+        snap = {"cash": 1300.0, "total_value": 10000.0,
+                "positions": [{"ticker": "AMD", "type": "stock", "qty": -3}]}
+        decision = {"action": "COVER", "ticker": "AMD", "qty": 3,
+                    "reasoning": "take profit same day"}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert detail.startswith("COVER 3")
         assert fresh_store.open_positions() == []
 
 
@@ -1174,6 +1508,40 @@ class TestExecuteBuyCall:
         status, detail = strategy._execute(decision, snap, fresh_store)
         assert status == "BLOCKED"
         assert "insufficient cash" in detail
+
+    def test_buy_call_can_use_margin_above_cash(self, fresh_store, monkeypatch):
+        # Premium $5 * 1 * 100 = $500. Cash only $50, but BP = cash + 50% NW.
+        monkeypatch.setattr(market, "get_option_price", lambda t, e, s, ot: 5.0)
+        snap = {
+            "cash": 50.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 550.0,
+            "positions": [],
+        }
+        decision = {"action": "BUY_CALL", "ticker": "NVDA", "qty": 1,
+                    "strike": 600, "expiry": "2026-12-19", "reasoning": ""}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert "BUY_CALL" in detail
+        # Cash goes negative within margin BP.
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(-450.0)
+        pos = fresh_store.open_positions()[0]
+        assert pos["type"] == "call"
+        assert pos["qty"] == pytest.approx(1.0)
+
+    def test_buy_call_blocked_when_margin_bp_insufficient(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_option_price", lambda t, e, s, ot: 5.0)
+        snap = {
+            "cash": 50.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 400.0,  # need 500
+            "positions": [],
+        }
+        decision = {"action": "BUY_CALL", "ticker": "NVDA", "qty": 1,
+                    "strike": 600, "expiry": "2026-12-19", "reasoning": ""}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "insufficient cash/buying power" in detail
 
     def test_buy_call_blocked_on_non_numeric_strike(self, fresh_store):
         # Regression: Claude can emit strike="ATM" (a description, not a
@@ -1280,10 +1648,12 @@ class TestExecuteSellCallDisambiguation:
         snap = {"cash": 1000.0, "total_value": 2000.0, "positions": positions}
         decision = {"action": "SELL_CALL", "ticker": "NVDA", "qty": 2,
                     "strike": 700, "expiry": "2026-12-19", "reasoning": ""}
-        # The pre-trade gate alone would pass (held summed across strikes = 2).
-        ok, _ = strategy._enforce_risk_pre_trade(decision, snap)
-        assert ok is True
-        # But _execute caps at the matched contract's qty (1) and blocks.
+        # Pre-trade now also disambiguates by strike/expiry and blocks oversize
+        # on the matched contract (stronger than summing held across strikes).
+        ok, why = strategy._enforce_risk_pre_trade(decision, snap)
+        assert ok is False
+        assert "exceeds held" in why.lower()
+        # _execute remains blocked the same way; no phantom fill.
         status, detail = strategy._execute(decision, snap, fresh_store)
         assert status == "BLOCKED"
         assert "exceeds held" in detail.lower()

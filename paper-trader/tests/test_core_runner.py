@@ -401,6 +401,9 @@ class TestKillStaleClaude:
         # `pkill -f` matches (against the space-joined command line).
         if model.startswith("gpt-"):
             return " ".join(["codex", "exec", "--model", model, "-c"])
+        if model.startswith("grok-") or model.startswith("xai/"):
+            name = model.split("/", 1)[1] if model.startswith("xai/") else model
+            return f"xai-http --model {name}"
         return " ".join(
             ["claude", "--model", model, "--print",
              "--permission-mode", "bypassPermissions"]

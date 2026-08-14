@@ -42,9 +42,10 @@ class TestNewsKeyRegression:
         assert op["action"] == "BUY"
         assert op["ticker"] == "NVDA"
 
-    def test_bearish_article_does_not_trigger_a_buy(self):
+    def test_bearish_article_drives_a_short(self):
         # Sentiment direction must be respected: a bearish catalyst yields a
-        # negative ticker score, which is below the buy threshold → HOLD.
+        # negative ticker score. Live advisory should surface that as SHORT,
+        # not merely suppress BUY.
         articles = [{
             "id": 2,
             "title": "AMD plunges on weak guidance miss",
@@ -56,7 +57,8 @@ class TestNewsKeyRegression:
             articles, quant_sigs={}, snap=_snap(), watch_px={"AMD": 150.0},
         )
         assert op is not None
-        assert op["action"] == "HOLD"
+        assert op["action"] == "SHORT"
+        assert op["ticker"] == "AMD"
 
     def test_score_key_still_works_as_fallback(self):
         # Backtest-shaped input (carries "score", no "ai_score") must still
@@ -118,9 +120,9 @@ class TestPunctuationTokenization:
         assert op["action"] == "BUY"
         assert op["ticker"] == "NVDA"
 
-    def test_trailing_punctuation_bearish_is_respected(self):
+    def test_trailing_punctuation_bearish_drives_short(self):
         # Mirror image: punctuation-trailed bearish words must now register a
-        # negative sentiment so the name stays below the buy threshold.
+        # negative sentiment so the name can become a short candidate.
         articles = [{
             "id": 11,
             "title": "AMD plunges! Guidance disappoints, analysts warn.",
@@ -132,7 +134,8 @@ class TestPunctuationTokenization:
             articles, quant_sigs={}, snap=_snap(), watch_px={"AMD": 150.0},
         )
         assert op is not None
-        assert op["action"] == "HOLD"
+        assert op["action"] == "SHORT"
+        assert op["ticker"] == "AMD"
 
     def test_exact_match_not_prefix_no_false_positive(self):
         # The fix tokenizes but keeps EXACT membership (not the backtest's
@@ -248,8 +251,8 @@ class TestRegimeAndUniverseGuards:
         # `watch_px` is the live universe gate: a ticker with no live price
         # (yfinance dead / delisted / off-hours) must NOT be picked as best
         # even when its score is the highest. Without the `px and px > 0`
-        # guard the engine would emit a BUY recommendation for a name the
-        # trader cannot actually transact in.
+        # guard the engine would emit a recommendation for a name the trader
+        # cannot actually transact in.
         articles = [{
             "id": 200,
             "title": "NVDA surges to record on strong AI demand",
@@ -263,6 +266,101 @@ class TestRegimeAndUniverseGuards:
         )
         assert op is not None
         assert op["action"] == "HOLD"
+
+    def test_allbirds_keyword_mapping_can_drive_short(self):
+        # User-facing regression: ArticleNet can surface Allbirds/Smartbird
+        # bearish/distress coverage even if ticker extraction misses BIRD.
+        articles = [{
+            "id": 201,
+            "title": "Allbirds plunges on weak outlook after Smartbird pivot",
+            "ai_score": 8.0,
+            "urgency": 4,
+            "tickers": [],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(), watch_px={"BIRD": 1.25},
+        )
+        assert op is not None
+        assert op["action"] == "SHORT"
+        assert op["ticker"] == "BIRD"
+
+    def test_priceable_off_watchlist_ticker_can_be_chosen(self):
+        # The advisory should not be blind to hot tickers merely because they
+        # are outside the curated WATCHLIST. The live cycle now scans a much
+        # larger ArticleNet discovery set and passes the hottest priceable
+        # names into watch_px; price remains the executable gate.
+        articles = [{
+            "id": 202,
+            "title": "PLTR surges to record on strong AI demand",
+            "ai_score": 9.0,
+            "urgency": 1,
+            "tickers": ["PLTR"],
+        }]
+        assert "PLTR" not in strategy.WATCHLIST
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(), watch_px={"PLTR": 250.0},
+        )
+        assert op is not None
+        assert op["action"] == "BUY"
+        assert op["ticker"] == "PLTR"
+
+    def test_off_watchlist_still_requires_live_price(self):
+        articles = [{
+            "id": 203,
+            "title": "PLTR surges to record on strong AI demand",
+            "ai_score": 9.0,
+            "urgency": 1,
+            "tickers": ["PLTR"],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(), watch_px={"PLTR": None},
+        )
+        assert op is not None
+        assert op["action"] == "HOLD"
+
+
+class TestResearchDiscovery:
+    def test_discovery_ranks_off_watchlist_heat_and_tracks_100x_target(self):
+        articles = [
+            {"id": 1, "title": "PLTR surges on strong AI demand",
+             "ai_score": 8.0, "urgency": 1, "tickers": ["PLTR", "NVDA"]},
+            {"id": 2, "title": "RDDT rallies on record growth",
+             "ai_score": 6.0, "urgency": 0, "tickers": ["RDDT"]},
+            {"id": 3, "title": "PLTR jumps again",
+             "ai_score": 5.0, "urgency": 2, "tickers": ["PLTR"]},
+        ]
+        out = strategy._research_discovery(
+            articles,
+            strategy.WATCHLIST,
+            target_size=len(strategy.WATCHLIST) * 100,
+            top_n=5,
+        )
+        assert out["target_size"] == len(strategy.WATCHLIST) * 100
+        assert out["multiple"] == strategy.RESEARCH_UNIVERSE_MULTIPLE
+        assert out["n_articles_scanned"] == 3
+        assert out["top"][0]["ticker"] == "PLTR"
+        assert out["top"][0]["n"] == 2
+        # WATCHLIST names are not "discovered" off-watchlist candidates.
+        assert all(r["ticker"] != "NVDA" for r in out["top"])
+
+    def test_research_prompt_block_mentions_target_and_hottest_names(self):
+        out = strategy._research_discovery(
+            [{"id": 1, "title": "SNAP plunges on weak guidance",
+              "ai_score": 7.0, "urgency": 1, "tickers": ["SNAP"]}],
+            strategy.WATCHLIST,
+            target_size=len(strategy.WATCHLIST) * 100,
+            top_n=5,
+        )
+        block = strategy._research_discovery_prompt_block(out)
+        assert block is not None
+        assert f"target={len(strategy.WATCHLIST) * 100}" in block
+        assert "SNAP" in block
+        assert "Hottest off-watchlist" in block
+
+    def test_snk_is_in_watchlist_and_leveraged_registry(self):
+        assert "SNK" in strategy.WATCHLIST
+        assert "SNK" in strategy._LEVERAGED_ETFS_SL
+        assert "SNK" in strategy._LEVERAGED_ETFS_LIVE
 
 
 class TestKeywordSubstringFalsePositives:

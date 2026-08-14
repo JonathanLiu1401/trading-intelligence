@@ -154,6 +154,14 @@ def _is_dead(ticker: str) -> bool:
 
 
 def _mark_dead(ticker: str):
+    # Never cache media/legal/accounting false-positives as "dead tickers".
+    # Those are extraction junk, not missing market data.
+    try:
+        from paper_trader.signals import _NOT_TICKERS as _junk_tokens
+        if str(ticker or "").upper().strip() in _junk_tokens:
+            return
+    except Exception:
+        pass
     # Only log the first time a symbol goes dead within a TTL window, not every cycle.
     if not _is_dead(ticker):
         print(f"[market] no data for {ticker}; suppressing re-fetch for {int(_DEAD_TTL)}s")
@@ -207,6 +215,15 @@ def dead_tickers() -> list[dict]:
     # only touched from market.py's own helpers (no external writers),
     # but the runner main thread and the dashboard request threads both
     # call into this module concurrently.
+    # Lazy-import the article false-positive denylist so media/legal/accounting
+    # tokens never surface as "dead tickers" just because discovery briefly
+    # tried to price them. Also purge them from the cache so the next cycle
+    # does not keep re-reporting junk.
+    try:
+        from paper_trader.signals import _NOT_TICKERS as _junk_tokens
+    except Exception:
+        _junk_tokens = frozenset()
+
     for tk, ts in list(_DEAD_CACHE.items()):
         try:
             elapsed = max(0.0, float(now) - float(ts))
@@ -215,6 +232,10 @@ def dead_tickers() -> list[dict]:
         if elapsed >= _DEAD_TTL:
             # Already past the TTL — would be re-fetched on the very next
             # get_price() call. Don't report as "dark" (false alarm).
+            continue
+        sym = str(tk or "").upper().strip()
+        if sym in _junk_tokens:
+            _DEAD_CACHE.pop(tk, None)
             continue
         out.append({
             "ticker": tk,

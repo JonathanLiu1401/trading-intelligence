@@ -43,12 +43,25 @@ _UA = (
 )
 
 SECTOR_FEEDS: dict[str, str] = {
+    # Energy / power / mining
     "offshore_energy": "https://www.offshore-energy.biz/feed/",
-    "power_magazine":  "https://www.powermag.com/feed/",
-    "mining_com":      "https://www.mining.com/feed/",
-    "ns_energy":       "https://www.nsenergybusiness.com/feed/",
-    "utility_dive":    "https://www.utilitydive.com/feeds/news/",
-    "pv_magazine":     "https://www.pv-magazine.com/feed/",
+    "power_magazine": "https://www.powermag.com/feed/",
+    "mining_com": "https://www.mining.com/feed/",
+    "ns_energy": "https://www.nsenergybusiness.com/feed/",
+    "utility_dive": "https://www.utilitydive.com/feeds/news/",
+    "pv_magazine": "https://www.pv-magazine.com/feed/",
+    # Healthcare / biopharma
+    "stat_news": "https://www.statnews.com/feed/",
+    "fierce_pharma": "https://www.fiercepharma.com/rss/xml",
+    "biopharma_dive": "https://www.biopharmadive.com/feeds/news/",
+    "healthcare_dive": "https://www.healthcaredive.com/feeds/news/",
+    # Financials / consumer / industrials
+    "banking_dive": "https://www.bankingdive.com/feeds/news/",
+    "retail_dive": "https://www.retaildive.com/feeds/news/",
+    "food_dive": "https://www.fooddive.com/feeds/news/",
+    "construction_dive": "https://www.constructiondive.com/feeds/news/",
+    "supply_chain_dive": "https://www.supplychaindive.com/feeds/news/",
+    "defense_news": "https://www.defensenews.com/arc/outboundfeeds/rss/?outputType=xml",
 }
 
 # sector → (keywords, tickers)
@@ -56,19 +69,35 @@ _SECTOR_MAP: list[tuple[list[str], list[str]]] = [
     # Mining / critical minerals
     (["copper", "lithium", "cobalt", "nickel", "rare earth", "mining", "ore", "gold",
       "silver", "uranium", "tungsten", "manganese", "graphite"],
-     ["FCX", "VALE", "RIO", "BHP", "ALB", "MP", "GOLD", "NEM", "RGLD", "LAC"]),
+     ["FCX", "VALE", "RIO", "BHP", "ALB", "MP", "GOLD", "NEM", "RGLD", "LAC", "XLB"]),
     # Offshore / oil services
     (["offshore", "deepwater", "subsea", "fpso", "drillship", "jack-up", "oil services",
       "exploration", "slb", "halliburton", "transocean"],
-     ["SLB", "HAL", "RIG", "DO", "OII", "PTEN", "VAL", "FTI"]),
+     ["SLB", "HAL", "RIG", "DO", "OII", "PTEN", "VAL", "FTI", "XLE"]),
     # Power generation / utilities
     (["utility", "utilities", "grid", "transmission", "power plant", "generation",
       "nuclear", "natural gas power", "coal plant", "load growth", "data center power"],
-     ["NEE", "AEP", "DUK", "SO", "EXC", "PCG", "D", "EVRG", "VST", "NRG"]),
+     ["NEE", "AEP", "DUK", "SO", "EXC", "PCG", "D", "EVRG", "VST", "NRG", "CEG", "XLU"]),
     # Solar / storage / clean energy
     (["solar", "photovoltaic", "pv", "battery storage", "bess", "wind farm",
       "renewable energy", "clean energy", "energy storage"],
      ["FSLR", "ENPH", "SEDG", "CSIQ", "JKS", "ARRY", "RUN", "FLNC", "ICLN"]),
+    # Healthcare / biopharma
+    (["fda", "drug", "biotech", "pharma", "hospital", "medicare", "glp-1", "obesity",
+      "clinical trial", "health insurance", "payer", "biopharma"],
+     ["LLY", "NVO", "UNH", "JNJ", "ABBV", "MRK", "PFE", "AMGN", "VRTX", "ISRG", "XLV", "XBI"]),
+    # Banks / financials
+    (["bank", "lending", "credit card", "net interest", "deposit", "loan loss",
+      "mortgage", "fintech", "payments"],
+     ["JPM", "BAC", "WFC", "GS", "MS", "C", "V", "MA", "BLK", "SCHW", "XLF", "KBE"]),
+    # Consumer / retail / staples
+    (["retail", "grocery", "consumer spending", "same-store", "e-commerce",
+      "brand pricing", "restaurant", "cpg"],
+     ["WMT", "COST", "TGT", "HD", "MCD", "SBUX", "NKE", "PG", "KO", "PEP", "XLY", "XLP"]),
+    # Industrials / defense / supply chain
+    (["defense", "weapons", "aerospace", "manufacturing", "supply chain", "freight",
+      "construction", "infrastructure", "factory"],
+     ["CAT", "DE", "GE", "HON", "ETN", "UNP", "UPS", "LMT", "RTX", "NOC", "GD", "BA", "XLI", "ITA"]),
 ]
 
 

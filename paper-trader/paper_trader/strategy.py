@@ -32,8 +32,8 @@ except Exception:  # pragma: no cover - stdlib-only module, import can't fail
     def host_saturated(*_a, **_k):
         return (False, "host_guard unavailable")
 
-MODEL = os.environ.get("PAPER_TRADER_MODEL", "grok-4.5")
-FALLBACK_MODEL = os.environ.get("PAPER_TRADER_FALLBACK_MODEL", "grok-4.5")
+MODEL = os.environ.get("PAPER_TRADER_MODEL", "grok-4.6")
+FALLBACK_MODEL = os.environ.get("PAPER_TRADER_FALLBACK_MODEL", "grok-4.6")
 CODEX_AUTH_FALLBACK_MODEL = os.environ.get(
     "PAPER_TRADER_CODEX_AUTH_FALLBACK_MODEL",
     "",
@@ -60,12 +60,12 @@ XAI_AUTH_PROFILE = os.environ.get(
 )
 # Cursor CLI OpenAI-compatible proxy (LaunchAgent com.cursor-agent-api).
 # Fallback ONLY when SuperGrok/xAI is rate-limited or credits are exhausted.
-# Still Grok 4.5 High, billed through Cursor — never Claude, never primary.
+# Still Grok 4.6 Extra High (xhigh), billed through Cursor — never Claude, never primary.
 CURSOR_API_BASE = os.environ.get(
     "PAPER_TRADER_CURSOR_API_BASE", "http://127.0.0.1:4646/v1"
 ).rstrip("/")
 CURSOR_MODEL = os.environ.get(
-    "PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.5-high"
+    "PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.6-xhigh"
 )
 CURSOR_FALLBACK = os.environ.get(
     "PAPER_TRADER_CURSOR_FALLBACK", "1"
@@ -428,7 +428,7 @@ def _cursor_http_call(prompt: str, timeout_s: int | None) -> str | None:
     global _last_claude_fail
     if not _cursor_fallback_enabled():
         return None
-    model_id = (CURSOR_MODEL or "cursor-grok-4.5-high").strip()
+    model_id = (CURSOR_MODEL or "cursor-grok-4.6-xhigh").strip()
     try:
         text = _openai_compatible_chat(
             base_url=CURSOR_API_BASE,
@@ -658,9 +658,10 @@ STANDING OPERATOR MANDATE (Jonathan 2026-08-07) — HARD:
   tape. No catalyst today = HOLD, not nibble TQQQ/shares to look busy.
 - If LLM/ML drought: HOLD or hard-exit only. Drought-fallback share dribbles
   are banned as a personality.
-- Options risk budget while climbing to $10k: about $800-$1000 premium at risk.
-  Kill long premium only at about -50% debit or REAL thesis-kill evidence (not
-  vibes). Active trading on winners is fine; losers are held through normal noise.
+- Options risk budget while climbing to $10k: leftover Sep mark is NOT the cap.
+  New 8/14 Friday weekly debit cap is $800. One NVDA/QQQ debit only. Engine
+  flattens SK (wrong issuer) and sends the closer after Thu 08:45 ET PPI.
+  Kill the new weekly only at about -50% debit or REAL thesis-kill evidence.
   Engine permanently blocks underwater panic sells.
 If OPERATOR STANDING ORDERS appear in CONTEXT, they outrank generic
 construction/deployment nagging when the two conflict.
@@ -1265,9 +1266,9 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
         if not _uses_xai_http(model) and not _m.startswith("gpt-"):
             print(
                 f"[strategy] BLOCKED Claude/non-Grok model={model!r}; "
-                "forcing grok-4.5 (Claude spend disabled 2026-08-04)"
+                "forcing grok-4.6 (Claude spend disabled 2026-08-04)"
             )
-            model = "grok-4.5"
+            model = "grok-4.6"
     if _uses_xai_http(model):
         # Primary: xAI SuperGrok. Fallback: Cursor CLI Grok (same model family).
         result = None
@@ -3969,6 +3970,21 @@ def decide() -> dict:
     )
     if auto_exits:
         snap = _portfolio_snapshot(store)
+
+    try:
+        from .analytics.friday_closer import maybe_execute_friday_closer
+        closer_notes = maybe_execute_friday_closer(
+            store,
+            snap,
+            market_mod=market,
+            execute_fn=_execute,
+            market_open=regular_market_open,
+        )
+        if closer_notes:
+            auto_exits.extend(closer_notes)
+            snap = _portfolio_snapshot(store)
+    except Exception as closer_exc:
+        auto_exits.append("friday closer error: %s" % closer_exc)
 
     top = signals.get_top_signals(20, hours=2, min_score=4.0)
     urgent = signals.get_urgent_articles(minutes=30)

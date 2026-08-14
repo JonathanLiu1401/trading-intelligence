@@ -22,8 +22,13 @@ PORTFOLIO_PATH = BASE_DIR / "config" / "portfolio.json"
 WATCHLIST_PATH = BASE_DIR / "config" / "watchlist.json"
 CURSOR_PATH = BASE_DIR / "data" / "google_news_cursor.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
-QUERY_BANK_PATH = BASE_DIR / "config" / "generated-query-banks" / "broad_search_queries_2026-06-23.txt"
-QUERY_BANK_LIMIT = int(os.environ.get("GOOGLE_NEWS_QUERY_BANK_LIMIT", "650"))
+QUERY_BANK_PATHS = [
+    BASE_DIR / "config" / "generated-query-banks" / "broad_search_queries_2026-06-23.txt",
+    BASE_DIR / "config" / "generated-query-banks" / "multi_sector_queries_2026-07-16.txt",
+]
+# Backward-compatible alias used by older helpers/tests.
+QUERY_BANK_PATH = QUERY_BANK_PATHS[0]
+QUERY_BANK_LIMIT = int(os.environ.get("GOOGLE_NEWS_QUERY_BANK_LIMIT", "700"))
 
 # How many tickers to fetch per call.
 BATCH_PER_PASS = int(os.environ.get("GOOGLE_NEWS_BATCH_PER_PASS", "64"))
@@ -41,28 +46,53 @@ BROAD_GOOGLE_NEWS_QUERIES = [
     "consumer weakness recession risk stock market",
 ]
 
+# Multi-sector desk queries so ArticleNet is not only an AI/semis radar.
+SECTOR_GOOGLE_NEWS_QUERIES = [
+    "sector rotation stocks defensive leadership",
+    "healthcare stocks earnings GLP-1 biotech FDA",
+    "bank earnings net interest margin credit quality",
+    "oil prices OPEC inventory energy stocks",
+    "utilities power demand data center grid nuclear",
+    "industrial stocks manufacturing PMI defense spending",
+    "consumer staples pricing power grocery retail sales",
+    "REIT real estate rates housing commercial property",
+    "materials mining copper lithium gold prices",
+    "insurance stocks catastrophe loss reserves",
+    "pharmaceutical drug pricing Medicare policy",
+    "defense contractors budget weapons contract awards",
+]
 
-def _load_query_bank(path: Path = QUERY_BANK_PATH, limit: int = QUERY_BANK_LIMIT) -> list[str]:
-    if limit <= 0 or not path.exists():
+
+def _load_query_bank(
+    path: Path | list[Path] | None = None,
+    limit: int = QUERY_BANK_LIMIT,
+) -> list[str]:
+    if limit <= 0:
         return []
+    paths = path if path is not None else QUERY_BANK_PATHS
+    if isinstance(paths, Path):
+        paths = [paths]
     out: list[str] = []
     seen: set[str] = set()
-    try:
-        lines = path.read_text().splitlines()
-    except Exception:
-        return []
-    for line in lines:
-        q = line.strip()
-        if not q:
+    for bank_path in paths:
+        if not bank_path.exists():
             continue
-        if ". " in q[:8]:
-            q = q.split(". ", 1)[1].strip()
-        key = q.lower()
-        if q and key not in seen:
-            seen.add(key)
-            out.append(q)
-        if len(out) >= limit:
-            break
+        try:
+            lines = bank_path.read_text().splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            q = line.strip()
+            if not q:
+                continue
+            if ". " in q[:8]:
+                q = q.split(". ", 1)[1].strip()
+            key = q.lower()
+            if q and key not in seen:
+                seen.add(key)
+                out.append(q)
+            if len(out) >= limit:
+                return out
     return out
 
 
@@ -98,14 +128,31 @@ def _load_tickers() -> list[str]:
             "broader_semis",
             "memory_options_focus",
             "korean",
+            "japanese",
             "portfolio",
+            "etfs",
+            "sector_etfs",
+            "healthcare",
+            "financials",
+            "energy",
+            "utilities_power",
+            "industrials_defense",
+            "materials_mining",
+            "consumer",
+            "real_estate",
+            "commodities",
+            "bonds",
         ):
             for t in wl.get(key, []):
                 _add(t)
     except Exception:
         pass
 
-    for q in [*BROAD_GOOGLE_NEWS_QUERIES, *_load_query_bank()]:
+    for q in [
+        *BROAD_GOOGLE_NEWS_QUERIES,
+        *SECTOR_GOOGLE_NEWS_QUERIES,
+        *_load_query_bank(),
+    ]:
         key = f"QUERY:{q}"
         if key not in seen:
             seen.add(key)

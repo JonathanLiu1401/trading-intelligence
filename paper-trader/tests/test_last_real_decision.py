@@ -67,7 +67,7 @@ def test_fresh_when_within_one_lagging_window():
 def test_delayed_between_lagging_and_stalled():
     now = datetime(2026, 5, 29, 14, 0, 0, tzinfo=timezone.utc)
     # OPEN_INTERVAL=300, LAGGING=1.25 → 375s; STALLED=2.0 → 600s.
-    # 450s = between LAGGING (375) and STALLED (600).
+    # 450s = between LAGGING and STALLED.
     ts = (now - timedelta(seconds=450)).isoformat()
     out = build_last_real_decision(_row(ts), now=now, market_open=True)
     assert out["state"] == "DELAYED"

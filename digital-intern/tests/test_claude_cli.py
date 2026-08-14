@@ -14,8 +14,8 @@ from core import claude_cli
 def _fresh_breaker(monkeypatch):
     """Start every test with the breaker shut and default Grok model."""
     claude_cli.reset_quota_breaker()
-    monkeypatch.setenv("DIGITAL_INTERN_LLM_MODEL", "grok-4.5")
-    monkeypatch.setattr(claude_cli, "DEFAULT_LLM_MODEL", "grok-4.5")
+    monkeypatch.setenv("DIGITAL_INTERN_LLM_MODEL", "grok-4.6")
+    monkeypatch.setattr(claude_cli, "DEFAULT_LLM_MODEL", "grok-4.6")
     # Keep Cursor fallback off unless a test explicitly enables it.
     monkeypatch.setenv("DIGITAL_INTERN_CURSOR_FALLBACK", "0")
     monkeypatch.setattr(claude_cli, "CURSOR_FALLBACK", False)
@@ -52,10 +52,10 @@ def test_quota_error_trips_breaker_and_skips_next_http(monkeypatch):
     monkeypatch.setattr(claude_cli, "_load_xai_access_token", lambda: "tok")
     monkeypatch.setattr(claude_cli.urllib.request, "urlopen", boom)
 
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
     assert claude_cli.quota_blocked() is True
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
     assert calls["n"] == 1
 
 
@@ -75,9 +75,9 @@ def test_non_quota_failure_does_not_trip_breaker(monkeypatch):
     monkeypatch.setattr(claude_cli, "_load_xai_access_token", lambda: "tok")
     monkeypatch.setattr(claude_cli.urllib.request, "urlopen", boom)
 
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
     assert claude_cli.quota_blocked() is False
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
     assert calls["n"] == 2
 
 
@@ -94,7 +94,7 @@ def test_rate_limit_string_also_trips(monkeypatch):
     monkeypatch.setattr(claude_cli, "_load_xai_access_token", lambda: "tok")
     monkeypatch.setattr(claude_cli.urllib.request, "urlopen", boom)
 
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
     assert claude_cli.quota_blocked() is True
 
 
@@ -125,7 +125,7 @@ def test_breaker_self_heals_after_cooldown(monkeypatch):
     monkeypatch.setattr(claude_cli, "_load_xai_access_token", lambda: "tok")
     monkeypatch.setattr(claude_cli.urllib.request, "urlopen", boom)
 
-    assert claude_cli.claude_call("p", model="grok-4.5") is None
+    assert claude_cli.claude_call("p", model="grok-4.6") is None
     assert claude_cli.quota_blocked() is True
 
     monkeypatch.setattr(
@@ -134,7 +134,7 @@ def test_breaker_self_heals_after_cooldown(monkeypatch):
         lambda: claude_cli._quota_blocked_until + 1,
     )
     assert claude_cli.quota_blocked() is False
-    assert claude_cli.claude_call("p", model="grok-4.5") == "result body"
+    assert claude_cli.claude_call("p", model="grok-4.6") == "result body"
     assert state["n"] == 2
 
 
@@ -155,7 +155,7 @@ def test_success_passes_through_unchanged(monkeypatch):
         "urlopen",
         lambda *_a, **_k: Resp(),
     )
-    assert claude_cli.claude_call("p", model="grok-4.5") == "hello"
+    assert claude_cli.claude_call("p", model="grok-4.6") == "hello"
     assert claude_cli.quota_blocked() is False
 
 
@@ -166,7 +166,7 @@ def test_default_model_is_grok():
 def test_cursor_fallback_used_when_xai_circuit_open(monkeypatch):
     """Cursor Grok is fallback-only: used when xAI quota breaker is open."""
     monkeypatch.setattr(claude_cli, "CURSOR_FALLBACK", True)
-    monkeypatch.setattr(claude_cli, "CURSOR_MODEL", "cursor-grok-4.5-high")
+    monkeypatch.setattr(claude_cli, "CURSOR_MODEL", "cursor-grok-4.6-xhigh")
     claude_cli._quota_blocked_until = claude_cli.time.time() + 3600
     monkeypatch.setattr(
         claude_cli,
@@ -178,7 +178,7 @@ def test_cursor_fallback_used_when_xai_circuit_open(monkeypatch):
         "_xai_http_call",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("xAI must not run")),
     )
-    assert claude_cli.claude_call("p", model="grok-4.5") == "cursor-ok"
+    assert claude_cli.claude_call("p", model="grok-4.6") == "cursor-ok"
 
 
 def test_cursor_fallback_used_after_xai_http_failure(monkeypatch):
@@ -190,7 +190,7 @@ def test_cursor_fallback_used_after_xai_http_failure(monkeypatch):
         "_cursor_http_call",
         lambda prompt, timeout: "cursor-after-miss",
     )
-    assert claude_cli.claude_call("p", model="grok-4.5") == "cursor-after-miss"
+    assert claude_cli.claude_call("p", model="grok-4.6") == "cursor-after-miss"
 
 
 def test_codex_gpt_models_still_pass_prompt_on_stdin(monkeypatch):

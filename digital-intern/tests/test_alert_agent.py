@@ -50,7 +50,8 @@ def _iso(hours_ago: float) -> str:
 
 def _insert_urgent(store, *, id, url="https://reuters.com/x",
                     title="MU earnings blow past Q3 estimates sharply",
-                    source="rss", ai_score=9.0, published="", first_seen=None):
+                    source="rss", ai_score=9.0, published="", first_seen=None,
+                    ml_score=None, score_source="llm"):
     """Insert a single live, urgency=1 row exactly as the scoring path would
     leave it for the alerter to pick up."""
     if first_seen is None:
@@ -62,9 +63,18 @@ def _insert_urgent(store, *, id, url="https://reuters.com/x",
             " first_seen, cycle, ml_score, score_source, full_text) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (id, url, title, source, published, 1.0, ai_score, 1,
-             first_seen, 0, None, "llm", None),
+             first_seen, 0, ml_score, score_source, None),
         )
         store.conn.commit()
+
+
+def _approve_gate(batch):
+    return {
+        "urgent": True,
+        "reason": "test-approved",
+        "keep": list(batch)[:1],
+        "headline": "TEST APPROVED URGENT",
+    }
 
 
 def _urgency_of(store, aid):
@@ -166,7 +176,7 @@ class TestStalenessGuard:
         assert {a["_id"] for a in urgent} == {"fresh", "old"}
 
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send",
                    return_value=True) as mock_send:
@@ -185,15 +195,15 @@ class TestStalenessGuard:
 
 
 class TestWebhookEarlyOut:
-    def test_missing_webhook_short_circuits_before_claude(self, store, monkeypatch):
-        """No DISCORD_WEBHOOK configured → return False immediately, WITHOUT
-        spending a Sonnet call. A regression here silently burns Claude quota
-        every alert cycle and POSTs to an empty URL."""
+    def test_missing_webhook_and_cli_short_circuits_before_claude(self, store, monkeypatch):
+        """No webhook and no OpenClaw CLI fallback → return False immediately,
+        WITHOUT spending a Sonnet call."""
         _insert_urgent(store, id="fresh", published=_iso(1))
         urgent = store.get_unalerted_urgent()
         assert len(urgent) == 1
 
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "")
+        monkeypatch.setattr(alert_agent, "_openclaw_cli_path", lambda: None)
         with patch.object(alert_agent, "claude_call") as mock_claude, \
              patch("notifier.discord_notifier.send") as mock_send:
             ok = alert_agent.send_urgent_alert(urgent, store)
@@ -216,7 +226,8 @@ class TestHappyPathMarksAlerted:
         assert len(urgent) == 1
 
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), \
+             patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send",
                    return_value=True) as mock_send, \
@@ -225,11 +236,70 @@ class TestHappyPathMarksAlerted:
             ok = alert_agent.send_urgent_alert(urgent, store)
 
         assert ok is True
-        mock_claude.assert_called_once()
+        mock_claude.assert_called()
         mock_send.assert_called_once()
-        mock_sao_dm.assert_called_once_with("🚨 BREAKING ◈ EARNINGS ◈ MU")
+        sent = mock_send.call_args.args[0]
+        assert "<@454961974048980992>" in sent
+        assert "🚨 BREAKING ◈ EARNINGS ◈ MU" in sent
+        mock_sao_dm.assert_called_once()
+        assert "🚨 BREAKING ◈ EARNINGS ◈ MU" in mock_sao_dm.call_args.args[0]
         # Marked alerted (urgency 1 → 2) and now invisible to the alerter.
         assert _urgency_of(store, "go") == 2
+        assert store.get_unalerted_urgent() == []
+
+    def test_grok_gate_required_no_page_without_approval(self, store, monkeypatch):
+        """If Grok gate is unavailable/returns None, do NOT page. Drain queue."""
+        _insert_urgent(
+            store,
+            id="fallback",
+            published=_iso(1),
+            ai_score=9.0,
+            title="MU guides Q4 revenue sharply above the Street",
+            url="https://reuters.com/mu-guide",
+            score_source="llm",
+        )
+        urgent = store.get_unalerted_urgent()
+        assert len(urgent) == 1
+
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call", return_value=None) as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert(urgent, store)
+
+        assert ok is True
+        mock_claude.assert_called()
+        mock_send.assert_not_called()
+        assert _urgency_of(store, "fallback") == 2
+        assert store.get_unalerted_urgent() == []
+
+    def test_grok_gate_rejects_noise_without_discord(self, store, monkeypatch):
+        """Grok saying not urgent must drain without Discord pings."""
+        _insert_urgent(
+            store,
+            id="noise",
+            published=_iso(1),
+            ai_score=0.0,
+            ml_score=9.5,
+            title="Asian Markets Trade Mostly Lower",
+            url="https://example.com/asia",
+            score_source="ml",
+        )
+        urgent = store.get_unalerted_urgent()
+        assert len(urgent) == 1
+
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(
+            alert_agent,
+            "claude_call",
+            return_value='{"urgent": false, "reason": "generic market wrap", "keep_ids": [], "headline": ""}',
+        ) as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert(urgent, store)
+
+        assert ok is True
+        mock_claude.assert_called()
+        mock_send.assert_not_called()
+        assert _urgency_of(store, "noise") == 2
         assert store.get_unalerted_urgent() == []
 
     def test_sao_dm_failure_does_not_requeue_successful_discord_alert(
@@ -242,7 +312,8 @@ class TestHappyPathMarksAlerted:
         assert len(urgent) == 1
 
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call", return_value="alert body"), \
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), \
+             patch.object(alert_agent, "claude_call", return_value="alert body"), \
              patch("notifier.discord_notifier.send", return_value=True), \
              patch.object(alert_agent, "_send_sao_breaking_dm", return_value=False):
             ok = alert_agent.send_urgent_alert(urgent, store)
@@ -260,7 +331,8 @@ class TestHappyPathMarksAlerted:
         assert len(urgent) == 1
 
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call", return_value="alert body"), \
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), \
+             patch.object(alert_agent, "claude_call", return_value="alert body"), \
              patch("notifier.discord_notifier.send", return_value=False):
             ok = alert_agent.send_urgent_alert(urgent, store)
 
@@ -345,7 +417,7 @@ class TestSyntheticDefenseInDepth:
         })
 
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU"), \
              patch("notifier.discord_notifier.send", return_value=True):
             ok = alert_agent.send_urgent_alert(urgent, store)
@@ -399,7 +471,7 @@ class TestFormatterRobustness:
             "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
         }
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send", return_value=True) as mock_send:
             ok = alert_agent.send_urgent_alert([art], spy)
@@ -429,7 +501,7 @@ class TestFormatterRobustness:
             "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
         }
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ SUPPLY CHAIN ◈ AXTI") as mock_claude, \
              patch("notifier.discord_notifier.send", return_value=True) as mock_send:
             ok = alert_agent.send_urgent_alert([good, poison], spy)
@@ -538,7 +610,7 @@ class TestQuoteWidgetGate:
             "published": _iso(1), "first_seen": _iso(0.1),
         }
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send",
                    return_value=True) as mock_send:
@@ -625,7 +697,7 @@ class TestQuoteWidgetGate:
             "published": _iso(1), "first_seen": _iso(0.1),
         }
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send",
                    return_value=True) as mock_send:
@@ -768,7 +840,7 @@ class TestQuoteWidgetGate:
             "published": _iso(1), "first_seen": _iso(0.1),
         }
         monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
-        with patch.object(alert_agent, "claude_call",
+        with patch.object(alert_agent, "_grok_urgency_gate", side_effect=_approve_gate), patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send",
                    return_value=True) as mock_send:

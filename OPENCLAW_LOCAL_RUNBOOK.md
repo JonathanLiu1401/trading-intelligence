@@ -112,10 +112,10 @@ com.jonathan.trading-intelligence.digital-intern
   127.0.0.1:8080
   dashboard.web_server.run_server(None)
   standalone ArticleNet web/API only; does not start daemon collectors/trainers
-  chat LLM env: DIGITAL_INTERN_LLM_MODEL=grok-4.5 (xAI primary),
+  chat LLM env: DIGITAL_INTERN_LLM_MODEL=grok-4.6 (xAI primary),
     DIGITAL_INTERN_CURSOR_FALLBACK=1,
     DIGITAL_INTERN_CURSOR_API_BASE=http://127.0.0.1:4646/v1,
-    DIGITAL_INTERN_CURSOR_MODEL=cursor-grok-4.5-high,
+    DIGITAL_INTERN_CURSOR_MODEL=cursor-grok-4.6-xhigh,
     DIGITAL_INTERN_CHAT_LLM_TIMEOUT=45,
     PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
   Cursor Grok is fallback-only when SuperGrok credits/limits fail (LaunchAgent
@@ -127,10 +127,10 @@ com.jonathan.trading-intelligence.paper-trader
   live Paper Trader runner requested by Jonathan on 2026-06-08; serves the
   dashboard/API and sleeps during closed-market quiet windows
   PAPER_TRADER_DASHBOARD_PREWARM=0
-  PAPER_TRADER_MODEL=grok-4.5 (xAI primary)
+  PAPER_TRADER_MODEL=grok-4.6 (xAI primary)
   PAPER_TRADER_CURSOR_FALLBACK=1
   PAPER_TRADER_CURSOR_API_BASE=http://127.0.0.1:4646/v1
-  PAPER_TRADER_CURSOR_MODEL=cursor-grok-4.5-high
+  PAPER_TRADER_CURSOR_MODEL=cursor-grok-4.6-xhigh
 
 com.jonathan.trading-intelligence.article-aggregation
   ArticleNet collector daemon requested by Jonathan on 2026-06-08

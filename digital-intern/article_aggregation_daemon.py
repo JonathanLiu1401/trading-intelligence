@@ -26,6 +26,7 @@ load_dotenv(BASE_DIR / ".env")
 sys.path.insert(0, str(BASE_DIR))
 
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
+from collectors.energy_news_collector import collect_energy_news
 from collectors.financial_blogs_collector import collect_financial_blogs
 from collectors.gdelt_collector import collect_gdelt
 from collectors.globenewswire_collector import collect_globenewswire
@@ -36,6 +37,7 @@ from collectors.investment_research_blogs_collector import (
 from collectors.market_movers import collect_market_movers
 from collectors.prnewswire_collector import collect as collect_prnewswire
 from collectors.rss_collector import collect_rss
+from collectors.sector_intelligence_collector import collect_sector_intelligence
 from collectors.seekingalpha_collector import collect_seekingalpha
 from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
 from collectors.yahoo_trending_tickers import collect_yahoo_trending
@@ -192,6 +194,13 @@ def _ingest(store: ArticleStore, articles: list[dict], source_tag: str) -> int:
     return inserted
 
 
+def _collect_sector_etf_articles() -> list[dict]:
+    """Sector ETF rotation collector already writes articles.db itself."""
+    from collectors.sector_etf_momentum import collect as _collect_sector_etf
+
+    return _collect_sector_etf() or []
+
+
 def _collector_worker(
     name: str,
     collect_fn,
@@ -205,6 +214,17 @@ def _collector_worker(
         started = time.monotonic()
         try:
             articles = collect_fn() or []
+            # sector_etf_momentum writes articles.db itself; only record health.
+            if name == "sector_etf":
+                try:
+                    source_health.record_result(source_key, len(articles))
+                except Exception as he:
+                    log.warning("[%s_worker] source_health error: %s", name, he)
+                _worker_last_ok[name] = time.time()
+                if articles:
+                    log.info("[%s] emitted %d article(s)", name, len(articles))
+                _sleep(interval)
+                continue
             inserted = _ingest(store, articles, source_key)
             try:
                 source_health.record_result(source_key, len(articles))
@@ -473,6 +493,24 @@ def main() -> None:
             collect_investment_research_blogs,
             _env_seconds("INVESTMENT_RESEARCH_BLOGS_INTERVAL", 900),
             "investment_research_blogs",
+        ),
+        (
+            "energy_news",
+            collect_energy_news,
+            _env_seconds("ENERGY_NEWS_INTERVAL", 900),
+            "energy_news",
+        ),
+        (
+            "sector_intelligence",
+            collect_sector_intelligence,
+            _env_seconds("SECTOR_INTEL_INTERVAL", 900),
+            "sector_intelligence",
+        ),
+        (
+            "sector_etf",
+            _collect_sector_etf_articles,
+            _env_seconds("SECTOR_ETF_INTERVAL", 600),
+            "sector_etf",
         ),
     ]
 

@@ -134,6 +134,17 @@ class TestVerdictLadder:
         assert r["next_decision_eta_s"] == 240
         assert r["is_overdue"] is False
 
+    def test_extended_hours_uses_30_minute_cadence(self):
+        now = _utc(2026, 5, 18, 12, 0)  # 08:00 ET pre-market
+        last = (now - timedelta(seconds=60)).isoformat()
+        r = build_decision_cadence(
+            [{"ticker": "NVDA"}], last,
+            now=now, calendar_path=_EMPTY_CAL,
+        )
+        assert r["tier"] == "EXTENDED_HOURS"
+        assert r["sleep_s"] == 1800
+        assert r["next_decision_eta_s"] == 1740
+
     def test_at_sleep_boundary_stays_on_schedule(self):
         # secs_since == sleep_s exactly → still ON_SCHEDULE (strict > only
         # steps to ELAPSED_NORMAL).

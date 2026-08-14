@@ -149,30 +149,43 @@ def build_equity_integrity(
                 f"Only {n} usable equity point(s) (<{min_points}) — "
                 f"too short to audit consistency."),
             "n_negative_cash": 0,
+            "n_margin_cash": 0,
             "min_cash_usd": None,
             "n_nonpositive_equity": 0,
             "n_suspect_jumps": 0,
             "worst_jump": None,
             "negative_cash_points": [],
+            "margin_cash_points": [],
             "nonpositive_equity_points": [],
             "suspect_jumps": [],
         }
 
-    neg_cash: list[dict] = []
+    neg_cash: list[dict] = []          # true overdraw / corrupt cash
+    margin_cash: list[dict] = []       # cash<0 but equity still positive (Reg-T style)
     nonpos_eq: list[dict] = []
     min_cash: float | None = None
     for p in pts:
         c = p["cash"]
+        tv = p["total_value"]
         if c is not None:
             if min_cash is None or c < min_cash:
                 min_cash = c
             if c < _CASH_EPS:
-                neg_cash.append({"timestamp": p["timestamp"],
-                                 "cash": round(c, 2),
-                                 "total_value": round(p["total_value"], 2)})
-        if p["total_value"] <= 0.0:
+                row = {"timestamp": p["timestamp"],
+                       "cash": round(c, 2),
+                       "total_value": round(tv, 2)}
+                # Paper desk runs 2x stock BP. Negative cash with still-positive
+                # total equity is leveraged book cash, NOT a corrupt overdraw.
+                # Only flag CORRUPT when cash is negative AND equity is ruined
+                # (tv <= 0) or cash is more negative than equity can support
+                # (cash < -abs(tv) - eps) — i.e. the books no longer add up.
+                if tv is not None and tv > 0.0 and c >= -(abs(tv) + _CASH_EPS):
+                    margin_cash.append(row)
+                else:
+                    neg_cash.append(row)
+        if tv is not None and tv <= 0.0:
             nonpos_eq.append({"timestamp": p["timestamp"],
-                              "total_value": round(p["total_value"], 2)})
+                              "total_value": round(tv, 2)})
 
     stamps = _trade_stamps(trades)
     jumps: list[dict] = []
@@ -186,6 +199,25 @@ def build_equity_integrity(
             continue
         if _trade_in_window(stamps, prev["timestamp"], cur["timestamp"]):
             continue  # a trade explains the swing — expected, not suspect
+        # Capital top-up / withdrawal: cash and total_value move by ~same $
+        # amount with no trade (e.g. $1k → $10k paper bankroll reset).
+        pc = prev.get("cash")
+        cc = cur.get("cash")
+        if pc is not None and cc is not None:
+            cash_delta = cc - pc
+            if abs(cash_delta - delta) <= max(1.0, 0.02 * abs(delta)):
+                continue
+        # Multi-day sampling gaps (offline / redeploy windows) are not
+        # same-session mismarks — skip when the gap exceeds 36h.
+        try:
+            from datetime import datetime
+            def _parse(ts: str):
+                return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            gap_h = (_parse(cur["timestamp"]) - _parse(prev["timestamp"])).total_seconds() / 3600.0
+            if gap_h >= 36.0:
+                continue
+        except Exception:
+            pass
         jumps.append({
             "from_ts": prev["timestamp"],
             "to_ts": cur["timestamp"],
@@ -204,7 +236,7 @@ def build_equity_integrity(
         bits = []
         if neg_cash:
             bits.append(
-                f"{len(neg_cash)} negative-cash point(s) (min "
+                f"{len(neg_cash)} impossible-cash point(s) (min "
                 f"${round(min_cash, 2) if min_cash is not None else 0.0})")
         if nonpos_eq:
             bits.append(f"{len(nonpos_eq)} non-positive-equity point(s)")
@@ -225,20 +257,30 @@ def build_equity_integrity(
             f"not a real P&L move.")
     else:
         verdict = "CLEAN"
-        headline = (
-            f"Equity curve consistent across {n} points — cash never "
-            f"negative, no unexplained jump >={jump_pct_threshold:g}%.")
+        if margin_cash:
+            headline = (
+                f"Equity curve consistent across {n} points — "
+                f"{len(margin_cash)} margin-cash point(s) (min "
+                f"${round(min_cash, 2) if min_cash is not None else 0.0}) "
+                f"with still-positive equity are expected under 2x BP; "
+                f"no unexplained jump >={jump_pct_threshold:g}%.")
+        else:
+            headline = (
+                f"Equity curve consistent across {n} points — cash never "
+                f"negative, no unexplained jump >={jump_pct_threshold:g}%.")
 
     return {
         **base,
         "verdict": verdict,
         "headline": headline,
         "n_negative_cash": len(neg_cash),
+        "n_margin_cash": len(margin_cash),
         "min_cash_usd": round(min_cash, 2) if min_cash is not None else None,
         "n_nonpositive_equity": len(nonpos_eq),
         "n_suspect_jumps": len(jumps),
         "worst_jump": worst_jump,
         "negative_cash_points": neg_cash[:_MAX_OFFENDERS],
+        "margin_cash_points": margin_cash[:_MAX_OFFENDERS],
         "nonpositive_equity_points": nonpos_eq[:_MAX_OFFENDERS],
         "suspect_jumps": sorted(
             jumps, key=lambda j: abs(j["delta_pct"]), reverse=True

@@ -34,7 +34,7 @@ def test_xai_failure_falls_back_to_cursor(monkeypatch):
         "_cursor_chat",
         lambda prompt, timeout_s=30: calls.append("cursor") or "[]",
     )
-    out = discovery._xai_chat("find news", model="grok-4.5", timeout_s=5)
+    out = discovery._xai_chat("find news", model="grok-4.6", timeout_s=5)
     assert out == "[]"
     assert calls == ["cursor"]
 

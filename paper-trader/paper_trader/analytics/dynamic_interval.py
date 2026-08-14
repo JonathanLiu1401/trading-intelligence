@@ -4,11 +4,10 @@ Returns the recommended sleep duration in seconds based on current market
 context. Designed for hot-path use: never raises, never does network I/O.
 
 Tiers (highest-priority first):
-  SESSION_OPEN     180s      First 30 min of regular session (9:30-10:00 ET)
+  SESSION_OPEN     300s      First 30 min of regular session (9:30-10:00 ET)
   EARNINGS_DAY     300s      Held name has earnings today during regular hours
   MARKET_OPEN      300s      Normal market hours
-  EARNINGS_WINDOW  1800s     Held name has same-day earnings AND
-                             it is 3:45pm-6:30pm ET (after-close monitor)
+  EXTENDED_HOURS   1800s     Pre-market and after-hours tradable windows
   MARKET_CLOSED    3600s     No special event, market closed
   QUIET_CLOSED     5400s     Market closed + no positions + no imminent events
 
@@ -40,12 +39,14 @@ _NY = ZoneInfo("America/New_York")
 # Tier sleep durations (seconds). Regular-session tiers must stay faster
 # than closed-market monitoring; otherwise the bot watches a frozen book more
 # aggressively than tradable tape.
-_SESSION_OPEN_S = 180
+_SESSION_OPEN_S = 300
 _EARNINGS_DAY_S = 300
 _MARKET_OPEN_S = 300
+_EXTENDED_HOURS_S = 1800
 _EARNINGS_WINDOW_S = 1800
 _MARKET_CLOSED_S = 3600
 _QUIET_CLOSED_S = 5400
+_OPEN_WAKE_BUFFER_S = 5
 
 
 def _pick_freshest(paths) -> Path | None:
@@ -130,6 +131,38 @@ def _is_market_hours(now_et: datetime) -> bool:
         return start <= now_et < end
 
 
+def _is_tradable_window(now_et: datetime) -> bool:
+    """Regular + extended-hours tradable window."""
+    try:
+        from ..market import is_tradable_window_open
+        return is_tradable_window_open(now_et.astimezone(timezone.utc))
+    except Exception:
+        if now_et.weekday() >= 5:
+            return False
+        minutes = now_et.hour * 60 + now_et.minute
+        return (4 * 60) <= minutes < (20 * 60)
+
+
+def _clamp_sleep_to_next_tradable_window(sleep_s: int, now_utc: datetime) -> int:
+    """Do not let a closed-market sleep skip over the next tradable window.
+
+    The normal closed cadence is intentionally slow, but a cycle that fires
+    shortly before 04:00 ET must wake right after extended-hours trading begins,
+    not one hour later.
+    """
+    try:
+        from ..market import next_tradable_window_open
+        next_open = next_tradable_window_open(now_utc)
+        if next_open is None:
+            return sleep_s
+        secs_to_open = int((next_open - now_utc).total_seconds())
+        if 0 < secs_to_open < sleep_s:
+            return max(1, secs_to_open + _OPEN_WAKE_BUFFER_S)
+    except Exception:
+        pass
+    return sleep_s
+
+
 def _is_earnings_window(now_et: datetime) -> bool:
     """15:45-18:30 ET: after-close print + initial reaction band."""
     if now_et.weekday() >= 5:
@@ -211,9 +244,10 @@ def compute_interval(
             positions, events, now_utc, now_et,
         )
         market_open = _is_market_hours(now_et)
+        tradable_open = _is_tradable_window(now_et)
 
         # Tier 1: first 30 min of the regular session.
-        if market_open and _is_session_open_window(now_et):
+        if tradable_open and market_open and _is_session_open_window(now_et):
             tier, sleep_s = "SESSION_OPEN", _SESSION_OPEN_S
         # Tier 2: held name has earnings today, but only while tradable.
         elif market_open and held_earnings_today:
@@ -221,17 +255,19 @@ def compute_interval(
         # Tier 3: normal market hours.
         elif market_open:
             tier, sleep_s = "MARKET_OPEN", _MARKET_OPEN_S
-        # Tier 4: after-close earnings monitor on a held name. This is
-        # intentionally slower than regular-session cadence because normal
-        # paper trades cannot execute against a closed NYSE book.
-        elif held_earnings_today and _is_earnings_window(now_et):
-            tier, sleep_s = "EARNINGS_WINDOW", _EARNINGS_WINDOW_S
+        # Tier 4: extended-hours stock trading is allowed, but at the lower
+        # 30-minute frequency requested for live market-open trading.
+        elif tradable_open:
+            tier, sleep_s = "EXTENDED_HOURS", _EXTENDED_HOURS_S
         # Tier 6 (before tier 5): quiet closed — no positions, closed.
         elif not positions:
             tier, sleep_s = "QUIET_CLOSED", _QUIET_CLOSED_S
         # Tier 5: market closed, positions held, no special event.
         else:
             tier, sleep_s = "MARKET_CLOSED", _MARKET_CLOSED_S
+
+        if not tradable_open:
+            sleep_s = _clamp_sleep_to_next_tradable_window(sleep_s, now_utc)
 
         print(f"[interval] tier={tier} sleep={sleep_s}s")
         return sleep_s
@@ -246,7 +282,7 @@ def compute_interval(
             else:
                 ref = now
             ref_et = ref.astimezone(_NY)
-            if _is_market_hours(ref_et):
+            if _is_tradable_window(ref_et):
                 tier, sleep_s = "MARKET_OPEN", _MARKET_OPEN_S
             else:
                 tier, sleep_s = "MARKET_CLOSED", _MARKET_CLOSED_S

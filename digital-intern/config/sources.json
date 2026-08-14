@@ -1367,6 +1367,98 @@
   {
    "name": "GN Central Banks Global",
    "url": "https://news.google.com/rss/search?q=central+bank+interest+rates+Fed+ECB+BOJ+when:3d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "STAT News",
+   "url": "https://www.statnews.com/feed/"
+  },
+  {
+   "name": "FiercePharma",
+   "url": "https://www.fiercepharma.com/rss/xml"
+  },
+  {
+   "name": "BioPharma Dive",
+   "url": "https://www.biopharmadive.com/feeds/news/"
+  },
+  {
+   "name": "Healthcare Dive",
+   "url": "https://www.healthcaredive.com/feeds/news/"
+  },
+  {
+   "name": "Banking Dive",
+   "url": "https://www.bankingdive.com/feeds/news/"
+  },
+  {
+   "name": "Retail Dive",
+   "url": "https://www.retaildive.com/feeds/news/"
+  },
+  {
+   "name": "Food Dive",
+   "url": "https://www.fooddive.com/feeds/news/"
+  },
+  {
+   "name": "Construction Dive",
+   "url": "https://www.constructiondive.com/feeds/news/"
+  },
+  {
+   "name": "Defense News",
+   "url": "https://www.defensenews.com/arc/outboundfeeds/rss/?outputType=xml"
+  },
+  {
+   "name": "OilPrice",
+   "url": "https://oilprice.com/rss/main"
+  },
+  {
+   "name": "Mining.com",
+   "url": "https://www.mining.com/feed/"
+  },
+  {
+   "name": "Utility Dive",
+   "url": "https://www.utilitydive.com/feeds/news/"
+  },
+  {
+   "name": "Offshore Energy",
+   "url": "https://www.offshore-energy.biz/feed/"
+  },
+  {
+   "name": "Power Magazine",
+   "url": "https://www.powermag.com/feed/"
+  },
+  {
+   "name": "GN Healthcare Sector",
+   "url": "https://news.google.com/rss/search?q=healthcare+stocks+biotech+pharma+FDA+earnings+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Financials Sector",
+   "url": "https://news.google.com/rss/search?q=bank+earnings+financials+credit+net+interest+margin+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Energy Sector",
+   "url": "https://news.google.com/rss/search?q=oil+prices+energy+stocks+OPEC+natural+gas+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Utilities Power",
+   "url": "https://news.google.com/rss/search?q=utilities+power+grid+nuclear+data+center+electricity+demand+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Industrials Defense",
+   "url": "https://news.google.com/rss/search?q=industrials+defense+contractors+manufacturing+aerospace+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Consumer Staples",
+   "url": "https://news.google.com/rss/search?q=consumer+staples+retail+sales+grocery+pricing+power+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Real Estate REITs",
+   "url": "https://news.google.com/rss/search?q=REIT+real+estate+commercial+property+housing+rates+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Materials Mining",
+   "url": "https://news.google.com/rss/search?q=copper+lithium+gold+mining+materials+stocks+when:1d&hl=en-US&gl=US&ceid=US:en"
+  },
+  {
+   "name": "GN Sector Rotation",
+   "url": "https://news.google.com/rss/search?q=sector+rotation+defensive+stocks+market+leadership+when:1d&hl=en-US&gl=US&ceid=US:en"
   }
  ],
  "twitter_accounts": [

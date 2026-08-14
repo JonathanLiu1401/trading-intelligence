@@ -20,20 +20,70 @@ from collections import defaultdict
 
 
 def _pair_trades(trades: list[dict]) -> list[dict]:
-    """Match BUY/SELL pairs per ticker. Returns list of round-trip dicts.
+    """Match open/close pairs. Returns list of round-trip dicts.
 
-    Stock-only — option trades carry a strike/expiry that doesn't FIFO-pair
-    cleanly with the same-ticker stock; option_type=NULL is the proxy for
-    "stock trade". FIFO per ticker so a partial-size exit pairs against the
-    oldest open BUY, the convention round_trips.py already uses."""
+    Stocks: BUY → SELL FIFO per ticker.
+    Options: BUY_CALL/BUY_PUT → SELL_CALL/SELL_PUT FIFO per
+    (ticker, option_type, strike, expiry). Premium P/L is percent of entry
+    premium (same shape as stock pnl_pct so scorecard math stays unified).
+    """
     open_buys: dict[str, list[dict]] = defaultdict(list)
+    open_opts: dict[tuple, list[dict]] = defaultdict(list)
     round_trips: list[dict] = []
     for t in sorted(trades, key=lambda x: x.get("timestamp") or ""):
-        # Skip option legs — they don't pair as plain BUY/SELL pairs.
-        if t.get("option_type"):
-            continue
         ticker = t.get("ticker") or ""
         action = (t.get("action") or "").upper()
+        otype = (t.get("option_type") or "").lower() or None
+
+        # Option legs — pair by full option key, not bare ticker.
+        if otype in ("call", "put") or action in {
+            "BUY_CALL", "BUY_PUT", "SELL_CALL", "SELL_PUT",
+        }:
+            side = otype
+            if not side:
+                if "CALL" in action:
+                    side = "call"
+                elif "PUT" in action:
+                    side = "put"
+            key = (
+                ticker,
+                side or "",
+                str(t.get("strike") or ""),
+                str(t.get("expiry") or "")[:10],
+            )
+            if action in {"BUY_CALL", "BUY_PUT"} or (
+                action == "BUY" and side in {"call", "put"}
+            ):
+                open_opts[key].append(t)
+            elif action in {"SELL_CALL", "SELL_PUT"} or (
+                action == "SELL" and side in {"call", "put"}
+            ):
+                if open_opts[key]:
+                    buy = open_opts[key].pop(0)
+                    try:
+                        entry = float(buy.get("price") or 0)
+                        exit_p = float(t.get("price") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if entry <= 0:
+                        continue
+                    pnl_pct = (exit_p - entry) / entry * 100
+                    round_trips.append({
+                        "ticker": ticker,
+                        "instrument": "option",
+                        "option_type": side,
+                        "strike": t.get("strike"),
+                        "expiry": t.get("expiry"),
+                        "entry_price": entry,
+                        "exit_price": exit_p,
+                        "pnl_pct": round(pnl_pct, 2),
+                        "win": pnl_pct > 0,
+                        "entry_ts": buy.get("timestamp") or "",
+                        "exit_ts": t.get("timestamp") or "",
+                        "exit_reason": t.get("reason") or "",
+                    })
+            continue
+
         if action == "BUY":
             open_buys[ticker].append(t)
         elif action == "SELL" and open_buys[ticker]:
@@ -48,6 +98,7 @@ def _pair_trades(trades: list[dict]) -> list[dict]:
             pnl_pct = (exit_p - entry) / entry * 100
             round_trips.append({
                 "ticker": ticker,
+                "instrument": "stock",
                 "entry_price": entry,
                 "exit_price": exit_p,
                 "pnl_pct": round(pnl_pct, 2),

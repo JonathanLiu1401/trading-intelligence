@@ -26,16 +26,16 @@ _T0 = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
 
 
 # ── exact verdict/recommendation strings (verbatim — DO NOT import) ────────
-HEALTHY_REC = "Supervised and current — no action."
+HEALTHY_REC = "Supervised by systemd user unit and current — no action."
 STALE_REC = (
     "Supervised but running old code (boot aaaaaaa vs head bbbbbbb, "
     "behind 3). `systemctl --user restart paper-trader` to deploy the "
     "committed fixes.")
 UNSUP_REC = (
-    "Running current code but with NO restart safety net (orphan / unit "
-    "not active+enabled). A clean exit (git-watcher restart, deadman) or "
-    "crash leaves the trader DOWN. `systemctl --user enable --now "
-    "paper-trader`.")
+    "Running current code but with NO restart safety net "
+    "(orphan / systemd user unit not active+enabled). A clean exit "
+    "(git-watcher restart, deadman) or crash leaves the trader DOWN. "
+    "`systemctl --user enable --now paper-trader`.")
 UNSUP_STALE_REC = (
     "NO restart safety net AND on old code (boot aaaaaaa vs head bbbbbbb, "
     "behind 3). This is an orphan / un-managed run; the moment its "
@@ -43,9 +43,11 @@ UNSUP_STALE_REC = (
     "Re-attach supervision: `systemctl --user enable --now paper-trader` "
     "(it boots on current code).")
 UNKNOWN_REC = (
-    "Could not read systemd user state from inside the process (user bus "
-    "may be unreachable). Verify manually: `systemctl --user is-active "
-    "paper-trader; systemctl --user is-enabled paper-trader`.")
+    "Could not read systemd user unit state from inside the process. "
+    "Verify manually: `systemctl --user is-active paper-trader; "
+    "systemctl --user is-enabled paper-trader`.")
+LAUNCHD_HEALTHY_REC = (
+    "Supervised by launchd LaunchAgent and current — no action.")
 
 
 class TestVerdictMatrix:
@@ -62,6 +64,19 @@ class TestVerdictMatrix:
         assert r["as_of"] == "2026-05-18T12:00:00+00:00"
         assert r["pid"] == 42 and r["ppid"] == 99
         assert r["systemd"] == {"active": "active", "enabled": "enabled"}
+
+    def test_launchd_ppid1_with_keepalive_is_healthy(self):
+        # macOS LaunchAgent: PPID 1 is normal; KeepAlive = restart safety net.
+        r = build_supervision(pid=42, ppid=1, unit_active="active",
+                              unit_enabled="enabled", boot_sha="abc1234",
+                              head_sha="abc1234", behind=0, now=_T0,
+                              supervisor="launchd", unit_scope="user")
+        assert r["verdict"] == "HEALTHY"
+        assert r["recommendation"] == LAUNCHD_HEALTHY_REC
+        assert r["supervised"] is True
+        assert r["orphan"] is False
+        assert r["actionable"] is False
+        assert r["supervisor"] == "launchd"
 
     def test_stale_supervised(self):
         r = build_supervision(pid=1, ppid=99, unit_active="active",
@@ -201,6 +216,12 @@ class TestEndpointDelegatesToBuilder:
     def test_endpoint_matches_builder_unsupervised_stale(self, client,
                                                           monkeypatch):
         c, dashboard = client
+        # Force the systemd probe path so this lock stays platform-stable
+        # (macOS hosts otherwise take the launchd branch).
+        monkeypatch.setattr(dashboard.sys if hasattr(dashboard, "sys") else __import__("sys"),
+                            "platform", "linux", raising=False)
+        import sys as _sys
+        monkeypatch.setattr(_sys, "platform", "linux")
         monkeypatch.setattr(dashboard, "_BOOT_SHA", "aaaaaaa")
         monkeypatch.setattr(dashboard, "_head_sha_and_behind",
                             lambda: ("bbbbbbb", 3))
@@ -221,7 +242,7 @@ class TestEndpointDelegatesToBuilder:
         expected = build_supervision(
             pid=4242, ppid=1, unit_active="inactive",
             unit_enabled="disabled", boot_sha="aaaaaaa",
-            head_sha="bbbbbbb", behind=3)
+            head_sha="bbbbbbb", behind=3, supervisor="systemd")
         # as_of is wall-clock; assert every other key is byte-identical.
         for k, v in expected.items():
             if k == "as_of":

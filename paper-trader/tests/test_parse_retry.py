@@ -154,6 +154,7 @@ def test_ml_drought_fallback_turns_llm_drought_into_hold(stub_decide_inputs,
 
 
 def test_ml_drought_buy_fallback_never_places_emergency_buy(monkeypatch):
+    monkeypatch.setattr(strategy, "ML_DROUGHT_ALLOW_ENTRIES", False)
     monkeypatch.setattr(strategy.market, "get_price", lambda t: 100.0)
     decision = strategy._ml_drought_decision(
         {
@@ -176,6 +177,36 @@ def test_ml_drought_buy_fallback_never_places_emergency_buy(monkeypatch):
     assert "qty" not in decision
     assert "emergency_qty" not in decision["reasoning"]
     assert "no emergency buy" in decision["reasoning"]
+    assert "ml-drought-fallback" in decision["reasoning"]
+
+
+def test_ml_drought_buy_fallback_can_place_entry_when_enabled(monkeypatch):
+    monkeypatch.setattr(strategy, "ML_DROUGHT_ALLOW_ENTRIES", True)
+    monkeypatch.setattr(strategy, "ML_DROUGHT_BUY_CASH_PCT", 0.20)
+    monkeypatch.setattr(strategy, "ML_DROUGHT_BUY_MAX_USD", 500.0)
+    monkeypatch.setattr(strategy, "ML_DROUGHT_MIN_CONFIDENCE", 0.35)
+    monkeypatch.setattr(strategy.market, "get_price", lambda t: 100.0)
+    decision = strategy._ml_drought_decision(
+        {
+            "action": "BUY",
+            "ticker": "AMD",
+            "reasoning": "ML+quant: AMD score=9.0 regime=bull conviction=20%",
+            "confidence": 0.5,
+        },
+        {
+            "cash": 1000.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 1500.0,
+            "positions": [],
+        },
+        {"AMD": 100.0},
+        "claude returned no response (timeout)",
+    )
+
+    assert decision["action"] == "BUY"
+    assert decision["ticker"] == "AMD"
+    assert decision["qty"] > 0
+    assert "ML drought entry authorized" in decision["reasoning"]
     assert "ml-drought-fallback" in decision["reasoning"]
 
 

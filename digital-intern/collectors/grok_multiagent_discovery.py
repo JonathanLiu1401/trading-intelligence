@@ -50,7 +50,7 @@ CURSOR_API_BASE = os.environ.get(
 ).rstrip("/")
 CURSOR_MODEL = os.environ.get(
     "GROK_DISCOVERY_CURSOR_MODEL",
-    os.environ.get("PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.5-high"),
+    os.environ.get("PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.6-xhigh"),
 )
 CURSOR_FALLBACK = os.environ.get(
     "GROK_DISCOVERY_CURSOR_FALLBACK",
@@ -181,7 +181,7 @@ def _cursor_chat(prompt: str, *, timeout_s: int = LLM_TIMEOUT_S) -> str | None:
     """Fallback: Cursor CLI proxy Grok (chat only; no xAI multi-agent tools)."""
     if not CURSOR_FALLBACK:
         return None
-    model_id = (CURSOR_MODEL or "cursor-grok-4.5-high").strip()
+    model_id = (CURSOR_MODEL or "cursor-grok-4.6-xhigh").strip()
     system = (
         "You are a financial news discovery harness (Cursor Grok fallback). "
         "Find real, recent public market/news articles with working URLs. "

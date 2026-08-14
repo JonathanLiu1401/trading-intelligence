@@ -258,6 +258,8 @@ def _clean_ui_global(resp):
 
 _MODEL_DISPLAY_NAMES = {
     "ml_quant": "ML+Quant (deterministic)",
+    "grok-4.6": "Grok 4.6",
+    "xai/grok-4.6": "Grok 4.6",
     "claude-opus-4-7": "Claude Opus 4.7",
     "claude-opus-4-8": "Claude Opus 4.8",
     "claude-sonnet-4-6": "Claude Sonnet 4.6",
@@ -14595,6 +14597,52 @@ def buying_power_api():
         return jsonify({"error": str(e)}), 500
 
 
+
+
+@app.route("/api/options-desk")
+@swr_cached("options-desk", 60.0)
+def options_desk_api():
+    """Options desk awareness — chain snapshots, strategy skills, open-option
+    facts. Same builder as strategy.decide() injects into the Opus prompt.
+    Observational only (AGENTS.md #2/#12)."""
+    try:
+        from . import market as _market
+        from .analytics.options_desk import build_options_desk
+        from .strategy import WATCHLIST, portfolio_snapshot_readonly
+        store = get_store()
+        snap = portfolio_snapshot_readonly(store)
+        # Prefer held names + a few watchlist names for chain context.
+        held = []
+        for p in snap.get("positions") or []:
+            t = str(p.get("ticker") or "").upper()
+            if t and t not in held:
+                held.append(t)
+        names = held + [t for t in (WATCHLIST or []) if t not in held]
+        watch_px = _market.get_prices(names[:6]) if names else {}
+        rep = build_options_desk(
+            snap,
+            watch_px,
+            names[:6],
+            max_underlyings=3,
+            fetch_chains=True,
+        )
+        return jsonify(rep)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trade-memory")
+def trade_memory_api():
+    """Recent paper-trade learning rows (local JSONL + last push status)."""
+    try:
+        from .analytics.claude_mem_trades import recent_trade_memory
+        limit = request.args.get("limit", default=20, type=int) or 20
+        limit = max(1, min(int(limit), 200))
+        rows = recent_trade_memory(limit=limit)
+        return jsonify({"count": len(rows), "trades": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/liquidation-preview")
 def liquidation_preview_api():
     """If I closed every open position right now at the live mark, what
@@ -16128,6 +16176,34 @@ def round_trip_postmortem_api():
         return jsonify({"error": str(e), "state": "ERROR"}), 500
 
 
+def _current_runner_cadence(store, now_utc: datetime) -> tuple[bool, float, str]:
+    """Return ``(tradable_window_open, expected_interval_s, cadence_context)``.
+
+    Mirrors the live runner's dynamic interval without making the heartbeat
+    builder import runner/dashboard state.
+    """
+    from . import market as _mkt
+    tradable = bool(_mkt.is_tradable_window_open(now_utc))
+    regular = bool(_mkt.is_market_open(now_utc))
+    try:
+        from .analytics.dynamic_interval import compute_interval
+        positions = [
+            {"ticker": p.get("ticker")}
+            for p in (store.open_positions() or [])
+            if p.get("ticker")
+        ]
+        expected = float(compute_interval(positions, now=now_utc))
+    except Exception:
+        expected = 300.0 if regular else (1800.0 if tradable else 3600.0)
+    if regular:
+        ctx = "regular-market"
+    elif tradable:
+        ctx = "extended-hours"
+    else:
+        ctx = "market-closed"
+    return tradable, expected, ctx
+
+
 @app.route("/api/last-real-decision")
 def last_real_decision_api():
     """Single dedicated surface for "when did the engine last actually
@@ -16188,8 +16264,7 @@ def last_real_decision_api():
                 "row": None,
             }), 500
         now_utc = datetime.now(timezone.utc)
-        market_open = _mkt.is_market_open(now_utc)
-        expected = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
+        market_open, expected, _ctx = _current_runner_cadence(store, now_utc)
 
         if row is None:
             return jsonify({
@@ -16419,10 +16494,13 @@ def runner_heartbeat_api():
         except Exception:
             last_real_ts = None
         now_utc = datetime.now(timezone.utc)
+        market_open, expected, cadence_context = _current_runner_cadence(store, now_utc)
         hb = build_runner_heartbeat(
-            last_ts, _mkt.is_market_open(now_utc), now=now_utc,
+            last_ts, market_open, now=now_utc,
             recent_actions=recent_actions, recent_reasons=recent_reasons,
-            last_real_decision_ts=last_real_ts)
+            last_real_decision_ts=last_real_ts,
+            expected_interval_s=expected,
+            cadence_context=cadence_context)
         # Additive: the single-instance-lock state of THE PROCESS SERVING
         # THIS DASHBOARD (the dashboard runs in a runner thread). A runner
         # that booted degraded (no flock — invariant #19 fail-open) may be
@@ -18149,6 +18227,7 @@ def _swr_prewarm():
         # manual trade — cold-stalling that surface defeats the point of
         # surfacing the block in the first place.
         ("buying-power", buying_power_api),
+        ("options-desk", options_desk_api),
         # The four endpoints below were @swr_cached by later commits but
         # never added to this prewarm list — the same freeze-triage cold-
         # stall blind spot test_swr_prewarm_coverage locks against. A trader
@@ -18305,6 +18384,7 @@ def supervision_api():
         unit_active = _systemctl("is-active")    # active|inactive|failed|unknown
         unit_enabled = _systemctl("is-enabled")  # enabled|disabled|static|unknown
         unit_scope = None
+        supervisor = "systemd"
         try:
             cg = Path("/proc/self/cgroup").read_text(errors="ignore")
             if "/system.slice/paper-trader.service" in cg:
@@ -18314,13 +18394,44 @@ def supervision_api():
         except Exception:
             unit_scope = None
 
+        # macOS host uses LaunchAgent KeepAlive, not systemd --user.
+        # PPID==1 is normal under launchd; do not false-alarm UNSUPERVISED.
+        try:
+            import sys as _sys
+            if _sys.platform == "darwin":
+                label = "com.jonathan.trading-intelligence.paper-trader"
+                xpc = (_os.environ.get("XPC_SERVICE_NAME") or "").strip()
+                try:
+                    r = subprocess.run(
+                        ["launchctl", "print", f"gui/{_os.getuid()}/{label}"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    out = (r.stdout or "") + (r.stderr or "")
+                except Exception:
+                    out = ""
+                loaded = bool(out) and (
+                    "state =" in out or "pid =" in out.lower() or "runs =" in out
+                )
+                if xpc == label:
+                    loaded = True
+                supervisor = "launchd"
+                unit_scope = "user"
+                if loaded:
+                    unit_active = "active"
+                    unit_enabled = "enabled"
+                else:
+                    unit_active = "inactive"
+                    unit_enabled = "disabled"
+        except Exception:
+            pass
+
         head, behind = _head_sha_and_behind()
 
         # Single source of truth for the verdict/recommendation strings and
         # the orphan/stale/supervised derivation (invariant #10): the pure
         # builder is also composed verbatim by the hourly/daily Discord
         # `_supervision_line`, so the two operator surfaces can never drift.
-        # The impure probes (pid/ppid/systemctl/git) stay here — the
+        # The impure probes (pid/ppid/systemctl|launchctl/git) stay here —
         # established "network in the caller, builder is pure" split.
         from .analytics.supervision import build_supervision
         return jsonify(build_supervision(
@@ -18328,6 +18439,7 @@ def supervision_api():
             unit_active=unit_active, unit_enabled=unit_enabled,
             boot_sha=_BOOT_SHA, head_sha=head, behind=behind,
             unit_scope=unit_scope,
+            supervisor=supervisor,
         ))
     except Exception as e:
         return jsonify({"error": str(e), "verdict": "UNKNOWN"}), 500
@@ -22228,9 +22340,12 @@ def api_stack_liveness():
         recent_actions = [d.get("action_taken") for d in decs]
         recent_reasons = [d.get("reasoning") for d in decs]
         now_utc = datetime.now(timezone.utc)
+        market_open, expected, cadence_context = _current_runner_cadence(store, now_utc)
         rh = build_runner_heartbeat(
-            last_ts, _mkt.is_market_open(now_utc), now=now_utc,
+            last_ts, market_open, now=now_utc,
             recent_actions=recent_actions, recent_reasons=recent_reasons,
+            expected_interval_s=expected,
+            cadence_context=cadence_context,
         )
 
         scorer_info = _scorer_pkl_summary()

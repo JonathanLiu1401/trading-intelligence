@@ -36,9 +36,11 @@ contract (the caller in ``decide()`` also wraps it).
 from __future__ import annotations
 
 _PREAMBLE = (
-    "BUYING POWER (what your free cash can actually fund right now — facts "
-    "for sizing awareness only, NOT a directive or limit; you retain "
-    "complete autonomy over the next decision):"
+    "BUYING POWER + DEPLOYMENT TARGET (operator mandate: keep cash under 10% "
+    "of net worth and run 120%-150% gross long exposure using stock BP / "
+    "margin + smart leverage; ideal ~135%. Facts for sizing — hard engine "
+    "caps still bind; HOLD with fat cash requires an explicit blocked-idea "
+    "reason):"
 )
 
 # Cap the affordable-names list so the block stays one short prompt section.
@@ -199,11 +201,33 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
             top = affordable[:_MAX_AFFORDABLE_NAMES]
             shares_str = " · ".join(
                 f"{a['ticker']} {a['whole_shares']}" for a in top)
-            summary = f"${deployable:.2f} stock buying power, {dep} deployed"
+            cash_pct = (cash / total * 100.0) if total > 0 else None
+            cash_bit = (
+                f"{cash_pct:.1f}% cash" if cash_pct is not None else "n/a cash"
+            )
+            under = (
+                cash_pct is not None and cash_pct > 10.0
+            ) or (
+                deployed_pct is not None and deployed_pct < 120.0
+            )
+            mandate = (
+                " UNDER-DEPLOYED — prefer BUY/SHORT/options that push toward "
+                "120%-150% gross exposure and cash <10%; use stock leverage "
+                "when conviction supports it."
+                if under else
+                " Deployment in-band or near target; still prefer staying "
+                "invested over rebuilding a cash pile."
+            )
+            summary = (
+                f"${deployable:.2f} stock buying power, {dep} deployed, "
+                f"{cash_bit}"
+            )
             prompt_block = (
                 f"{_PREAMBLE}\n  ${deployable:.2f} stock buying power "
                 f"(${cash:.2f} cash + ${margin:.2f} margin; {dep} of the book "
-                f"deployed). Whole shares affordable now at live prices: "
+                f"deployed; {cash_bit}). Target: cash <10%, gross exposure "
+                f"120%-150% of net worth (ideal ~135%) via BP + leverage."
+                f"{mandate} Whole shares affordable now at live prices: "
                 f"{shares_str}.{unlock_line}")
 
         return {

@@ -4436,19 +4436,16 @@ def _query_news_context(ticker: str, sim_date_str: str, n: int = 4) -> list[str]
 
 def _opus_annotate(engine: "BacktestEngine", top_runs: list[BacktestRun],
                    cycle: int, outcome_records: list[dict] | None = None) -> int:
-    """Ask gpt-5.5 to annotate ALL decisions (BUY, SELL, HOLD) in the winner run.
+    """Ask Grok to annotate ALL decisions (BUY, SELL, HOLD) in the winner run.
 
     Enhanced over previous version:
     - Covers every decision, not just trades, so HOLDs can also be critiqued
-    - Attaches actual 5-day forward returns so Opus sees what happened after each call
+    - Attaches actual 5-day forward returns so the model sees what happened after each call
     - Pulls relevant scraped news articles from articles DB near each decision date
     - Outcome records (from _compute_decision_outcomes) included as context when available
 
     Annotations are appended to WINNER_JSONL. Returns number of records written.
     """
-    if not shutil.which("codex"):
-        print("[opus_annotate] codex CLI not found — skipping annotation")
-        return 0
     if not top_runs:
         return 0
 
@@ -4550,39 +4547,16 @@ Respond as JSON with this schema (no markdown fences):
 }}"""
 
     try:
-        r = subprocess.run(
-            [
-                "codex", "exec",
-                "--model", "gpt-5.5",
-                "-c", 'model_reasoning_effort="none"',
-                "--sandbox", "read-only",
-                "--cd", str(Path(__file__).resolve().parent),
-                "--ephemeral",
-                "--color", "never",
-                "-",
-            ],
-            input=prompt, capture_output=True, text=True, timeout=240,
-            env={
-                **os.environ,
-                "HOME": "/home/zeph",
-                "CODEX_HOME": os.environ.get(
-                    "PAPER_TRADER_CODEX_HOME",
-                    str(Path.home() / ".codex"),
-                ),
-            },
-        )
-    except subprocess.TimeoutExpired:
-        print("[opus_annotate] timeout")
-        return 0
+        # Stack policy: all annotation LLM traffic goes through Grok/xAI.
+        from paper_trader.strategy import _xai_http_call, MODEL as _GROK_MODEL
+        raw = (_xai_http_call(prompt, timeout_s=240, model=_GROK_MODEL) or "").strip()
     except Exception as e:
-        print(f"[opus_annotate] subprocess error: {e}")
+        print(f"[opus_annotate] grok error: {e}")
         return 0
 
-    if r.returncode != 0 or not r.stdout.strip():
-        print(f"[opus_annotate] codex rc={r.returncode} stderr={r.stderr.strip()[:200]!r}")
+    if not raw:
+        print("[opus_annotate] grok returned empty")
         return 0
-
-    raw = r.stdout.strip()
     m = re.search(r"\{[\s\S]*\}", raw)
     if not m:
         print("[opus_annotate] no JSON in response")

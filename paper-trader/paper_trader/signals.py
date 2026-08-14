@@ -336,7 +336,18 @@ _NOT_TICKERS = {
     #     ("RBC upgrades NVDA to BUY") and ARE deliberately preserved as
     #     non-controversial verbs above.
     "NYSE", "DJIA", "JONES", "WALL", "STREET", "BUYS", "SELLS",
+    # Media / legal / accounting / org tokens observed live as dead "tickers"
+    # (2026-08-06): GAAP, AOL, CNBC, LLC, RBI + friends were extracted from
+    # headlines, entered discovery pricing, and yfinance-darked the cycle.
+    # Verified NOT to be names we want the paper desk to trade as equities.
+    "GAAP", "IFRS", "EBITDA", "EBIT", "AOL", "CNBC", "BBC", "CNN", "WSJ",
+    "NYT", "FT", "AP", "REUTERS", "BLOOMBERG", "MSNBC", "FOX", "ABC", "NBC",
+    "CBS", "LLC", "LTD", "INC", "CORP", "PLC", "CO", "LP", "LLP", "SA", "AG",
+    "NV", "BV", "GMBH", "RBI", "SBA", "HUD", "IRS", "HHS", "DHS", "DOT",
+    "DOE", "EPA", "FCC", "FTC", "CFTC", "OCC", "FDIC", "NLRB", "NASA",
+    "NOAA", "WHOOP",  # keep genuine cashtag path via $cashtag bypass
 }
+
 
 
 # Company-name → ticker aliases. A headline like "Nvidia surges to record on chip

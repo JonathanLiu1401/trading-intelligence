@@ -120,6 +120,20 @@ def test_same_gap_different_verdict_by_market_state():
     assert closed_out["expected_interval_s"] == CLOSED_INTERVAL_S
 
 
+def test_expected_interval_override_supports_extended_hours_cadence():
+    """Extended-hours uses the open/tradable path but a 30-minute cadence."""
+    out = build_runner_heartbeat(
+        _ago(20 * 60),
+        market_open=True,
+        now=NOW,
+        expected_interval_s=1800.0,
+        cadence_context="extended-hours",
+    )
+    assert out["verdict"] == "HEALTHY"
+    assert out["expected_interval_s"] == 1800.0
+    assert "extended-hours" in out["headline"]
+
+
 # ─────────────────────────── NO_DATA ───────────────────────────
 
 def test_none_timestamp_is_no_data():

@@ -126,7 +126,9 @@ class TestBookReachesSonnetPrompt:
         ok, spy, mock_claude = self._send(art, monkeypatch)
         assert ok is True
         prompt = mock_claude.call_args.args[0]
-        assert "book: MU — analyst HOLDS/watches these" in prompt
+        assert "book: MU" in prompt
+        assert ("book_open: MU" in prompt) or ("book_watch: MU" in prompt)
+        assert "analyst HOLDS/watches these" not in prompt
         # The BOOK rule must reach the prompt so Sonnet acts on the line.
         assert "BOOK: If an article carries a `book:` line" in prompt
         assert "PORTFOLIO line MUST" in prompt
@@ -143,7 +145,8 @@ class TestBookReachesSonnetPrompt:
         ok, _spy, mock_claude = self._send(art, monkeypatch)
         assert ok is True
         prompt = mock_claude.call_args.args[0]
-        assert "book: MU,NVDA — analyst HOLDS/watches these" in prompt
+        assert "book: MU,NVDA" in prompt
+        assert "analyst HOLDS/watches these" not in prompt
 
     def test_non_book_row_omits_book_line_no_fabrication(self, monkeypatch):
         art = {

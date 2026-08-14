@@ -34,19 +34,40 @@ def test_clean_flat_curve():
 
 
 def test_negative_cash_is_corrupt_and_dominates():
-    # A 50% jump (would otherwise be SUSPECT) AND a negative-cash point:
-    # CORRUPT must dominate SUSPECT.
+    # Impossible cash (more negative than total equity) is CORRUPT and
+    # must dominate a would-be SUSPECT jump.
     pts = [
         _pt("2026-05-18T00:00:00+00:00", 1000.0, 200.0),
-        _pt("2026-05-18T01:00:00+00:00", 1500.0, -25.50),  # +50% & cash<0
-        _pt("2026-05-18T02:00:00+00:00", 1500.0, -25.50),
+        _pt("2026-05-18T01:00:00+00:00", 100.0, -250.0),  # cash < -equity
+        _pt("2026-05-18T02:00:00+00:00", 100.0, -250.0),
     ]
     out = ei.build_equity_integrity(pts, [])  # no trades → jump is no-trade
     assert out["verdict"] == "CORRUPT"
     assert out["n_negative_cash"] == 2
-    assert out["min_cash_usd"] == -25.5
-    assert out["negative_cash_points"][0]["cash"] == -25.5
+    assert out["min_cash_usd"] == -250.0
+    assert out["negative_cash_points"][0]["cash"] == -250.0
     assert "over-drawn" in out["headline"]
+
+
+def test_margin_negative_cash_with_positive_equity_is_clean():
+    # Paper desk allows 2x stock buying power. cash=-25 with equity=1500 is
+    # leveraged book cash, not a corrupt overdraw.
+    pts = [
+        _pt("2026-05-18T00:00:00+00:00", 1000.0, 200.0),
+        _pt("2026-05-18T01:00:00+00:00", 1500.0, -25.50),
+        _pt("2026-05-18T02:00:00+00:00", 1510.0, -25.50),
+        _pt("2026-05-18T03:00:00+00:00", 1520.0, -10.0),
+        _pt("2026-05-18T04:00:00+00:00", 1530.0, 5.0),
+    ]
+    # Include a trade near the jump window so the +50% move is explained.
+    trades = [{"timestamp": "2026-05-18T00:30:00+00:00", "ticker": "NVDA",
+               "action": "BUY", "qty": 1, "price": 100.0}]
+    out = ei.build_equity_integrity(pts, trades)
+    assert out["verdict"] == "CLEAN"
+    assert out["n_negative_cash"] == 0
+    assert out["n_margin_cash"] >= 2
+    assert out["min_cash_usd"] == -25.5
+    assert "margin-cash" in out["headline"]
 
 
 def test_nonpositive_equity_is_corrupt():

@@ -58,7 +58,8 @@ def build_supervision(*, pid: int | None, ppid: int | None,
                        unit_active: str, unit_enabled: str,
                        boot_sha: str | None, head_sha: str | None,
                        behind: int, now: datetime | None = None,
-                       unit_scope: str | None = None) -> dict:
+                       unit_scope: str | None = None,
+                       supervisor: str | None = None) -> dict:
     """Compose the deployment-recovery verdict from already-probed inputs.
 
     Args (all probed by the caller — this function does NO IO):
@@ -73,6 +74,12 @@ def build_supervision(*, pid: int | None, ppid: int | None,
       head_sha / behind   — current git HEAD + commit distance from boot.
       unit_scope          — ``system`` / ``user`` when the caller can prove
                             this process lives inside the matching unit cgroup.
+      supervisor          — ``systemd`` / ``launchd`` / None. On macOS the
+                            paper trader is a LaunchAgent with KeepAlive, not
+                            a systemd user unit. Callers probe launchctl and
+                            pass supervisor="launchd" with unit_active/
+                            unit_enabled mapped to active+enabled when the
+                            job is loaded with a restart safety net.
       now                 — injectable clock for the ``as_of`` stamp.
 
     Returns the exact dict shape ``/api/supervision`` has always returned,
@@ -91,16 +98,23 @@ def build_supervision(*, pid: int | None, ppid: int | None,
     when no active+enabled service owns the restart contract."""
     try:
         ts = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
-        unit_supervised = (unit_active == "active"
-                           and unit_enabled == "enabled"
-                           and (ppid != 1 or unit_scope in {"system", "user"}))
-        orphan = (ppid == 1 and not unit_supervised)
+        sup = (supervisor or "systemd").strip().lower()
+        # launchd is PID 1 on macOS. A LaunchAgent with KeepAlive is supervised
+        # even when PPID==1 — that is the normal parent, not an orphan.
+        if sup == "launchd":
+            unit_supervised = (unit_active == "active" and unit_enabled == "enabled")
+            orphan = (not unit_supervised) and (ppid == 1)
+        else:
+            unit_supervised = (unit_active == "active"
+                               and unit_enabled == "enabled"
+                               and (ppid != 1 or unit_scope in {"system", "user"}))
+            orphan = (ppid == 1 and not unit_supervised)
         stale = bool(boot_sha and head_sha and head_sha != boot_sha)
 
         # "supervised" = this process WILL be auto-restarted if it exits.
         # A true orphan never will. Otherwise require an active+enabled unit
-        # (Restart=always in force).
-        # Unreadable systemctl on a non-orphan ⇒ supervision indeterminate.
+        # (Restart=always / KeepAlive in force).
+        # Unreadable supervisor state on a non-orphan ⇒ indeterminate.
         if orphan:
             supervised: bool | None = False
         elif unit_active == "unknown" or unit_enabled == "unknown":
@@ -108,23 +122,47 @@ def build_supervision(*, pid: int | None, ppid: int | None,
         else:
             supervised = unit_supervised
 
+        if sup == "launchd":
+            restart_cmd = (
+                "launchctl kickstart -k "
+                "gui/$(id -u)/com.jonathan.trading-intelligence.paper-trader"
+            )
+            enable_cmd = (
+                "launchctl bootstrap gui/$(id -u) "
+                "~/Library/LaunchAgents/"
+                "com.jonathan.trading-intelligence.paper-trader.plist"
+            )
+            verify_cmd = (
+                "launchctl print "
+                "gui/$(id -u)/com.jonathan.trading-intelligence.paper-trader "
+                "| head"
+            )
+            super_label = "launchd LaunchAgent"
+        else:
+            restart_cmd = "systemctl --user restart paper-trader"
+            enable_cmd = "systemctl --user enable --now paper-trader"
+            verify_cmd = (
+                "systemctl --user is-active paper-trader; "
+                "systemctl --user is-enabled paper-trader"
+            )
+            super_label = "systemd user unit"
+
         if supervised is None:
             verdict = "UNKNOWN"
             recommendation = (
-                "Could not read systemd user state from inside the process "
-                "(user bus may be unreachable). Verify manually: "
-                "`systemctl --user is-active paper-trader; "
-                "systemctl --user is-enabled paper-trader`.")
+                f"Could not read {super_label} state from inside the process. "
+                f"Verify manually: `{verify_cmd}`.")
         elif supervised:
             if stale:
                 verdict = "STALE"
                 recommendation = (
                     f"Supervised but running old code (boot {boot_sha} vs "
-                    f"head {head_sha}, behind {behind}). `systemctl --user "
-                    "restart paper-trader` to deploy the committed fixes.")
+                    f"head {head_sha}, behind {behind}). `{restart_cmd}` "
+                    "to deploy the committed fixes.")
             else:
                 verdict = "HEALTHY"
-                recommendation = "Supervised and current — no action."
+                recommendation = (
+                    f"Supervised by {super_label} and current — no action.")
         else:
             if stale:
                 verdict = "UNSUPERVISED_STALE"
@@ -133,16 +171,15 @@ def build_supervision(*, pid: int | None, ppid: int | None,
                     f"{boot_sha} vs head {head_sha}, behind {behind}). This "
                     "is an orphan / un-managed run; the moment its "
                     "git-watcher or deadman does os._exit(0) the trader "
-                    "stays DOWN. Re-attach supervision: `systemctl --user "
-                    "enable --now paper-trader` (it boots on current code).")
+                    "stays DOWN. Re-attach supervision: "
+                    f"`{enable_cmd}` (it boots on current code).")
             else:
                 verdict = "UNSUPERVISED"
                 recommendation = (
                     "Running current code but with NO restart safety net "
-                    "(orphan / unit not active+enabled). A clean exit "
-                    "(git-watcher restart, deadman) or crash leaves the "
-                    "trader DOWN. `systemctl --user enable --now "
-                    "paper-trader`.")
+                    f"(orphan / {super_label} not active+enabled). A clean "
+                    "exit (git-watcher restart, deadman) or crash leaves the "
+                    f"trader DOWN. `{enable_cmd}`.")
 
         return {
             "as_of": ts,
@@ -150,6 +187,7 @@ def build_supervision(*, pid: int | None, ppid: int | None,
             "pid": pid,
             "ppid": ppid,
             "orphan": orphan,
+            "supervisor": sup,
             "systemd": {"active": unit_active, "enabled": unit_enabled},
             "unit_scope": unit_scope,
             "boot_sha": boot_sha,
@@ -177,6 +215,7 @@ def build_supervision(*, pid: int | None, ppid: int | None,
             "pid": pid,
             "ppid": ppid,
             "orphan": None,
+            "supervisor": (supervisor or "systemd"),
             "systemd": {"active": unit_active, "enabled": unit_enabled},
             "unit_scope": unit_scope,
             "boot_sha": boot_sha,

@@ -5848,7 +5848,8 @@ _CHAT_SUGGESTIONS_FILLERS = [
     "What's happening in macro?",
     "Asia overnight setup?",
 ]
-_CHAT_LLM_FALLBACK_MODELS = ("gpt-5.5", "claude-sonnet-4-6")
+# Stack policy: all Digital Intern LLM traffic goes through Grok/xAI.
+_CHAT_LLM_FALLBACK_MODELS = ("grok-4.6",)
 _CHAT_LLM_TIMEOUT_S = max(
     2,
     int(os.environ.get("DIGITAL_INTERN_CHAT_LLM_TIMEOUT", "45")),
@@ -5882,9 +5883,8 @@ def _chat_model_candidates(env: dict[str, str] | None = None) -> list[str]:
     """Ordered chat LLM backends.
 
     ``DIGITAL_INTERN_CHAT_MODELS`` may name a comma-separated override. If it is
-    absent, keep the daemon-wide default first, then append both supported
-    runtimes so a Codex outage can fall through to Claude and a Claude outage
-    can fall through to Codex.
+    absent, keep the daemon-wide default first, then append Grok fallbacks.
+    Codex/Claude are no longer default chat backends.
     """
     env = env or os.environ
     configured = (
@@ -5957,7 +5957,7 @@ def _chat_backend_unavailable_response(
     lines.extend([
         "",
         f"Backend status: tried {failed}; all returned empty/unavailable.",
-        "Retry in a minute. This route now tries both Codex and Claude automatically.",
+        "Retry in a minute. This route now uses Grok (xAI) only.",
     ])
     if user_msg:
         lines.append(f"Question queued context: {user_msg[:180]}")
@@ -7347,18 +7347,19 @@ def create_app(store=None) -> Flask:
         conn = _ro_conn()
         if conn is not None:
             try:
-                # ArticleNet trains on rows with any ML/LLM-assigned score;
-                # `kw_score` is the pure-heuristic fallback we exclude here.
-                # Articles scored in the past 24h are a reasonable proxy for
-                # inference throughput; there is no `score_source` column in
-                # this schema (see articles table definition).
+                # ArticleNet predictions are rows the scorer wrote as
+                # score_source='ml'. Do not count ai_score > 0 here: live ML
+                # predictions intentionally keep ai_score at 0 and write
+                # ml_score instead, so the old query showed predictions_24h=0
+                # even while the scorer was actively updating rows.
                 if standalone:
                     row = conn.execute(
                         "SELECT "
-                        "SUM(CASE WHEN ai_score > 0 THEN 1 ELSE 0 END), "
+                        "SUM(CASE WHEN score_source = 'ml' THEN 1 ELSE 0 END), "
                         "SUM(CASE WHEN urgency >= 1 THEN 1 ELSE 0 END) "
                         "FROM articles "
-                        f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
+                        "WHERE datetime(first_seen) >= datetime('now','-24 hours') "
+                        f"AND {_LIVE_ONLY_SQL}"
                     ).fetchone()
                     predictions_24h = int(row[0] or 0)
                     urgent_24h = int(row[1] or 0)
@@ -7366,11 +7367,13 @@ def create_app(store=None) -> Flask:
                     row = conn.execute(
                         "SELECT "
                         "SUM(CASE WHEN ai_score > 0 THEN 1 ELSE 0 END), "
-                        "SUM(CASE WHEN ai_score > 0 "
-                        f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                        "SUM(CASE WHEN score_source = 'ml' "
+                        "AND datetime(first_seen) >= datetime('now','-24 hours') "
+                        f"AND {_LIVE_ONLY_SQL} "
                         "THEN 1 ELSE 0 END), "
                         "SUM(CASE WHEN urgency >= 1 "
-                        f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                        "AND datetime(first_seen) >= datetime('now','-24 hours') "
+                        f"AND {_LIVE_ONLY_SQL} "
                         "THEN 1 ELSE 0 END) "
                         "FROM articles"
                     ).fetchone()
@@ -12168,7 +12171,7 @@ _CHAT_HTML = """<!doctype html>
 <div class="page-content">
 <header class="page">
   <h1>Market Intel</h1>
-  <div class="sub">Powered by Claude Opus 4.7 + Live News Feed</div>
+  <div class="sub">Powered by Grok + Live News Feed</div>
 </header>
 <div class="suggestions" id="suggestions"></div>
 <div class="chat-wrap" id="chat"></div>

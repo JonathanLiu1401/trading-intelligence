@@ -44,10 +44,10 @@ def _write_calendar(path: Path, events: list[dict]) -> None:
 
 # ─────────────────────── EARNINGS tiers ───────────────────────
 
-def test_after_close_earnings_window_is_slower_than_market_open(tmp_path):
+def test_after_close_earnings_window_uses_tradable_cadence(tmp_path):
     """NVDA held + earnings today + it is 16:00 ET (inside the
-    15:45-18:30 ET reaction window) → use the after-close monitor cadence,
-    not a frantic loop faster than tradable market hours."""
+    15:45-18:30 ET reaction window) → use the extended-hours tradable
+    cadence."""
     cal = tmp_path / "earnings_calendar.json"
     # 2026-05-19 (Tuesday) 16:00 ET — same date in ET as the earnings stamp.
     now_utc = _et(2026, 5, 19, 16, 0)
@@ -90,12 +90,11 @@ def test_held_earnings_today_regular_session_returns_fast_open_cadence(tmp_path)
     )
 
 
-def test_held_earnings_today_premarket_uses_closed_cadence(tmp_path):
-    """Held-name earnings day before the regular session must not use the
-    fast earnings-day tier. This was the bug behind frequent closed-market
-    cycles and sparse open-market cycles."""
+def test_held_earnings_today_premarket_uses_tradable_cadence(tmp_path):
+    """Held-name earnings day during pre-market is tradable, but only at the
+    lower 30-minute cadence."""
     cal = tmp_path / "earnings_calendar.json"
-    now_utc = _et(2026, 5, 19, 8, 0)  # Tuesday, premarket closed
+    now_utc = _et(2026, 5, 19, 8, 0)  # Tuesday, premarket tradable
     earnings_dt = datetime(2026, 5, 19, 0, 0, tzinfo=_NY)
     _write_calendar(cal, [
         {"ticker": "NVDA", "earnings_date": earnings_dt.isoformat()},
@@ -106,9 +105,39 @@ def test_held_earnings_today_premarket_uses_closed_cadence(tmp_path):
         now=now_utc,
         calendar_path=cal,
     )
-    assert sleep_s == 3600, (
-        f"premarket earnings day should use closed cadence, got {sleep_s}"
+    assert sleep_s == 1800, (
+        f"premarket earnings day should use 1800s cadence, got {sleep_s}"
     )
+
+
+def test_premarket_near_regular_open_uses_extended_cadence(tmp_path):
+    """Pre-market is now tradable, so 09:26 ET uses the 30-minute cadence
+    instead of clamping to the 09:30 regular open."""
+    cal = tmp_path / "earnings_calendar.json"
+    _write_calendar(cal, [])
+    now_utc = _et(2026, 6, 15, 9, 26)
+
+    sleep_s = compute_interval(
+        positions=[{"ticker": "MU"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 1800
+
+
+def test_overnight_near_premarket_clamps_sleep(tmp_path):
+    """A closed-market cycle shortly before 04:00 ET must not sleep the full
+    closed cadence and miss the extended-hours open."""
+    cal = tmp_path / "earnings_calendar.json"
+    _write_calendar(cal, [])
+    now_utc = _et(2026, 6, 15, 3, 59)
+
+    sleep_s = compute_interval(
+        positions=[],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 65
 
 
 # ─────────────────────── MARKET_OPEN tier ───────────────────────
@@ -189,9 +218,9 @@ def test_half_day_afternoon_after_early_close_is_closed_cadence(tmp_path):
         now=now_utc,
         calendar_path=cal,
     )
-    # Held position → MARKET_CLOSED (3600s), not MARKET_OPEN (300s)
-    assert sleep_s == 3600, (
-        f"half-day post-close should use closed cadence, got {sleep_s}s"
+    # Held position → extended-hours cadence, not regular-session-only closed.
+    assert sleep_s == 1800, (
+        f"half-day post-close should use extended cadence, got {sleep_s}s"
     )
 
 

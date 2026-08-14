@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 # operator's JSON shape is stable across runs).
 _UNSET = object()
 
-OPEN_INTERVAL_S = 300.0     # mirrors runner.OPEN_INTERVAL_S   (market open)
+OPEN_INTERVAL_S = 300.0     # mirrors runner.OPEN_INTERVAL_S   (regular market)
 CLOSED_INTERVAL_S = 3600.0  # mirrors runner.CLOSED_INTERVAL_S (market closed)
 LAGGING_MULT = 1.25
 STALLED_MULT = 2.0
@@ -290,6 +290,8 @@ def build_runner_heartbeat(
     no_decision_storm_threshold: int = NO_DECISION_STORM_THRESHOLD,
     recent_reasons: list[str | None] | None = None,
     last_real_decision_ts=_UNSET,
+    expected_interval_s: float | None = None,
+    cadence_context: str | None = None,
 ) -> dict:
     """Verdict on whether the decision loop is still cycling **and deciding**.
 
@@ -330,8 +332,12 @@ def build_runner_heartbeat(
     Omitting ``last_real_decision_ts`` ⇒ output byte-identical to before
     these keys existed (no new fields appear on the dict at all)."""
     now = now or datetime.now(timezone.utc)
-    expected = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
-    ctx = "market-open" if market_open else "market-closed"
+    expected = float(
+        expected_interval_s
+        if expected_interval_s is not None
+        else (OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S)
+    )
+    ctx = cadence_context or ("market-open" if market_open else "market-closed")
     out: dict = {
         "as_of": now.isoformat(timespec="seconds"),
         "market_open": bool(market_open),

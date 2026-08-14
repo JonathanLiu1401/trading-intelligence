@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_LLM_MODEL = os.environ.get("DIGITAL_INTERN_LLM_MODEL", "grok-4.5")
+DEFAULT_LLM_MODEL = os.environ.get("DIGITAL_INTERN_LLM_MODEL", "grok-4.6")
 CODEX_REASONING_EFFORT = os.environ.get(
     "DIGITAL_INTERN_CODEX_REASONING_EFFORT",
     "xhigh",
@@ -57,15 +57,15 @@ XAI_AUTH_PROFILE = os.environ.get(
 )
 
 # Cursor CLI OpenAI-compatible proxy (LaunchAgent com.cursor-agent-api).
-# Used when SuperGrok/xAI credits or rate limits are exhausted. Still Grok 4.5
-# High, billed through Cursor — never Claude.
+# Used when SuperGrok/xAI credits or rate limits are exhausted. Still Grok 4.6
+# Extra High (xhigh), billed through Cursor — never Claude.
 CURSOR_API_BASE = os.environ.get(
     "DIGITAL_INTERN_CURSOR_API_BASE",
     os.environ.get("PAPER_TRADER_CURSOR_API_BASE", "http://127.0.0.1:4646/v1"),
 ).rstrip("/")
 CURSOR_MODEL = os.environ.get(
     "DIGITAL_INTERN_CURSOR_MODEL",
-    os.environ.get("PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.5-high"),
+    os.environ.get("PAPER_TRADER_CURSOR_MODEL", "cursor-grok-4.6-xhigh"),
 )
 CURSOR_FALLBACK = os.environ.get(
     "DIGITAL_INTERN_CURSOR_FALLBACK",
@@ -329,7 +329,7 @@ def _cursor_http_call(prompt: str, timeout: int) -> str | None:
     """Call Grok via the local Cursor CLI OpenAI proxy (SuperGrok backup)."""
     if not _cursor_fallback_enabled():
         return None
-    model_id = (CURSOR_MODEL or "cursor-grok-4.5-high").strip()
+    model_id = (CURSOR_MODEL or "cursor-grok-4.6-xhigh").strip()
     system = (
         "You are the Digital Intern / ArticleNet LLM backend. "
         "Follow the user instructions exactly. Prefer concise, "
@@ -449,7 +449,7 @@ def claude_call(
 
     Default / Grok models use xAI HTTP first. When SuperGrok/xAI is rate-limited
     or credits are exhausted, fall back to the local Cursor CLI proxy
-    (``cursor-grok-4.5-high``) — still Grok, billed via Cursor. Explicit
+    (``cursor-grok-4.6-xhigh``) — still Grok, billed via Cursor. Explicit
     ``gpt-*`` model ids still fall through to Codex CLI only if requested.
     """
     # HARD RULE 2026-08-04: Claude/Anthropic spend disabled unless explicitly re-enabled.
@@ -465,9 +465,9 @@ def claude_call(
         if not _uses_xai_http(model):
             print(
                 f"[claude_cli] BLOCKED Claude/non-Grok model={model!r}; "
-                "forcing grok-4.5 (Claude spend disabled 2026-08-04)"
+                "forcing grok-4.6 (Claude spend disabled 2026-08-04)"
             )
-            model = "grok-4.5"
+            model = "grok-4.6"
 
     if _uses_xai_http(model):
         result = None

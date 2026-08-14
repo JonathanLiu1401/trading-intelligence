@@ -84,15 +84,15 @@ class TestDeadTickersAccessor:
         # An older mark has higher seconds_dead and lower ttl_remaining_s.
         t0 = 4_000_000.0
         monkeypatch.setattr(market.time, "time", lambda: t0)
-        market._mark_dead("OLD")            # marked at t0
+        market._mark_dead("XOLD")            # marked at t0
         monkeypatch.setattr(market.time, "time", lambda: t0 + 100.0)
-        market._mark_dead("NEW")            # marked at t0+100
+        market._mark_dead("XNEW")            # marked at t0+100
         # Probe at t0+150
         monkeypatch.setattr(market.time, "time", lambda: t0 + 150.0)
         rows = {r["ticker"]: r for r in market.dead_tickers()}
-        assert rows["OLD"]["seconds_dead"] == 150
-        assert rows["NEW"]["seconds_dead"] == 50
-        assert rows["OLD"]["ttl_remaining_s"] < rows["NEW"]["ttl_remaining_s"]
+        assert rows["XOLD"]["seconds_dead"] == 150
+        assert rows["XNEW"]["seconds_dead"] == 50
+        assert rows["XOLD"]["ttl_remaining_s"] < rows["XNEW"]["ttl_remaining_s"]
 
     def test_pure_read_does_not_mutate_cache(self, monkeypatch):
         """Calling ``dead_tickers()`` must NOT clear the cache or refresh

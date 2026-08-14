@@ -1,8 +1,10 @@
 """
 Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 """
+import json
 import logging
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -27,9 +29,18 @@ except Exception:
 
 SONNET_MODEL = DEFAULT_LLM_MODEL
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+JONATHAN_DISCORD_USER_ID = os.environ.get(
+    "JONATHAN_DISCORD_USER_ID", "454961974048980992"
+)
 SAO_DISCORD_USER_ID = os.environ.get("SAO_DISCORD_USER_ID", "702863115276124211")
 SAO_BREAKING_DM_ENABLED = (
     os.environ.get("SAO_BREAKING_DM_ENABLED", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+# Prefix every BREAKING channel alert with Discord user pings so urgent items
+# actually notify Jonathan (and Sao) instead of sitting silently in #claw.
+BREAKING_PING_ENABLED = (
+    os.environ.get("BREAKING_PING_ENABLED", "1").strip().lower()
     not in {"0", "false", "no", "off"}
 )
 OPENCLAW_CLI = os.environ.get("OPENCLAW_CLI", "")
@@ -58,13 +69,13 @@ Then on a new line after the code block: [article url]
 
 Categories: EARNINGS | RATING CHANGE | MACRO SHOCK | SUPPLY CHAIN | REGULATORY | FED | CRYPTO | M&A | GEOPOLITICAL
 
-RECENCY: Each article below carries `age` = elapsed time since publication. Reflect it honestly — an item several hours old is a developing/continued story, NOT one that "just" broke; never imply a multi-hour-old item happened moments ago. {now_utc} is the alert send time, not the event time. If an item is materially old (≳3h), make that explicit in CONTEXT (e.g. "first reported ~Nh ago").
+RECENCY: Each article below carries `age` = elapsed time since publication. Reflect it honestly — an item several hours old is a developing/continued story, NOT one that "just" broke; never imply a multi-hour-old item happened moments ago. {now_utc} is the alert send time, not the event time. If an item is materially old (≳3h), make that explicit in CONTEXT (e.g. "first reported ~Nh ago"). EARNINGS is stricter: only page fresh prints near release. Never frame a multi-hour-old earnings recap as a just-released print, and never write "Reported ~Nh ago" for an EARNINGS BREAKING alert — if it is already hours old it should not be in this batch.
 
 CALIBRATION: An article tagged "[unverified — model-only urgent]" was flagged urgent by the local relevance/urgency model with NO LLM ground-truth label (raw ai_score=0; the displayed score came from ml_score alone). The model demonstrably over-scores recap/SEO/forum/wiki rows ("Why X Stock Is Trading Up Today" templates, "Here What the Street Thinks ..." mill content). This is a lower-confidence call. CONTEXT must explicitly hedge — "model flagged as urgent, no LLM relevance label" — and IMPACT must NOT state magnitude as confirmed (use "WATCH" rather than "BUY"/"SELL" unless other rows in the batch corroborate). Do NOT lead the alert HEADLINE on a lone unverified row when a non-unverified one is present in the batch.
 
 CONTINUITY: If an article carries a `related:` line, a standalone 🚨 BREAKING alert on a related developing story ALREADY fired to this analyst within the last few hours — they have already been told the headline event. Frame THIS alert explicitly as a continuation/update of it: lead the HEADLINE with a development verb (ESCALATES / EXTENDS / WIDENS / FOLLOWS), and in CONTEXT state it follows the earlier alert (e.g. "follows ~Nh-ago alert on <prior event>"). Do NOT present it as the first time this story broke. This is what stops the analyst seeing what reads as a duplicate BREAKING for an event they are already tracking.
 
-BOOK: If an article carries a `book:` line, it names live portfolio/watchlist positions the analyst actually has money in ({held_book}). That event is directly actionable for the analyst's open risk: the PORTFOLIO line MUST name the listed held ticker(s) and give a concrete directional implication for each, and weight this article's IMPACT above generic macro colour of similar magnitude. Absence of a `book:` line means the event does not touch the held book — keep PORTFOLIO short (sector read-through only, no invented position).
+BOOK: If an article carries a `book:` line, it names tickers from the live portfolio/watchlist set ({held_book}). Treat `book_open:` as true open risk (positions/options with non-zero qty) and `book_watch:` as watchlist-only — never claim the analyst HOLDS a watchlist-only name. For open names, PORTFOLIO MUST give a concrete directional implication. For watchlist-only names, PORTFOLIO may note watchlist relevance but must not say "held". Absence of a `book:` line means the event does not touch the book — keep PORTFOLIO short (sector read-through only, no invented position).
 
 BOOK VELOCITY: If a `book_velocity:` line ALSO appears on a `book:` alert, it names how many other distinct articles mentioned the same held ticker in the last 60 minutes — the wire is materially CONCENTRATING on that name (momentum / cluster of related developments), so the IMPACT magnitude should reflect that: prefer BUY/SELL over WATCH and state magnitude with more confidence than for a lone event. A `book:` line WITHOUT a `book_velocity:` line means this is the only recent mention — frame it as an isolated headline (use WATCH unless the body itself is unambiguous). Absence of `book_velocity:` is silent (never reproduced as a section).
 
@@ -78,6 +89,420 @@ Output ONLY the alert message."""
 
 ALERT_BATCH_SIZE = 5
 
+GROK_URGENCY_GATE_PROMPT = """You are the final urgency gate for a trading desk Discord pager.
+
+Decide whether ANY article below is truly page-now urgent for a human trader who only wants rare, high-signal interruptions.
+
+Default to urgent=false. Most political and market color is NOT urgent.
+
+PAGE (urgent=true) only if ALL are true:
+1) Material market-moving catalyst with NEW information (earnings surprise/guidance change, major M&A, regulatory/FDA action, Fed decision/path change, sudden tariff/sanctions policy change, war/geopolitical shock with immediate market impact, supply-chain break, major forced selling/buyback/capital-return event).
+2) Fresh enough to act on now (not a recap, not a daily open, not multi-hour-old color).
+3) Specific and actionable — not SEO/recap/forum/wiki/quote-widget noise.
+4) Preferably touches the held/watchlist book, unless it is a true market-wide shock.
+
+Do NOT page for:
+- Trump speeches, campaign optics, teleprompter/staff/stage anecdotes, or routine political theater that happens often
+- "CNBC Daily Open" / morning wraps / Asia open color without a hard catalyst
+- "Asian markets lower/higher" style wraps
+- yield quote pages / price tickers / screener tapes
+- non-English syndication copies
+- analyst price-target churn without a new catalyst
+- "why stock is up today" recaps
+- model-only SEO mill content
+- duplicate facets of a story already known
+- soft geopolitics / Kremlin comments / generic inflation fear without a new print or policy action
+
+Articles:
+{articles_text}
+
+Return ONLY compact JSON, no markdown:
+{{"urgent": true|false, "reason": "one short sentence", "keep_ids": ["id1","id2"], "headline": "ONE LINE CAPS HEADLINE IF URGENT ELSE EMPTY"}}
+If urgent=false, keep_ids must be [].
+If urgent=true, keep_ids must include only the article ids that justify paging (max 2).
+"""
+
+# Deterministic rejects before spending a Grok call. These are daily-color
+# patterns that must never page even if the local model scores them 9+.
+_HARD_NON_URGENT_TITLE_RE = re.compile(
+    r"(?i)("
+    r"daily open|morning wrap|markets? wrap|asia open|overnight wrap|"
+    r"teleprompter|takes the stage|without his longtime|"
+    r"why .{0,40}stock is (up|down|trading)|"
+    r"stocks? making the biggest moves|"
+    r"what analysts want to see|"
+    r"here.?s what (happened|it means)|"
+    r"most undervalued stocks to buy"
+    r")"
+)
+_POLITICAL_COLOR_RE = re.compile(
+    r"(?i)\b(trump|biden|white house|campaign|rally|speech|press conference)\b"
+)
+_HARD_CATALYST_RE = re.compile(
+    r"(?i)("
+    r"tariff|sanction|executive order|fed (cut|hike|hold|decision|minutes)|fomc|"
+    r"earnings|guidance|acquire|acquisition|merger|fda|approval|recall|"
+    r"bankruptcy|default|halted|halt |cyberattack|missile|invasion|ceasefire collapse"
+    r")"
+)
+
+
+def _looks_like_hard_non_urgent(art: dict) -> str | None:
+    """Return a reject reason if the row is obviously not page-worthy."""
+    title = (art.get("title") or "").strip()
+    summary = (art.get("summary") or "").strip()
+    blob = f"{title}\n{summary}"
+    if not title:
+        return "empty title"
+    if _HARD_NON_URGENT_TITLE_RE.search(title):
+        return "daily-color / recap template"
+    # Political personality/optics with no hard catalyst = everyday noise.
+    if _POLITICAL_COLOR_RE.search(blob) and not _HARD_CATALYST_RE.search(blob):
+        return "political color without hard catalyst"
+    return None
+
+
+def _article_id(art: dict):
+    return art.get("_id") or art.get("id")
+
+
+def _gate_articles_text(batch: list[dict]) -> str:
+    lines = []
+    for a in batch:
+        aid = _article_id(a)
+        title = (a.get("title") or "(untitled)").strip()
+        source = (a.get("source") or "unknown").strip()
+        link = (a.get("link") or a.get("url") or "").strip()
+        score = a.get("ai_score") or a.get("ml_score") or "?"
+        src_kind = a.get("score_source") or "?"
+        book = ",".join(_book_tickers(a)) or "-"
+        summary = (a.get("summary") or "").strip()[:280]
+        lines.append(
+            f"id={aid} | score={score} score_source={src_kind} | book={book} | source={source}\n"
+            f"title={title}\nurl={link}\nsummary={summary}"
+        )
+    return "\n\n".join(lines)
+
+
+def _parse_grok_urgency_gate(raw: str | None, batch: list[dict]) -> dict:
+    """Parse Grok gate JSON. Fail closed (not urgent) on any ambiguity."""
+    if not raw or not str(raw).strip():
+        return {"urgent": False, "reason": "empty gate response", "keep": [], "headline": ""}
+    text = str(raw).strip()
+    # Strip markdown fences if the model ignores instructions.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        # Prefer first JSON object.
+        m = re.search(r"\{[\s\S]*\}", text)
+        payload = json.loads(m.group(0) if m else text)
+    except Exception:
+        return {"urgent": False, "reason": "unparseable gate response", "keep": [], "headline": ""}
+    if not isinstance(payload, dict):
+        return {"urgent": False, "reason": "gate payload not object", "keep": [], "headline": ""}
+    urgent = bool(payload.get("urgent") is True)
+    reason = str(payload.get("reason") or "").strip()[:240]
+    headline = str(payload.get("headline") or "").strip()[:180]
+    keep_ids = payload.get("keep_ids") or payload.get("ids") or []
+    if not isinstance(keep_ids, list):
+        keep_ids = []
+    keep_ids_norm = {str(x) for x in keep_ids}
+    id_map = {str(_article_id(a)): a for a in batch if _article_id(a) is not None}
+    keep = [id_map[i] for i in keep_ids_norm if i in id_map]
+    if urgent and not keep:
+        # Fail closed if model says urgent but names no valid ids.
+        return {"urgent": False, "reason": "urgent without valid keep_ids", "keep": [], "headline": ""}
+    if not urgent:
+        keep = []
+        headline = ""
+    return {"urgent": urgent, "reason": reason, "keep": keep[:2], "headline": headline}
+
+
+def _grok_urgency_gate(batch: list[dict]) -> dict:
+    """Hard final gate: every Discord page must be approved by Grok first."""
+    # Deterministic rejects first so daily Trump/politics color never pages
+    # and does not burn a model call.
+    survivors = []
+    rejected_reasons = []
+    for a in batch:
+        reason = _looks_like_hard_non_urgent(a)
+        if reason:
+            rejected_reasons.append(reason)
+            continue
+        survivors.append(a)
+    if not survivors:
+        why = rejected_reasons[0] if rejected_reasons else "hard non-urgent filter"
+        return {"urgent": False, "reason": why, "keep": [], "headline": ""}
+
+    prompt = GROK_URGENCY_GATE_PROMPT.format(articles_text=_gate_articles_text(survivors))
+    raw = claude_call(prompt, model=SONNET_MODEL, timeout=45)
+    return _parse_grok_urgency_gate(raw, survivors)
+
+
+def _format_gated_breaking_message(keep: list[dict], headline: str, reason: str, now_utc: str) -> str:
+    """Deterministic BN body for Grok-approved pages only."""
+    lead = (headline or (keep[0].get("title") if keep else "") or "URGENT MARKET EVENT").strip().upper()
+    held = _held_book_phrase()
+    tickers = sorted({t for a in keep for t in _book_tickers(a)})
+    ticker_line = "/".join(tickers) if tickers else "MARKET"
+    source = (keep[0].get("source") if keep else "unknown") or "unknown"
+    link = ((keep[0].get("link") or keep[0].get("url")) if keep else "") or ""
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🚨 BREAKING  ◈  WIRE  ◈  {now_utc} UTC",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        lead,
+        "",
+        f"TICKERS:   {ticker_line}",
+        f"IMPACT:    WATCH — {reason or 'Grok-confirmed urgent catalyst'}",
+        f"CONTEXT:   Grok urgency gate approved this page after local filters.",
+        f"PORTFOLIO: book={held}",
+        f"SOURCE:    {source}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if link:
+        lines.append(link)
+    # Include secondary approved item titles if present.
+    if len(keep) > 1:
+        lines.append("")
+        lines.append(f"ALSO: {(keep[1].get('title') or '')[:160]}")
+        l2 = (keep[1].get('link') or keep[1].get('url') or '').strip()
+        if l2:
+            lines.append(l2)
+    return "\n".join(lines).strip()[:1850]
+
+
+
+def _breaking_ping_prefix() -> str:
+    """Discord user mentions for urgent BREAKING channel alerts.
+
+    Catalyst-cycle urgent events already ping Jonathan + Sao. Standalone
+    BREAKING alerts historically did not, so high-urgency wires could land in
+    #claw without paging anyone. Controlled by BREAKING_PING_ENABLED and the
+    same JONATHAN/SAO Discord user id env vars as the catalyst monitor.
+    """
+    if not BREAKING_PING_ENABLED:
+        return ""
+    pings = []
+    if JONATHAN_DISCORD_USER_ID:
+        pings.append(f"<@{JONATHAN_DISCORD_USER_ID}>")
+    if SAO_DISCORD_USER_ID:
+        pings.append(f"<@{SAO_DISCORD_USER_ID}>")
+    return (" ".join(pings) + "\n") if pings else ""
+
+
+def _is_llm_vetted_urgent(art: dict) -> bool:
+    """True only when an LLM (not the local model alone) labeled the row urgent.
+
+    Model-only rows (`score_source=ml`, ai_score~0) demonstrably over-score
+    recap/SEO/GDELT/quote noise. The full BN formatter can hedge those; the
+    deterministic fallback cannot. Never page on model-only when LLM is down.
+    """
+    try:
+        ai = float(art.get("ai_score") or 0.0)
+    except (TypeError, ValueError):
+        ai = 0.0
+    src = (art.get("score_source") or "").strip().lower()
+    return ai >= 8.0 or src == "llm"
+
+
+def _filter_fallback_pageable(batch: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Strict pageable subset for LLM-outage fallback.
+
+    Keep only rows that are:
+      1) LLM-vetted urgent (not model-only),
+      2) English (non-English PR/GDELT copies are noise),
+      3) book-touching (held/watchlist ticker in title/summary).
+
+    Everything else is returned as ``dropped`` so the caller can mark it
+    alerted without Discord — drain the queue, do not page.
+    """
+    try:
+        from watchers.non_english_filter import looks_non_english
+    except Exception:
+        def looks_non_english(_art: dict) -> bool:  # type: ignore
+            return False
+
+    pageable: list[dict] = []
+    dropped: list[dict] = []
+    for a in batch:
+        if not _is_llm_vetted_urgent(a):
+            dropped.append(a)
+            continue
+        if looks_non_english(a):
+            dropped.append(a)
+            continue
+        if not _book_tickers(a):
+            dropped.append(a)
+            continue
+        pageable.append(a)
+    return pageable, dropped
+
+
+def _fallback_breaking_message(batch: list[dict], now_utc: str) -> str:
+    """Deterministic BREAKING alert when the LLM formatter is unavailable.
+
+    Only used after ``_filter_fallback_pageable`` — so this is a short,
+    book-touching, LLM-vetted dump, not a raw 5-story model-score spam page.
+    """
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🚨 BREAKING  ◈  WIRE  ◈  {now_utc} UTC",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "LLM FORMATTER UNAVAILABLE — BOOK-RELEVANT FALLBACK",
+        "",
+    ]
+    # Cap hard: fallback is a page, not a digest.
+    for i, a in enumerate(batch[:2], 1):
+        title = (a.get("title") or "(untitled)").strip()
+        source = (a.get("source") or "unknown").strip()
+        link = (a.get("link") or a.get("url") or "").strip()
+        score = a.get("ai_score") or a.get("ml_score") or "?"
+        book_hits = _book_tickers(a)
+        book = f" | book: {', '.join(book_hits)}" if book_hits else ""
+        lines.append(f"{i}. {title}")
+        lines.append(f"   source={source} score={score}{book}")
+        if link:
+            lines.append(f"   {link}")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    body = "\n".join(lines).strip()
+    # Leave room for the ping prefix and Discord's 2000-char limit.
+    return body[:1850]
+
+
+def _alert_impact_side(message: str) -> str:
+    """Parse IMPACT side from a composed BN alert body.
+
+    Returns BUY / SELL / WATCH when present, else "".
+    """
+    text = message or ""
+    m = re.search(r"(?im)^\s*IMPACT:\s*(BUY|SELL|WATCH)\b", text)
+    if m:
+        return m.group(1).upper()
+    # Fallback for compacted / fence-stripped bodies.
+    m = re.search(r"(?i)\bIMPACT:\s*(BUY|SELL|WATCH)\b", text)
+    return m.group(1).upper() if m else ""
+
+
+# Levered / wrapper symbols → cash underlyings for open-book paging.
+# Sector watchlist alone is intentionally NOT enough to page on WATCH colour
+# (PLD can sit on XLRE watch without being a desk-page event).
+_OPEN_BOOK_UNDERLYING_MAP = {
+    "MUU": "MU",
+    "ADBG": "ADBE",
+    "LNOK": "NOK",
+    "DRAM": "MU",
+    "SNDU": "MU",
+}
+
+
+def _open_book_tickers() -> set[str]:
+    """Tickers that justify paging a WATCH alert: open qty only.
+
+    Sources ``config/portfolio.json`` positions/options with non-zero qty,
+    plus known levered-wrapper underlyings. Falls back to a small hard set if
+    the file is missing so paging still works for core names.
+    """
+    open_syms: set[str] = set()
+    path = Path(__file__).resolve().parent.parent / "config" / "portfolio.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            pf = json.load(f)
+        for pos in pf.get("positions", []) or []:
+            try:
+                qty = float((pos or {}).get("qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty == 0:
+                continue
+            sym = str((pos or {}).get("ticker") or "").strip().upper()
+            if sym:
+                open_syms.add(sym)
+                und = _OPEN_BOOK_UNDERLYING_MAP.get(sym)
+                if und:
+                    open_syms.add(und)
+        for opt in pf.get("options", []) or []:
+            try:
+                qty = float((opt or {}).get("qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty == 0:
+                continue
+            und = str((opt or {}).get("underlying") or "").strip().upper()
+            if und:
+                open_syms.add(und)
+            sym = str((opt or {}).get("symbol") or "").strip().upper()
+            # "NOK CALL" → also keep NOK if underlying missing
+            if not und and sym:
+                tok = sym.split()[0]
+                if tok:
+                    open_syms.add(tok)
+    except Exception:
+        # Degrade to current open-ish core names rather than paging on the
+        # entire sector watchlist.
+        open_syms = {"MUU", "MU", "ADBG", "ADBE", "NOK"}
+    return open_syms
+
+
+def _batch_has_open_book_hit(batch: list | None) -> bool:
+    """True when any approved article mentions an open held name."""
+    open_syms = _open_book_tickers()
+    if not open_syms:
+        return False
+    for art in batch or []:
+        try:
+            hits = set(_book_tickers(art if isinstance(art, dict) else {}))
+        except Exception:
+            continue
+        if hits & open_syms:
+            return True
+        # Also scan raw text for open symbols not in LIVE_PORTFOLIO_TICKERS
+        # (should be rare; LIVE set already unions portfolio.json).
+        blob = f"{(art or {}).get('title') or ''} {(art or {}).get('summary') or ''}".upper()
+        for sym in open_syms:
+            if re.search(rf"\b{re.escape(sym)}\b", blob):
+                return True
+    return False
+
+
+def _should_page_breaking(message: str, batch: list | None = None) -> bool:
+    """Decide whether a BREAKING channel post should @-page + Sao-DM.
+
+    Channel still gets the alert either way. Pings are reserved for:
+      1) open held names (position/option qty > 0, plus levered underlyings), or
+      2) actionable IMPACT sides (BUY / SELL).
+
+    Sector-watchlist-only WATCH colour (e.g. PLD/Segro M&A while PLD is only
+    on the REIT watchlist) posts quietly — no Discord mention storm, no Sao
+    DM, no alert-priority TTS. News-desk "breaking" ≠ "page the desk."
+    """
+    if not BREAKING_PING_ENABLED:
+        return False
+    if _batch_has_open_book_hit(batch):
+        return True
+    side = _alert_impact_side(message)
+    return side in {"BUY", "SELL"}
+
+
+def _with_breaking_ping(message: str, *, page: bool | None = None,
+                        batch: list | None = None) -> str:
+    msg = (message or "").strip()
+    if not msg:
+        return msg
+    if page is None:
+        page = _should_page_breaking(msg, batch)
+    if not page:
+        return msg
+    prefix = _breaking_ping_prefix()
+    if not prefix:
+        return msg
+    # Avoid double-prefix if the LLM already mentioned the same user ids.
+    if JONATHAN_DISCORD_USER_ID and f"<@{JONATHAN_DISCORD_USER_ID}>" in msg:
+        return msg
+    return f"{prefix}{msg}"
+
 
 def _openclaw_cli_path() -> str | None:
     if OPENCLAW_CLI:
@@ -85,6 +510,9 @@ def _openclaw_cli_path() -> str | None:
     found = shutil.which("openclaw")
     if found:
         return found
+    mac_fallback = "/usr/local/bin/openclaw"
+    if os.path.exists(mac_fallback):
+        return mac_fallback
     fallback = "/home/zeph/.nvm/versions/node/v24.15.0/bin/openclaw"
     return fallback if os.path.exists(fallback) else None
 
@@ -100,6 +528,13 @@ def _send_sao_breaking_dm(message: str) -> bool:
         _log.warning("[alert] Sao DM skipped: openclaw CLI not found")
         return False
 
+    env = os.environ.copy()
+    env["PATH"] = (
+        "/usr/local/bin:/opt/homebrew/bin:"
+        f"{os.path.expanduser('~')}/.local/bin:"
+        f"{os.path.expanduser('~')}/.npm-global/bin:"
+        + env.get("PATH", "")
+    )
     try:
         proc = subprocess.run(
             [
@@ -115,8 +550,10 @@ def _send_sao_breaking_dm(message: str) -> bool:
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            # Match discord_notifier OpenClaw timeout: CLI plugin load is slow.
+            timeout=90,
             check=False,
+            env=env,
         )
     except Exception:
         _log.exception("[alert] Sao DM delivery failed")
@@ -176,6 +613,14 @@ BURST_MIN_PRIOR_ALERTS = 3
 # this gate removes from the analyst's push channel.
 ALERT_MIN_LONE_SOURCE_CRED = 0.45
 
+# Earnings prints must page near release, not hours later. A 24h general
+# staleness gate is correct for most wires, but an "BREAKING" EARNINGS
+# push that says "Reported ~1.6h ago" is already late for a trader. Keep the
+# earnings page window tight so only fresh prints reach Discord as BREAKING;
+# older earnings recaps still exist in articles.db for briefings, they just
+# must not @-page as a fresh release.
+ALERT_EARNINGS_MAX_AGE_HOURS = 0.5  # 30 minutes
+
 
 def _filter_low_authority_lone(
     deduped: list[dict],
@@ -213,33 +658,62 @@ def _filter_low_authority_lone(
 
 
 def _article_age_ok(art: dict) -> bool:
-    """Return True if the article is less than 24 hours old."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    for field in ("published", "first_seen"):
-        raw = (art.get(field) or "").strip()
-        if not raw:
-            continue
-        try:
-            # Try RFC 2822 (RSS/Atom)
-            dt = parsedate_to_datetime(raw)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt >= cutoff
-        except Exception:
-            pass
-        try:
-            # Try ISO 8601
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt >= cutoff
-        except Exception:
-            pass
-    # No parseable date in either field — block rather than risk stale alert.
-    # Articles without any date were already pre-filtered by first_seen >= 24h
-    # in get_unalerted_urgent, so reaching here means both fields are corrupt.
-    _log.warning("[alert] article has no parseable date — dropping to be safe")
-    return False
+    """Return True if the article is fresh enough to page as BREAKING.
+
+    Default: < 24h (general wire freshness).
+    Earnings prints: < ``ALERT_EARNINGS_MAX_AGE_HOURS`` (on-release only).
+    A multi-hour-old earnings recap must never fire as BREAKING — the
+    trader wanted the print at release, not a late "Reported ~Nh ago" ping.
+    """
+    hours = _article_age_hours(art)
+    if hours is None:
+        # No parseable date in either field — block rather than risk stale alert.
+        # Articles without any date were already pre-filtered by first_seen >= 24h
+        # in get_unalerted_urgent, so reaching here means both fields are corrupt.
+        _log.warning("[alert] article has no parseable date — dropping to be safe")
+        return False
+    max_h = (
+        ALERT_EARNINGS_MAX_AGE_HOURS
+        if _is_earnings_article(art)
+        else 24.0
+    )
+    return hours <= max_h
+
+
+_EARNINGS_TITLE_RE = re.compile(
+    r"\b("
+    r"earnings|eps\b|revenue\s+(beat|miss|results?)|"
+    r"quarterly\s+results|q[1-4]\s*(?:fy)?\s*\d{2,4}|"
+    r"fiscal\s+(?:q[1-4]|year)|results\s+(?:beat|miss|topped|top)|"
+    r"beats?\s+(?:estimates?|expectations?|consensus)|"
+    r"misses?\s+(?:estimates?|expectations?|consensus)|"
+    r"guidance\s+(?:raise[ds]?|cut|lowered|raised|boosted)|"
+    r"reports?\s+(?:q[1-4]|quarterly|earnings)|"
+    r"posted\s+(?:q[1-4]|quarterly)|"
+    r"earnings\s+(?:call|release|print|report)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_earnings_article(art: dict) -> bool:
+    """True when the row is an earnings print / results wire.
+
+    Used only for the tighter on-release freshness gate. Prefer explicit
+    category/tags when present; otherwise title+summary keyword match.
+    Pure read-side — never mutates the article.
+    """
+    cat = str(art.get("category") or art.get("event_type") or "").strip().upper()
+    if "EARNINGS" in cat:
+        return True
+    tags = art.get("tags") or art.get("labels") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    for t in tags:
+        if "EARNINGS" in str(t or "").upper():
+            return True
+    blob = f"{art.get('title') or ''} {art.get('summary') or ''}"
+    return bool(_EARNINGS_TITLE_RE.search(blob))
 
 
 def _article_age_hours(art: dict) -> float | None:
@@ -1888,10 +2362,15 @@ def _is_synthetic(art: dict) -> bool:
 
 
 def send_urgent_alert(urgent_articles: list, store) -> bool:
+    # Emergency kill switch. Default is enabled; set URGENT_ALERTS_FORCE_OFF=1
+    # to hard-stop paging without removing the alert worker.
+    if os.environ.get("URGENT_ALERTS_FORCE_OFF", "0").strip().lower() not in {"0", "false", "no", "off", ""}:
+        _log.warning("[alert] URGENT_ALERTS_FORCE_OFF active — refusing to page")
+        return False
     if not urgent_articles:
         return False
-    if not DISCORD_WEBHOOK:
-        _log.warning("[alert] No DISCORD_WEBHOOK_URL — skipping")
+    if not DISCORD_WEBHOOK and not _openclaw_cli_path():
+        _log.warning("[alert] No DISCORD_WEBHOOK_URL and no OpenClaw CLI — skipping")
         return False
 
     # Defense-in-depth: synthetic backtest/opus-annotation rows must never
@@ -2001,7 +2480,8 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             for a in stale[:5]
         )
         _log.info(
-            f"[alert] dropped {len(stale)} stale article(s) (>24h old) — {srcs}"
+            f"[alert] dropped {len(stale)} stale article(s) "
+            f"(>24h general / >{ALERT_EARNINGS_MAX_AGE_HOURS:g}h earnings) — {srcs}"
         )
     if not fresh:
         _log.info("[alert] all urgent articles are stale — skipping alert")
@@ -2310,11 +2790,28 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         # [BOOK:] tag (cross-product parity). Read-only — see _book_tickers.
         book = _book_tickers(a)
         if book:
-            block += (
-                f"\nbook: {','.join(book)} — analyst HOLDS/watches these; "
-                f"the PORTFOLIO line MUST give a concrete directional "
-                f"implication for them"
-            )
+            try:
+                open_syms = set(_open_book_tickers())
+            except Exception:
+                open_syms = set()
+            open_hits = [t for t in book if t in open_syms]
+            watch_hits = [t for t in book if t not in open_syms]
+            block += f"\nbook: {','.join(book)}"
+            if open_hits:
+                block += (
+                    f"\nbook_open: {','.join(open_hits)} — OPEN held risk; "
+                    f"PORTFOLIO MUST give a concrete directional implication"
+                )
+            if watch_hits:
+                block += (
+                    f"\nbook_watch: {','.join(watch_hits)} — watchlist only; "
+                    f"do NOT claim these are held positions"
+                )
+            if open_hits and not watch_hits:
+                block += (
+                    " — analyst HOLDS these; the PORTFOLIO line MUST give a "
+                    "concrete directional implication for them"
+                )
             # Per-held-ticker mention velocity hint. Multiple recent
             # mentions = a wire concentrating on that name (momentum / event
             # cluster), so the IMPACT magnitude should reflect that. Single
@@ -2407,20 +2904,85 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     )
 
     try:
-        message = claude_call(prompt, model=SONNET_MODEL, timeout=60)
+        # HARD RULE: every page must pass a Grok urgency gate first.
+        # No deterministic fallback paging. If Grok is down or says no, drain
+        # and do not ping.
+        gate = _grok_urgency_gate(batch)
+        if not gate.get("urgent"):
+            try:
+                store.mark_alerted_batch(alerted_ids(batch))
+            except Exception:
+                _log.exception("[alert] failed to drain Grok-rejected batch")
+            _log.info(
+                "[alert] Grok gate rejected page — drained %d row(s) (%s)",
+                len(batch),
+                gate.get("reason") or "not urgent",
+            )
+            return True
+
+        keep = gate.get("keep") or []
+        if not keep:
+            try:
+                store.mark_alerted_batch(alerted_ids(batch))
+            except Exception:
+                _log.exception("[alert] failed to drain empty keep set")
+            return True
+
+        # Drop non-approved siblings from the queue so they cannot re-spam.
+        rejected = [a for a in batch if a not in keep]
+        if rejected:
+            try:
+                store.mark_alerted_batch(alerted_ids(rejected))
+            except Exception:
+                _log.exception("[alert] failed to drain Grok-rejected siblings")
+
+        # Prefer Grok BN formatter on the approved subset; if formatter fails,
+        # still page using the gate headline/reason (already Grok-approved).
+        keep_text = "\n\n".join(
+            t for a, t in ((a, _fmt(a)) for a in keep) if t is not None
+        )
+        message = None
+        if keep_text:
+            fmt_prompt = ALERT_PROMPT.format(
+                articles_text=keep_text,
+                now_utc=now_utc,
+                held_book=_held_book_phrase(),
+            )
+            message = claude_call(fmt_prompt, model=SONNET_MODEL, timeout=60)
         if not message:
-            _log.warning("[alert] No response from Claude — skipping")
+            message = _format_gated_breaking_message(
+                keep,
+                headline=gate.get("headline") or "",
+                reason=gate.get("reason") or "",
+                now_utc=now_utc,
+            )
+        batch = keep
+        if not message:
+            _log.warning("[alert] Grok-approved but empty message body — skipping send")
             return False
 
+        page = _should_page_breaking(message, batch)
+        message = _with_breaking_ping(message, page=page, batch=batch)
+        if not page:
+            _log.info(
+                "[alert] quiet BREAKING (no page): off-book non-actionable "
+                f"impact={_alert_impact_side(message) or 'n/a'}"
+            )
+
         # post via discord_notifier which also fires TTS
+        # is_alert=True only when paging — quiet WATCH colour should not
+        # trigger alert-priority TTS on the laptop.
         from notifier.discord_notifier import send as discord_send
-        ok = discord_send(message, is_alert=True)
+        ok = discord_send(message, is_alert=page)
 
         if ok:
-            try:
-                _send_sao_breaking_dm(message)
-            except Exception:
-                _log.exception("[alert] Sao DM fanout failed")
+            if page:
+                try:
+                    _send_sao_breaking_dm(message)
+                except Exception:
+                    _log.exception("[alert] Sao DM fanout failed")
+            else:
+                _log.info("[alert] Sao DM skipped: quiet non-page BREAKING")
             # Bulk-mark in one transaction; previous code took the write lock
             # N times (5 round-trips for the default batch size). alerted_ids
             # includes the syndicated copies merged into the batch, so they
@@ -2443,6 +3005,7 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
                 notes.append(f"{collapsed} syndicated dupes folded in")
             if tail > 0:
                 notes.append(f"{tail} more queued")
+            notes.append("grok-gated")
             note = f" ({'; '.join(notes)})" if notes else ""
             _log.info(f"[alert] BN alert sent ({len(batch)} distinct stories){note}")
         else:

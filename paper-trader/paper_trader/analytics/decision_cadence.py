@@ -3,7 +3,7 @@ RIGHT NOW, and when is the bot's next decision cycle expected?
 
 The runner's sleep cadence is computed dynamically by
 ``analytics.dynamic_interval.compute_interval``: six tiers from
-``SESSION_OPEN`` (180s) at the top through ``QUIET_CLOSED`` (5400s) at
+``SESSION_OPEN`` (300s) at the top through ``QUIET_CLOSED`` (5400s) at
 the bottom, picked from the held book + earnings calendar + NY clock. The
 tier is logged to stdout but is NOT structurally exposed anywhere — a
 trader watching the dashboard sees ``/api/state`` (cash + positions) and
@@ -13,8 +13,8 @@ gap by surfacing:
 
   * ``tier``       — the dynamic-interval tier name the runner would pick
                      for the NEXT cycle if asked NOW
-                     (EARNINGS_WINDOW / SESSION_OPEN / EARNINGS_DAY /
-                     MARKET_OPEN / MARKET_CLOSED / QUIET_CLOSED)
+                     (SESSION_OPEN / EARNINGS_DAY / MARKET_OPEN /
+                     EXTENDED_HOURS / MARKET_CLOSED / QUIET_CLOSED)
   * ``sleep_s``    — the cadence (seconds) that tier maps to
   * ``last_decision_ts``      — most recent decisions row's ISO timestamp
                                 (any verb — NO_DECISION counts here; this
@@ -106,14 +106,15 @@ def _compute_tier(now_et, positions, events) -> tuple[str, int]:
             now_et=now_et,
         )
         market_open = _di._is_market_hours(now_et)
-        if market_open and _di._is_session_open_window(now_et):
+        tradable_open = _di._is_tradable_window(now_et)
+        if tradable_open and market_open and _di._is_session_open_window(now_et):
             return "SESSION_OPEN", _di._SESSION_OPEN_S
         if market_open and held_earnings_today:
             return "EARNINGS_DAY", _di._EARNINGS_DAY_S
         if market_open:
             return "MARKET_OPEN", _di._MARKET_OPEN_S
-        if held_earnings_today and _di._is_earnings_window(now_et):
-            return "EARNINGS_WINDOW", _di._EARNINGS_WINDOW_S
+        if tradable_open:
+            return "EXTENDED_HOURS", _di._EXTENDED_HOURS_S
         if not positions:
             return "QUIET_CLOSED", _di._QUIET_CLOSED_S
         return "MARKET_CLOSED", _di._MARKET_CLOSED_S
@@ -121,6 +122,8 @@ def _compute_tier(now_et, positions, events) -> tuple[str, int]:
         try:
             if _di._is_market_hours(now_et):
                 return "MARKET_OPEN", _di._MARKET_OPEN_S
+            if _di._is_tradable_window(now_et):
+                return "EXTENDED_HOURS", _di._EXTENDED_HOURS_S
         except Exception:
             pass
         return "MARKET_CLOSED", _di._MARKET_CLOSED_S

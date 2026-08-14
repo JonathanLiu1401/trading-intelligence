@@ -4889,10 +4889,10 @@ class TestTodaySessionAnchorIso:
 
 class TestTodaySessionLine:
     """`_today_session_line` — single line "what has TODAY's session done so
-    far" anchored to 09:30 ET. Reuses ``_window_delta`` for direction so the
-    hourly's 1h SESSION block and this surface can never disagree on
-    direction. Suppressed when non-trading-day, pre-open, or no equity
-    point at-or-after today's open."""
+    far" anchored to the first usable post-open tick. It uses the existing
+    deposit-adjusted P/L annotations for direction so intraday cash flows do
+    not masquerade as trading P/L. Suppressed when non-trading-day, pre-open,
+    or no equity point at-or-after today's open."""
 
     def _utc_from_ny(self, year, month, day, hour, minute):
         return datetime(year, month, day, hour, minute,
@@ -4956,6 +4956,70 @@ class TestTodaySessionLine:
         assert "$+20.00 (+2.00%)" in line
         assert "alpha `+1.00%`" in line
 
+    def test_code_block_line_uses_same_today_pl(self, fresh_store,
+                                                monkeypatch):
+        now = self._utc_from_ny(2026, 5, 14, 13, 0)
+        curve = [
+            {"timestamp": "2026-05-14T13:30:00+00:00",
+             "total_value": 1000.0, "sp500_price": 5000.0},
+            {"timestamp": "2026-05-14T17:00:00+00:00",
+             "total_value": 1020.0, "sp500_price": 5050.0},
+        ]
+        monkeypatch.setattr(fresh_store, "equity_curve",
+                             lambda limit=5000: curve)
+        assert reporter._today_session_pnl_code_line(
+            fresh_store, now=now,
+        ) == "Today P/L   $+20.00 (+2.00%)\n"
+
+    def test_today_pl_percent_uses_capital_basis_after_deposit(
+        self, fresh_store, monkeypatch
+    ):
+        """Regression for 2026-06-15: the report showed $+26.44 as +2.18%
+        because it divided the raw session dollars by a deposit-adjusted
+        synthetic equity denominator (~$1.2k) instead of capital basis
+        ($10k)."""
+        now = self._utc_from_ny(2026, 6, 15, 15, 45)
+        curve = [
+            {"timestamp": "2026-06-15T13:26:14.407305+00:00",
+             "total_value": 1211.2027816772, "cash": 1000.0,
+             "sp500_price": 7431.4599609375},
+            {"timestamp": "2026-06-15T14:26:50.832845+00:00",
+             "total_value": 10211.2027816772, "cash": 10000.0,
+             "sp500_price": 7543.60009765625},
+            {"timestamp": "2026-06-15T22:45:54.460642+00:00",
+             "total_value": 10237.6368942261, "cash": 10000.0,
+             "sp500_price": 7554.2900390625},
+        ]
+        monkeypatch.setattr(fresh_store, "equity_curve",
+                            lambda limit=5000: curve)
+
+        line = reporter._today_session_line(fresh_store, now=now)
+        assert "**TODAY** ◈ since first post-open tick 10:26 ET" in line
+        assert "$+26.44 (+0.26%)" in line
+        assert "+2.18%" not in line
+        assert reporter._today_session_pnl_code_line(
+            fresh_store, now=now,
+        ) == "Today P/L   $+26.44 (+0.26%)\n"
+
+    def test_intraday_cash_flow_does_not_count_as_today_pl(
+        self, fresh_store, monkeypatch
+    ):
+        now = self._utc_from_ny(2026, 5, 14, 13, 0)
+        curve = [
+            {"timestamp": "2026-05-14T13:30:00+00:00",
+             "total_value": 1000.0, "cash": 1000.0, "sp500_price": 5000.0},
+            {"timestamp": "2026-05-14T15:00:00+00:00",
+             "total_value": 10000.0, "cash": 10000.0, "sp500_price": 5010.0},
+            {"timestamp": "2026-05-14T17:00:00+00:00",
+             "total_value": 10020.0, "cash": 10000.0, "sp500_price": 5050.0},
+        ]
+        monkeypatch.setattr(fresh_store, "equity_curve",
+                            lambda limit=5000: curve)
+
+        line = reporter._today_session_line(fresh_store, now=now)
+        assert "$+20.00 (+0.20%)" in line
+        assert "$+9020.00" not in line
+
     def test_negative_intraday_motion(self, fresh_store, monkeypatch):
         # Losing session: -$30 on a $1000 baseline, no SPY data (alpha
         # clause must NOT render when only port_pct is available).
@@ -5015,6 +5079,7 @@ class TestTodaySessionLine:
         assert reporter.send_hourly_summary() is True
         body = captured[0]
         assert "**TODAY** ◈ since 09:30 ET NYSE open" in body
+        assert "Today P/L   $+15.00 (+1.50%)" in body
         # 1015/1000-1 = +1.5%, 5050/5000-1 = +1%, alpha = +0.5%
         assert "$+15.00 (+1.50%)" in body
         assert "alpha `+0.50%`" in body

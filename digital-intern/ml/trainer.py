@@ -138,10 +138,21 @@ _TRAIN_LOCK = threading.Lock()
 RETRAIN_INTERVAL = 180      # retrain at most once every 3 minutes
 MIN_NEW_LABELS   = 50       # retrain if this many new LLM labels since last train
 
-# Training hyperparameters — aggressive GPU usage
-# 100 epochs per cycle for the deep multi-task net (RTX 3060 trains in <5s).
-EPOCHS_PER_CYCLE = 100
-BATCH_SIZE       = 256
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+# Training hyperparameters. The original 100-epoch default was tuned for an
+# RTX 3060 path, but the Mac launchd service is CPU-only; make the cadence
+# environment-driven so the daemon can finish a bounded retrain instead of
+# timing out every cycle.
+EPOCHS_PER_CYCLE = _env_int("ML_TRAIN_EPOCHS_PER_CYCLE", 6)
+BATCH_SIZE       = _env_int("ML_TRAIN_BATCH_SIZE", 256)
 
 # Sample-weighting for label magnitude. Higher relevance scores train harder so
 # strong-signal articles (9-10 / "200% profit") dominate gradient updates over
@@ -582,7 +593,7 @@ def _run_training_child(db_path: str, force: bool, result_queue) -> None:
 import ml.embedder as _ml_embedder_mod  # noqa: E402
 import ml.model as _ml_model_mod        # noqa: E402
 
-_TRAIN_TIMEOUT_S = 600
+_TRAIN_TIMEOUT_S = _env_int("ML_TRAIN_TIMEOUT_S", 900, minimum=60)
 
 
 def _collaborators_stubbed() -> bool:

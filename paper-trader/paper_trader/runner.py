@@ -783,6 +783,11 @@ def _start_dashboard():
         print(f"[runner] dashboard disabled: {e}")
 
 
+def _normalize_breaker_model(model: str) -> str:
+    name = str(model or "").strip()
+    return name.split("/", 1)[1] if name.startswith("xai/") else name
+
+
 def _stale_llm_patterns() -> list[str]:
     """Full-cmdline patterns for direct child LLM subprocesses."""
     from . import strategy
@@ -796,11 +801,16 @@ def _stale_llm_patterns() -> list[str]:
     for model in models:
         if not model:
             continue
-        pattern = (
-            f"codex exec --model {model}"
-            if str(model).startswith("gpt-")
-            else f"claude --model {model}"
-        )
+        model_s = str(model)
+        if model_s.startswith("gpt-"):
+            pattern = f"codex exec --model {model_s}"
+        elif model_s.startswith("grok-") or model_s.startswith("xai/"):
+            # Grok uses direct HTTP, not a child CLI process. Keep a unique
+            # marker so pattern generation stays model-aware without matching
+            # unrelated host processes.
+            pattern = f"xai-http --model {_normalize_breaker_model(model_s)}"
+        else:
+            pattern = f"claude --model {model_s}"
         if pattern not in patterns:
             patterns.append(pattern)
     return patterns
@@ -1316,7 +1326,7 @@ def main():
                 pass
             os._exit(0)
 
-        market_open = market.is_market_open()
+        market_open = market.is_tradable_window_open()
         current_positions = _open_position_tickers_for_interval(store)
         sleep_s = compute_interval(current_positions)
         print(f"[runner] sleeping {sleep_s}s (market_open={market_open})")
