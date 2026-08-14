@@ -13,7 +13,7 @@ Each cycle:
      across ALL runs (winners and losers — losing decisions are critical
      signal for the scorer too) and appends them to
      data/decision_outcomes.jsonl, then retrains DecisionScorer.
-  5. Spawns a background Opus 4.7 annotator to label the top run's
+  5. Spawns a background Grok 4.6 annotator to label the top run's
      decisions GOOD/NEUTRAL/BAD and write a trading lesson — fed back into
      ArticleNet training.
   6. Trims backtest_runs to the most recent KEEP_LAST_RUNS (500) entries.
@@ -4808,7 +4808,8 @@ def _llm_annotate_outcomes(
     Returns outcome_records with llm_quality_label filled in.
     """
     try:
-        import anthropic
+        from paper_trader.llm_adapter import call_llm
+        from paper_trader.strategy import MODEL as _GROK_MODEL
     except ImportError:
         return outcome_records
 
@@ -4851,14 +4852,12 @@ TICKER ACTION: ENDORSE or CONDEMN [one sentence reason based on whether this tra
 Be concise. Only output the labeled lines, no intro text."""
 
     try:
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        annotation_text = resp.content[0].text.strip()
-        print(f"[continuous] LLM annotation cycle {cycle}:\n{annotation_text}")
+        # Stack policy: all annotation LLM traffic goes through Grok/xAI.
+        annotation_text = (call_llm(_GROK_MODEL, prompt, timeout=90) or "").strip()
+        if not annotation_text:
+            print(f"[continuous] LLM annotation cycle {cycle}: empty Grok response")
+            return outcome_records
+        print(f"[continuous] LLM annotation cycle {cycle} model={_GROK_MODEL}:\n{annotation_text}")
 
         # The LLM only reviewed trades from the best and worst runs (see the
         # prompt above). Restrict label application to those two run_ids —
@@ -5220,7 +5219,7 @@ def main() -> None:
             except Exception as e:
                 print(f"[continuous] scorer train failed: {e}")
 
-            # Opus 4.7 annotation in background thread — don't block next cycle
+            # Grok 4.6 annotation in background thread — don't block next cycle
             import threading as _threading
             _threading.Thread(
                 target=_opus_annotate, args=(engine, top_runs, cycle, outcome_records),

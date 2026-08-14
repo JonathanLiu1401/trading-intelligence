@@ -3470,8 +3470,7 @@ TEMPLATE = r"""
           <label style="color:var(--text-secondary);font-size:13px;">Run backtest with model:
             <select id="run-model-select" style="margin-left:8px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:3px;">
               <option value="ml_quant">ML+Quant (deterministic)</option>
-              <option value="claude-opus-4-7">Claude Opus 4.7</option>
-              <option value="claude-opus-4-8" selected>Claude Opus 4.8</option>
+              <option value="grok-4.6" selected>Grok 4.6</option>
               <option value="hf/deepseek-ai/DeepSeek-R1">DeepSeek R1</option>
               <option value="hf/meta-llama/Llama-3.3-70B-Instruct">Llama 3.3 70B</option>
               <option value="hf/Qwen/Qwen3-32B">Qwen3 32B</option>

@@ -2,7 +2,7 @@
 
 Each run starts with $1000, samples every 5th NYSE trading day,
 fetches historical news from GDELT, scores with a keyword heuristic,
-and asks Opus 4.7 for trading decisions. Stocks-only (no options —
+and asks Grok 4.6 (or the deterministic ml_quant path) for trading decisions. Stocks-only (no options —
 yfinance has no historical option prices). Stop-loss / take-profit
 are checked daily between sampled decisions using cached closes.
 """
@@ -2989,7 +2989,7 @@ def _parse_yf_news_item(item: dict) -> tuple[str, str, float | None]:
 
 
 class BacktestEngine:
-    _VALID_MODEL_PREFIXES = ("ml_quant", "claude-", "gpt-", "hf/")
+    _VALID_MODEL_PREFIXES = ("ml_quant", "grok-", "xai/", "cursor-", "hf/", "claude-", "gpt-")
     # Class-level default so callers that bypass __init__ via
     # `BacktestEngine.__new__(...)` (the canonical no-network test pattern in
     # tests/test_integration_backtest.py and tests/test_model_rankings.py)
@@ -3001,7 +3001,7 @@ class BacktestEngine:
         # Standalone runs (e.g. `python3 run_backtests.py`) get a sane default
         # equal to the pre-refactor hardcoded window so the one-shot launcher
         # keeps working without arg-plumbing changes. Continuous loop overrides.
-        if not (model_id == "ml_quant" or model_id.startswith(("claude-", "hf/"))):
+        if not (model_id == "ml_quant" or model_id.startswith(("grok-", "xai/", "cursor-", "hf/", "claude-"))):
             raise ValueError(
                 f"Invalid model_id {model_id!r}. Must start with one of "
                 f"{self._VALID_MODEL_PREFIXES}"
@@ -3454,7 +3454,7 @@ class BacktestEngine:
             signals = self._fetch_signals(sim_date, seed, rng, portfolio)
 
             # Intraday loop: up to MAX_DECISIONS_PER_DAY ml_decide calls per day
-            # for the ml_quant path. LLM paths (claude-*, hf/*) call once per
+            # for the ml_quant path. LLM paths (grok-*, hf/*) call once per
             # day — they are slow + expensive, and the prompt would have to be
             # regenerated with growing `exclude_tickers` each pass.
             # Each filled trade excludes that ticker from subsequent calls today.

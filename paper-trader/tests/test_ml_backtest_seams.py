@@ -18,8 +18,8 @@ symbol in tests/ during the 2026-05-16 review):
      onto identically-named trades in the three unreviewed middle runs,
      corrupting their training sample weights). Untested known-pitfall.
 
-All offline/deterministic. No network: the only external dependency
-(`anthropic`) is monkeypatched at the module attribute.
+All offline/deterministic. No network: the Grok/xAI adapter
+(`paper_trader.llm_adapter.call_llm`) is monkeypatched.
 """
 from __future__ import annotations
 
@@ -149,18 +149,11 @@ class TestDecisionScorerDummyFallback:
 
 # ─────────────────── _llm_annotate_outcomes run isolation ───────────────────
 
-def _fake_anthropic(text: str):
-    """Return a drop-in `anthropic.Anthropic` replacement whose
-    messages.create(...) yields a single message with `text`."""
-    class _Messages:
-        def create(self, **kw):
-            return SimpleNamespace(content=[SimpleNamespace(text=text)])
-
-    class _Client:
-        def __init__(self, *a, **k):
-            self.messages = _Messages()
-
-    return _Client
+def _fake_llm(text: str):
+    """Return a drop-in `llm_adapter.call_llm` replacement."""
+    def _call(model_id, prompt, timeout=None):
+        return text
+    return _call
 
 
 class TestLlmAnnotateRunIsolation:
@@ -172,8 +165,6 @@ class TestLlmAnnotateRunIsolation:
         return winner, loser
 
     def test_verdict_does_not_leak_to_unreviewed_middle_runs(self, monkeypatch):
-        import anthropic
-
         winner, loser = self._runs()
         # Three runs share the (NVDA, BUY) trade. Only runs 1 (winner) & 3
         # (loser) were summarised in the prompt; run 2 is an unreviewed
@@ -191,7 +182,7 @@ class TestLlmAnnotateRunIsolation:
         ]
         text = ("NVDA BUY: ENDORSE strong AI momentum\n"
                 "AMD SELL: CONDEMN poor exit timing")
-        monkeypatch.setattr(anthropic, "Anthropic", _fake_anthropic(text))
+        monkeypatch.setattr("paper_trader.llm_adapter.call_llm", _fake_llm(text))
 
         out = rcb._llm_annotate_outcomes(None, winner, loser, recs, cycle=7)
 
@@ -207,8 +198,6 @@ class TestLlmAnnotateRunIsolation:
         assert all("llm_quality_label" in r for r in out)
 
     def test_unparseable_response_leaves_all_labels_neutral(self, monkeypatch):
-        import anthropic
-
         winner, loser = self._runs()
         recs = [
             {"run_id": 1, "ticker": "NVDA", "action": "BUY",
@@ -218,8 +207,8 @@ class TestLlmAnnotateRunIsolation:
         ]
         # No line matches the TICKER ACTION: VERDICT grammar.
         monkeypatch.setattr(
-            anthropic, "Anthropic",
-            _fake_anthropic("I could not evaluate these trades confidently."),
+            "paper_trader.llm_adapter.call_llm",
+            _fake_llm("I could not evaluate these trades confidently."),
         )
         out = rcb._llm_annotate_outcomes(None, winner, loser, recs, cycle=1)
         assert [r["llm_quality_label"] for r in out] == [0, 0]
@@ -234,8 +223,6 @@ class TestLlmAnnotateRunIsolation:
         actual training-time row carries the real None forward.
         Annotations on the OTHER rows must still apply.
         """
-        import anthropic
-
         winner, loser = self._runs()
         recs = [
             # malformed: explicit None forward_return_5d (the live ledger
@@ -248,7 +235,7 @@ class TestLlmAnnotateRunIsolation:
              "ml_score": 1.0, "rsi": 70, "forward_return_5d": -2.0},
         ]
         text = "AMD SELL: CONDEMN poor exit timing"
-        monkeypatch.setattr(anthropic, "Anthropic", _fake_anthropic(text))
+        monkeypatch.setattr("paper_trader.llm_adapter.call_llm", _fake_llm(text))
         out = rcb._llm_annotate_outcomes(None, winner, loser, recs, cycle=1)
         # The malformed row gets neutral. The well-formed row STILL receives
         # its CONDEMN label — the whole batch is not silently dropped.

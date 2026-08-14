@@ -1,4 +1,4 @@
-"""Bloomberg Terminal-style briefing — Claude Opus 4.7 via CLI."""
+"""Bloomberg Terminal-style briefing — Grok 4.6 via xAI / claude_cli wrapper."""
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
