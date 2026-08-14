@@ -123,3 +123,36 @@ def test_daemon_registers_x_search_worker():
     assert "x_search_worker" in names
     assert "x_search" in src
     assert "collect_x_search" in src
+
+
+def test_collect_fans_out_per_account(monkeypatch):
+    calls = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            handle = calls[-1]
+            tid = "1111111111111111111" if handle == "business" else "2222222222222222222"
+            return json.dumps({
+                "output_text": json.dumps([{
+                    "handle": handle,
+                    "text": "ping",
+                    "url": f"https://x.com/{handle}/status/{tid}",
+                    "published": "",
+                    "tickers": [],
+                }])
+            }).encode()
+
+    def fake_urlopen(req, timeout=None, context=None):
+        body = json.loads(req.data.decode())
+        calls.append(body["tools"][0]["allowed_x_handles"][0])
+        return Resp()
+
+    monkeypatch.setattr("core.claude_cli._load_xai_access_token", lambda: "tok-not-a-secret")
+    monkeypatch.setattr(xs.urllib.request, "urlopen", fake_urlopen)
+    arts = xs.collect_x_search(accounts=["business", "Reuters"])
+    assert calls == ["business", "Reuters"]
+    assert {a["source"] for a in arts} == {"twitter_xsearch/@business", "twitter_xsearch/@Reuters"}

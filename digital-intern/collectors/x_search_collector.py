@@ -345,16 +345,29 @@ def _xai_responses(payload: dict) -> dict | None:
 
 
 def collect_x_search(*, accounts: list[str] | None = None) -> list[dict]:
-    """Pull recent tweets for configured accounts via xAI x_search."""
+    """Pull recent tweets for configured accounts via xAI x_search.
+
+    One account per request: a 6-handle bundle hung past 180s on this host,
+    while a single-handle call returned 200 in ~17s.
+    """
     handles = accounts if accounts is not None else load_twitter_accounts()
     print(f"[x_search] {len(handles)} accounts via xAI x_search model={MODEL}")
-    payload = build_x_search_payload(handles)
-    data = _xai_responses(payload)
-    if not data:
-        return []
-    articles = articles_from_response(data)
-    print(f"[x_search] {len(articles)} tweets")
-    return articles
+    found: list[dict] = []
+    seen: set[str] = set()
+    for handle in handles:
+        data = _xai_responses(build_x_search_payload([handle]))
+        if not data:
+            continue
+        for art in articles_from_response(data):
+            link = art.get("link") or ""
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            found.append(art)
+        if len(found) >= MAX_TWEETS:
+            break
+    print(f"[x_search] {len(found)} tweets")
+    return found
 
 
 if __name__ == "__main__":
