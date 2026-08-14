@@ -923,7 +923,8 @@ class TestExecuteBuy:
 
     def test_stock_buy_auto_leverage_when_underdeployed(self, fresh_store, monkeypatch):
         # All-cash book: 1-share 1x buy should be auto-boosted toward the
-        # 120-150% deployment mandate within BP and the 70% name cap.
+        # 120-150% deployment mandate within BP (auto-boost still bounds a
+        # tiny juice; this is not a post-trade fill block).
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
         snap = {
             "cash": 1000.0,
@@ -941,7 +942,7 @@ class TestExecuteBuy:
         status, detail = strategy._execute(decision, snap, fresh_store)
         assert status == "FILLED"
         pos = fresh_store.open_positions()[0]
-        # 70% name cap on $1000 book => max $700 => 7 shares at $100.
+        # Auto-boost name-room bound on $1000 book => max $700 => 7 shares.
         assert pos["qty"] == 7
         assert "auto_leverage" in detail
         assert fresh_store.get_portfolio()["cash"] == 300.0
@@ -999,9 +1000,11 @@ class TestExecuteBuy:
         assert status == "BLOCKED"
         assert "qty" in detail.lower()
 
-    def test_buy_blocked_when_it_would_overconcentrate_live_book(
+    def test_buy_allows_over_70pct_single_name_like_lite(
         self, fresh_store, monkeypatch
     ):
+        # Art 2026-08-14: 70% single-name post-trade block is dropped.
+        # A LITE-sized 75.7% sleeve must fill, not hard-block.
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
         snap = {
             "cash": 10000.0,
@@ -1009,13 +1012,14 @@ class TestExecuteBuy:
             "stock_buying_power": 15000.0,
             "positions": [],
         }
-        decision = {"action": "BUY", "ticker": "AMD", "qty": 50, "reasoning": ""}
+        decision = {"action": "BUY", "ticker": "LITE", "qty": 76, "reasoning": ""}
 
         status, detail = strategy._execute(decision, snap, fresh_store)
 
-        assert status == "BLOCKED"
-        assert "diversification block" in detail
-        assert fresh_store.open_positions() == []
+        assert status == "FILLED"
+        assert "BUY 76" in detail
+        assert "diversification block" not in detail
+        assert fresh_store.open_positions()[0]["ticker"] == "LITE"
 
     def test_buy_allows_bounded_entry_on_live_book(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
@@ -1032,26 +1036,29 @@ class TestExecuteBuy:
         assert status == "FILLED"
         assert "BUY 30" in detail
 
-    def test_buy_blocked_when_same_sector_would_exceed_cap(
+    def test_buy_allows_over_70pct_same_sector_like_mu(
         self, fresh_store, monkeypatch
     ):
+        # Art 2026-08-14: 70% sector post-trade block is dropped.
+        # A MU-sized add that takes semis to ~80% must fill, not hard-block.
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
         snap = {
             "cash": 7000.0,
             "total_value": 10000.0,
             "stock_buying_power": 12000.0,
             "positions": [{
-                "ticker": "NVDA", "type": "stock", "qty": 15,
-                "avg_cost": 200.0, "current_price": 200.0,
+                "ticker": "NVDA", "type": "stock", "qty": 30,
+                "avg_cost": 100.0, "current_price": 100.0,
                 "market_value": 3000.0,
             }],
         }
-        decision = {"action": "BUY", "ticker": "AMD", "qty": 20, "reasoning": ""}
+        decision = {"action": "BUY", "ticker": "MU", "qty": 50, "reasoning": ""}
 
         status, detail = strategy._execute(decision, snap, fresh_store)
 
-        assert status == "BLOCKED"
-        assert "sector concentration block" in detail
+        assert status == "FILLED"
+        assert "BUY 50" in detail
+        assert "sector concentration block" not in detail
 
     def test_rebuy_after_recent_exit_is_blocked(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)

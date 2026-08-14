@@ -111,7 +111,8 @@ AUTO_LEVERAGE_WHEN_UNDERDEPLOYED = True
 
 # Hard operator discipline for the live paper book. These are deliberately
 # enforced in _execute(), not merely described to the model, because the live
-# trade log showed repeated same-ticker round trips and sector pile-ons.
+# trade log showed repeated same-ticker round trips. Single-name / sector
+# concentration is guidance only — not a hard post-trade block.
 TRADE_DISCIPLINE_MIN_BOOK_VALUE = float(os.environ.get(
     "PAPER_TRADER_DISCIPLINE_MIN_BOOK_VALUE", "5000",
 ))
@@ -144,12 +145,8 @@ UNDERWATER_EXIT_EPS = float(
 OPTION_PREMIUM_KILL_PCT = float(
     os.environ.get("PAPER_TRADER_OPTION_PREMIUM_KILL_PCT", "0.50")
 )
-MAX_POST_TRADE_SINGLE_NAME_PCT = float(os.environ.get(
-    "PAPER_TRADER_MAX_POST_TRADE_SINGLE_NAME_PCT", "70",
-))
-MAX_POST_TRADE_SECTOR_PCT = float(os.environ.get(
-    "PAPER_TRADER_MAX_POST_TRADE_SECTOR_PCT", "70",
-))
+# Art 2026-08-14: single-name and sector 70% post-trade blocks are DROPPED.
+# Diversify stays guidance only. Leveraged-ETF sleeve still has a hard cap.
 MAX_POST_TRADE_LEVERAGED_PCT = float(os.environ.get(
     "PAPER_TRADER_MAX_POST_TRADE_LEVERAGED_PCT", "70",
 ))
@@ -732,8 +729,9 @@ If OPERATOR STANDING ORDERS appear in CONTEXT, they outrank generic
 construction/deployment nagging when the two conflict.
 Your ONLY goal is maximum profit after churn, concentration, and avoidable
 drawdown. You have autonomy over timing, thesis, and sizing inside the hard
-operator discipline enforced by the engine: no repeated same-ticker entry churn,
-no oversized single-name or sector pile-on, and no oversized leveraged ETF bet.
+operator discipline enforced by the engine: no repeated same-ticker entry churn
+and no oversized leveraged ETF bet. Diversify is standing-order guidance, not
+a hard single-name or sector fill block.
 You can:
 - Trade like a day trader on ENTRIES and WINNERS. Do NOT panic-sell losers just
   because the candle is red. Engine blocks underwater discretionary exits unless
@@ -746,14 +744,15 @@ You can:
 - Read DURABLE TRADE MEMORY every cycle before acting. Remember your own recent
   orders and lessons. Do not amnesia-rebuy/resell the same ticker without new
   evidence that explicitly overrides the prior memory
-- Concentrate when evidence is exceptional, but only within the hard engine caps
+- Concentrate when evidence is exceptional. Diversify is guidance, not a hard
+  single-name or sector engine cap; leveraged ETF sleeves still have a hard cap
 - Short priceable stocks when the ArticleNet/news evidence is bearish, even if
   the portfolio does not already own them
 - Hold options through expiry if you believe in the thesis, or sell them early
   when the move is in / thesis is done / theta or IV crush is the bigger risk
 - Idle cash is a failure mode. Keep cash under 10% of net worth unless every
   actionable idea is blocked by hard engine gates (issuer map, cooldown,
-  concentration, no price). Prefer deploying into differentiated high-conviction
+  no price). Prefer deploying into differentiated high-conviction
   names over parking cash
 - Target 120%-150% gross long exposure vs net worth by using stock buying power
   (cash + 50% net-worth margin) and explicit stock leverage. Ideal ~135%. Do not
@@ -806,7 +805,8 @@ POSITION SIZING GUIDANCE:
   so the book moves toward 120%-150% gross exposure
 - Medium conviction (2/3 signals aligned): 15-35%, still prefer deploying idle cash
   rather than leaving >10% cash
-- Low conviction / leveraged ETF: size within the same hard caps (max 70%)
+- Low conviction / leveraged ETF: size smaller; leveraged ETF sleeves still
+  have a hard 70% engine cap. Single-name / sector weight is guidance only
 - Do not rebuy a ticker right after selling it unless a genuinely new catalyst appears
 - Never go 100% into one ticker or leveraged ETF
 - If CONTEXT shows cash_pct > 10% or gross_exposure < 120%, deploy only into a
@@ -869,9 +869,9 @@ For BUY on regular stocks, you may set "leverage" from 1x to 20x. The paper
 trader applies the leverage to stock exposure only: qty=2, leverage=5 buys
 10 effective shares. Buying power includes cash plus 50% margin on current
 portfolio net worth (max ~1.5x when fully used). Prefer leverage >=1.2x when
-cash is above 10% or gross exposure is below 120%, unless concentration or
-issuer gates block it. The engine may auto-boost under-deployed tiny stock BUYs
-toward the 120%-150% target within remaining buying power and hard caps.
+cash is above 10% or gross exposure is below 120%, unless issuer gates
+block it. The engine may auto-boost under-deployed tiny stock BUYs
+toward the 120%-150% target within remaining buying power.
 For SHORT, qty is the positive share count to sell short; it opens or adds to
 a short stock position and uses the same stock buying-power field as BUY.
 For SELL, ticker must match an open long stock position. For COVER, ticker
@@ -2541,7 +2541,6 @@ def _auto_boost_stock_buy_leverage(
     Smart bounds:
     - only regular stocks (not leveraged ETF tickers)
     - respect remaining stock buying power
-    - respect single-name 70% hard cap on post-trade market value
     - do not lower an already-higher requested leverage
     - clamp to STOCK_BUY_MAX_LEVERAGE
     Returns (leverage, note). Note empty when no boost applied.
@@ -2689,12 +2688,14 @@ def _trade_discipline_guard(
     effective_qty: float,
     now: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Hard block repeated entries and concentration pile-ons.
+    """Hard block repeated entries. Concentration is not a fill block.
 
     Applies only to new stock entries (BUY/SHORT). Exits are always allowed so
-    the guard cannot trap risk. The small-book threshold keeps legacy unit tests
-    and toy local simulations from turning into "35% max" math exercises; the
-    live Mac book is above this threshold.
+    the guard cannot trap risk. Single-name and sector weights are guidance
+    only (Art 2026-08-14 dropped the 70% post-trade blocks). Leveraged-ETF
+    sleeves still have a hard cap. The small-book threshold keeps legacy unit
+    tests and toy local simulations from turning into cooldown-only noise; the
+    live book is above this threshold.
     """
     action = (decision.get("action") or "").upper()
     if action not in {"BUY", "SHORT"}:
@@ -2753,7 +2754,6 @@ def _trade_discipline_guard(
     except Exception:
         classify = lambda _ticker: "other"  # noqa: E731
 
-    name_values: dict[str, float] = {}
     sector_values: dict[str, float] = {}
     for p in snapshot.get("positions") or []:
         tk = str(p.get("ticker") or "").upper()
@@ -2762,31 +2762,14 @@ def _trade_discipline_guard(
         value = _position_abs_value(p)
         if value <= 0:
             continue
-        name_values[tk] = name_values.get(tk, 0.0) + value
         sec = classify(tk)
         sector_values[sec] = sector_values.get(sec, 0.0) + value
 
     sector = classify(ticker)
-    denom = max(total, sum(name_values.values()) + notional, 1.0)
-    post_name = name_values.get(ticker, 0.0) + notional
+    denom = max(total, sum(sector_values.values()) + notional, 1.0)
     post_sector = sector_values.get(sector, 0.0) + notional
-    post_name_pct = post_name / denom * 100.0
     post_sector_pct = post_sector / denom * 100.0
 
-    if post_name_pct > MAX_POST_TRADE_SINGLE_NAME_PCT + 1e-6:
-        return (
-            False,
-            f"diversification block: {ticker} would be "
-            f"{post_name_pct:.1f}% of book; max "
-            f"{MAX_POST_TRADE_SINGLE_NAME_PCT:.1f}%",
-        )
-    if post_sector_pct > MAX_POST_TRADE_SECTOR_PCT + 1e-6:
-        return (
-            False,
-            f"sector concentration block: {sector} would be "
-            f"{post_sector_pct:.1f}% of book; max "
-            f"{MAX_POST_TRADE_SECTOR_PCT:.1f}%",
-        )
     if sector.endswith("_lev") and post_sector_pct > MAX_POST_TRADE_LEVERAGED_PCT + 1e-6:
         return (
             False,
