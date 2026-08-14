@@ -12,8 +12,8 @@ _PREAMBLE = (
     "OPTIONS DESK (chain + strategy awareness -- facts for instrument choice "
     "only, NOT a directive; you retain complete autonomy; use BUY_CALL / "
     "BUY_PUT when options are the better expression of conviction, else stock). "
-    "FRIDAY CLOSER: leftover Sep mark is NOT the $800 new-debit cap. One 8/14 "
-    "NVDA/QQQ debit spread is the climb-to-10k send. Snapshot DTE~2 weeklies."
+    "No preferred-underlying list. NVDA/QQQ Friday-weekly hard-send is revoked. "
+    "Diversify: do not pile the same factor. Snapshot DTE is observational only."
 )
 
 STRATEGY_SKILLS = [
@@ -29,7 +29,7 @@ STRATEGY_SKILLS = [
         "name": "Swing call",
         "when": "Catalyst + technical confirmation, 2-6 week horizon",
         "prefer": "BUY_CALL DTE 21-60, delta 0.40-0.65, liquid strikes",
-        "avoid": "DTE <14 unless the 8/14 Friday closer or an imminent sized flyer",
+        "avoid": "DTE <14 unless an imminent sized flyer with defined risk",
     },
     {
         "id": "protective_put",
@@ -42,7 +42,7 @@ STRATEGY_SKILLS = [
         "id": "event_debit",
         "name": "Event debit option",
         "when": "Binary catalyst inside 14 DTE; shares too capital-heavy",
-        "prefer": "BUY_CALL_SPREAD / BUY_PUT_SPREAD on the Friday weekly (8/14), not Sep leftovers",
+        "prefer": "BUY_CALL_SPREAD / BUY_PUT_SPREAD on a liquid weekly/monthly, not leftover junk",
         "avoid": "Selling premium into events; treating leftover Sep mark as the $800 cap",
     },
     {

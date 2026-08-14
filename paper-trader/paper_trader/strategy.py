@@ -222,16 +222,80 @@ def _normalize_model_name(model: str | None = None) -> str:
     return name
 
 
+def _read_openclaw_auth_profiles_sqlite(db_path: Path) -> dict | None:
+    """Read the OpenClaw auth-profile token sink (SQLite, not the JSON name)."""
+    try:
+        import sqlite3
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT store_json FROM auth_profile_store "
+                "ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        raw = json.loads(row[0])
+        return raw if isinstance(raw, dict) else None
+    except Exception as e:
+        print(f"[strategy] xAI auth sqlite unreadable ({db_path}): {e}")
+        return None
+
+
+def _read_openclaw_auth_profiles() -> dict | None:
+    """Load OpenClaw auth profiles from JSON file or the SQLite token sink.
+
+    OpenClaw 2026+ stores secrets in ``openclaw-agent.sqlite`` under the
+    logical name ``auth-profiles.json``. The JSON file is often absent on
+    VPS installs (only the SQLite WAL store exists), which previously
+    made every Grok decision fail closed.
+    """
+    path = Path(XAI_AUTH_PROFILES_PATH)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text())
+            if isinstance(raw, dict) and raw.get("profiles"):
+                return raw
+        except Exception as e:
+            print(f"[strategy] xAI auth profiles unreadable: {e}")
+    candidates: list[Path] = []
+    if path.suffix.lower() == ".sqlite":
+        candidates.append(path)
+    else:
+        candidates.append(path.with_name("openclaw-agent.sqlite"))
+        candidates.append(path.parent / "openclaw-agent.sqlite")
+    default_sqlite = (
+        Path.home() / ".openclaw" / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+    )
+    candidates.append(default_sqlite)
+    seen: set[Path] = set()
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except Exception:
+            resolved = cand
+        if resolved in seen or not cand.is_file():
+            continue
+        seen.add(resolved)
+        loaded = _read_openclaw_auth_profiles_sqlite(cand)
+        if loaded and loaded.get("profiles"):
+            return loaded
+    print(
+        f"[strategy] xAI auth profiles unreadable: no JSON or SQLite store at {path}"
+    )
+    return None
+
+
 def _load_xai_access_token() -> str | None:
     """Resolve a bearer token for api.x.ai from env or OpenClaw auth profiles."""
     for key in ("PAPER_TRADER_XAI_API_KEY", "XAI_API_KEY"):
         value = (os.environ.get(key) or "").strip()
         if value:
             return value
-    try:
-        raw = json.loads(Path(XAI_AUTH_PROFILES_PATH).read_text())
-    except Exception as e:
-        print(f"[strategy] xAI auth profiles unreadable: {e}")
+    raw = _read_openclaw_auth_profiles()
+    if not raw:
         return None
     profiles = raw.get("profiles") if isinstance(raw, dict) else None
     if not isinstance(profiles, dict):
@@ -645,23 +709,24 @@ _TP_PCT_LEVERAGED = 0.25
 SYSTEM_PROMPT = """You are managing a paper trading portfolio. Use the live
 portfolio value, cash balance, positions, and buying-power fields in CONTEXT as
 the source of truth for account size.
-STANDING OPERATOR MANDATE (Jonathan 2026-08-07) — HARD:
+STANDING OPERATOR MANDATE (Jonathan 2026-08-14) — HARD:
+- The NVDA/QQQ-first / one Friday-weekly closer rule is REVOKED. Jarvis
+  fabricated that standing rule after being told to stop fabricating them.
+  Do not reinstate it. Do not "prefer NVDA/QQQ" as a default.
+- The live rule is DIVERSIFY. Do not pile NVDA, QQQ, TQQQ, NVDU, or other
+  NVDA/Nasdaq-factor clones just because an old closer or prompt said so.
+- Next discretionary entry must be a different issuer and a different factor
+  than the current NVDA cluster. Existing NVDA lots may be held or reduced;
+  no new NVDA/QQQ pile-on.
 - You are a DAY TRADER using real multi-source knowledge + leverage, not a
   passive office-worker portfolio manager buying boring ballast.
-- Active goal: climb equity back to $10,000 (~+$640 from the hole), then stop
-  pressing. Prefer defined-risk options (debit spreads / high-conviction
-  calls-puts on NVDA/QQQ first) over adding more cash-bleed shares.
-- First clean up dead weight: flatten CAT; treat AMZN as a trade not a career;
-  free BP before new option debits. Do not buy CAT/AMZN/etc just because gross
-  exposure is under 120% or a construction sleeve is underweight.
+- Prefer defined-risk options when they fit the thesis. There is NO preferred-
+  underlying list and NO $800 NVDA/QQQ Friday-weekly obligation.
 - Construction targets and "stay invested" pressure are SECONDARY to catalyst +
   tape. No catalyst today = HOLD, not nibble TQQQ/shares to look busy.
 - If LLM/ML drought: HOLD or hard-exit only. Drought-fallback share dribbles
   are banned as a personality.
-- Options risk budget while climbing to $10k: leftover Sep mark is NOT the cap.
-  New 8/14 Friday weekly debit cap is $800. One NVDA/QQQ debit only. Engine
-  flattens SK (wrong issuer) and sends the closer after Thu 08:45 ET PPI.
-  Kill the new weekly only at about -50% debit or REAL thesis-kill evidence.
+- Kill an option only at about -50% debit or REAL thesis-kill evidence.
   Engine permanently blocks underwater panic sells.
 If OPERATOR STANDING ORDERS appear in CONTEXT, they outrank generic
 construction/deployment nagging when the two conflict.

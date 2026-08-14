@@ -173,6 +173,7 @@ def _openclaw_fallback_candidates() -> list[str]:
     """
     home = os.path.expanduser("~")
     cands = [
+        os.path.join(home, ".openclaw", "bin", "openclaw"),
         os.path.join(home, ".local", "bin", "openclaw"),
         "/usr/local/bin/openclaw",
         "/usr/bin/openclaw",
