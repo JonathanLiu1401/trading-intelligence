@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from storage.article_store import ArticleStore, _LIVE_ONLY_CLAUSE  # noqa: E402
+from worker_bounds import configured_allowlist  # noqa: E402
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
 DASHBOARD_HTML = DASHBOARD_DIR / "dashboard.html"
@@ -221,8 +222,8 @@ def _configured_worker_allowlist() -> set[str] | None:
             raw = str(env.get("DIGITAL_INTERN_WORKERS") or "")
         except Exception:
             raw = ""
-    allowlist = {name.strip() for name in raw.split(",") if name.strip()}
-    return allowlist or None
+    # Numeric/empty is a cap (default 4). Never treat unset as "all 147".
+    return configured_allowlist(raw, WORKERS)
 
 
 def _worker_health(lookback: int = 2000) -> list[dict[str, Any]]:

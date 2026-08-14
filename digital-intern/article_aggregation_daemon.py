@@ -99,8 +99,15 @@ def _env_seconds(name: str, default: float) -> float:
 
 
 def _requested_workers() -> set[str]:
+    from worker_bounds import parse_worker_spec, resolve_worker_names
     raw = os.environ.get("DIGITAL_INTERN_WORKERS", "")
-    return {name.strip() for name in raw.split(",") if name.strip()}
+    cap, names = parse_worker_spec(raw)
+    if cap is not None:
+        # Numeric/empty cap: bounded priority names, not a worker called "4".
+        return set(resolve_worker_names((
+            "web_server", "rss", "scorer", "heartbeat", "web", "reddit", "alert", "purge"
+        ), raw))
+    return names
 
 
 def _sleep(seconds: float) -> None:

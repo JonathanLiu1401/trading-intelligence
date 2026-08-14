@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 sys.path.insert(0, str(BASE_DIR))
+from worker_bounds import resolve_worker_names  # noqa: E402
 
 # Central structured logger — must import before any other local module
 from core.logger import get_logger, record_metric
@@ -343,10 +344,11 @@ def _env_enabled(name: str, default: str = "1") -> bool:
 
 EMBEDDED_WEB_SERVER_ENABLED = _env_enabled("DIGITAL_INTERN_EMBEDDED_WEB", "1")
 CONTINUOUS_TRAINER_ENABLED = _env_enabled("DIGITAL_INTERN_CONTINUOUS_TRAINER", "1")
+DIGITAL_INTERN_WORKERS_RAW = os.environ.get("DIGITAL_INTERN_WORKERS", "")
 DIGITAL_INTERN_WORKERS = {
     name.strip()
-    for name in os.environ.get("DIGITAL_INTERN_WORKERS", "").split(",")
-    if name.strip()
+    for name in DIGITAL_INTERN_WORKERS_RAW.split(",")
+    if name.strip() and not name.strip().isdigit()
 }
 
 # Active portfolio + watchlist tickers used for price alerts and relevance boosts.
@@ -5598,15 +5600,20 @@ def main():
     else:
         log.info("[daemon] Embedded web_server disabled; standalone dashboard owns port 8080")
 
-    if DIGITAL_INTERN_WORKERS:
-        known_workers = {name for name, _fn in workers}
+    known_order = [name for name, _fn in workers]
+    selected_names = resolve_worker_names(known_order, DIGITAL_INTERN_WORKERS_RAW)
+    if DIGITAL_INTERN_WORKERS_RAW.strip() and not DIGITAL_INTERN_WORKERS_RAW.strip().isdigit():
+        known_workers = set(known_order)
         unknown_workers = sorted(DIGITAL_INTERN_WORKERS - known_workers)
         if unknown_workers:
             log.warning(f"[daemon] unknown DIGITAL_INTERN_WORKERS ignored: {unknown_workers}")
-        workers = [(name, fn) for name, fn in workers if name in DIGITAL_INTERN_WORKERS]
-        if not workers:
-            raise RuntimeError("DIGITAL_INTERN_WORKERS did not match any daemon workers")
-        log.info(f"[daemon] worker allowlist active: {[name for name, _fn in workers]}")
+    if not selected_names:
+        raise RuntimeError("DIGITAL_INTERN_WORKERS did not match any daemon workers")
+    worker_fn = {name: fn for name, fn in workers}
+    workers = [(name, worker_fn[name]) for name in selected_names]
+    log.info(f"[daemon] worker allowlist active ({len(workers)}): {[name for name, _fn in workers]}")
+    global ALL_WORKERS
+    ALL_WORKERS = tuple(name for name, _fn in workers)
 
     # Map name → fn for lookup during respawn
     worker_map = {name: fn for name, fn in workers}
@@ -5620,7 +5627,7 @@ def main():
         _worker_state[name] = "ok"
         log.info(f"[daemon] Worker '{name}' started")
 
-    log.info(f"[daemon] All {len(threads)} workers running — max throughput mode")
+    log.info(f"[daemon] All {len(threads)} workers running — bounded mode")
 
     # ── Supervisor loop ──────────────────────────────────────────────────────
     # Smart respawn: per-worker crash counter, degraded/disabled states, OOM
