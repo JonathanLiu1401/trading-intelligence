@@ -66,7 +66,48 @@ WINNER_JSONL = ROOT / "data" / "winner_training.jsonl"
 WINNER_JSONL_KEEP = 50000
 # digital-intern's article DB that `_inject_and_train` writes winner rows into.
 # Module-level (not a function local) so it can be redirected in tests.
-DIGITAL_INTERN_ARTICLES_DB = "/home/zeph/digital-intern/data/articles.db"
+# NEVER hardcode a host-specific path: `/home/zeph/digital-intern/...` does
+# not exist on the Grok Bot VPS, and sqlite then raises
+# `OperationalError: unable to open database file` every cycle.
+
+
+def _resolve_digital_intern_dir() -> Path:
+    """Pick the intern checkout that actually has articles.db / trainer.py."""
+    env = (os.environ.get("DIGITAL_INTERN_DIR") or "").strip()
+    candidates: list[Path] = []
+    if env:
+        candidates.append(Path(env))
+    candidates.extend([
+        ROOT.parent / "digital-intern",
+        Path("/workspace/trading-intelligence/digital-intern"),
+        Path.home() / "trading-intelligence" / "digital-intern",
+        Path("/home/zeph/trading-intelligence/digital-intern"),
+        Path("/home/zeph/digital-intern"),
+    ])
+    seen: set[Path] = set()
+    for c in candidates:
+        try:
+            resolved = c.resolve()
+        except Exception:
+            resolved = c
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if (c / "data" / "articles.db").is_file() or (c / "ml" / "trainer.py").is_file():
+            return c
+    return ROOT.parent / "digital-intern"
+
+
+DIGITAL_INTERN_DIR = _resolve_digital_intern_dir()
+DIGITAL_INTERN_ARTICLES_DB = str(DIGITAL_INTERN_DIR / "data" / "articles.db")
+
+# Grok annotation budgets. One 60-decision JSON prompt routinely exceeded
+# the old 240s xAI timeout (`[strategy] xAI HTTP timeout after 240s` →
+# `[opus_annotate] grok returned empty`). Chunk + retry keeps us on grok-4.6.
+OPUS_ANNOTATE_CHUNK = 12
+OPUS_ANNOTATE_TIMEOUT_S = 180
+OPUS_ANNOTATE_RETRIES = 1
+LLM_ANNOTATE_TIMEOUT_S = 180
 
 # How often to run the validation suite (label audit + permutation test) on the
 # current cycle's engine. Validation is *expensive* (one full backtest per
@@ -4434,6 +4475,148 @@ def _query_news_context(ticker: str, sim_date_str: str, n: int = 4) -> list[str]
     return out
 
 
+_ANNOTATION_LINE_RE = re.compile(
+    r"(\w[\w\-]*)\s+(BUY|SELL|HOLD)[:\s]+(ENDORSE|CONDEMN)",
+    re.IGNORECASE,
+)
+
+
+def _flatten_annotation_items(items: list) -> list[str]:
+    """Turn JSON review/label items into searchable text blobs."""
+    out: list[str] = []
+    for it in items:
+        if isinstance(it, str):
+            out.append(it)
+        elif isinstance(it, dict):
+            ticker = it.get("ticker") or ""
+            action = it.get("action") or ""
+            verdict = it.get("verdict") or it.get("label") or it.get("quality") or ""
+            if ticker and verdict:
+                out.append(f"{ticker} {action or 'BUY'}: {verdict}")
+            else:
+                out.append(" ".join(str(v) for v in it.values() if v is not None))
+    return out
+
+
+def _parse_llm_annotation_labels(text: str) -> list[tuple[str, str, str]]:
+    """Extract (TICKER, ACTION, ENDORSE|CONDEMN) from free text or JSON.
+
+    Live grok-4.6 often wraps the requested line format in
+    ``{"reviews":["MSFT BUY: ENDORSE ...", ...]}``. The old parser used
+    ``re.match`` on each raw line, so a JSON wrapper produced
+    ``LLM labels: 0 endorsed, 0 condemned`` even when Grok labeled well.
+    """
+    if not text or not str(text).strip():
+        return []
+    blobs: list[str] = [str(text)]
+    stripped = str(text).strip()
+    obj = None
+    try:
+        obj = json.loads(stripped)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", stripped)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = None
+    if isinstance(obj, dict):
+        for key in ("reviews", "labels", "trade_labels", "annotations"):
+            val = obj.get(key)
+            if isinstance(val, list):
+                blobs.extend(_flatten_annotation_items(val))
+            elif isinstance(val, str):
+                blobs.append(val)
+    elif isinstance(obj, list):
+        blobs.extend(_flatten_annotation_items(obj))
+    found: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for blob in blobs:
+        for m in _ANNOTATION_LINE_RE.finditer(str(blob)):
+            item = (m.group(1).upper(), m.group(2).upper(), m.group(3).upper())
+            if item not in seen:
+                seen.add(item)
+                found.append(item)
+    return found
+
+
+def _call_grok_annotate(prompt: str, timeout_s: int) -> str:
+    """Call grok-4.6 for annotation; retry once on empty/timeout. Never Anthropic."""
+    from paper_trader.llm_adapter import call_llm
+    from paper_trader.strategy import MODEL as _GROK_MODEL
+
+    last = ""
+    attempts = OPUS_ANNOTATE_RETRIES + 1
+    for attempt in range(attempts):
+        try:
+            raw = (call_llm(_GROK_MODEL, prompt, timeout=timeout_s) or "").strip()
+        except Exception as e:
+            print(f"[opus_annotate] grok error: {e}")
+            raw = ""
+        if raw:
+            return raw
+        last = raw
+        print(f"[opus_annotate] grok returned empty "
+              f"(attempt {attempt + 1}/{attempts})")
+    return last
+
+
+def _build_opus_annotate_prompt(winner: "BacktestRun", other_returns: str,
+                                decision_lines: list[str],
+                                chunk_i: int, n_chunks: int) -> str:
+    chunk_note = (f" (chunk {chunk_i + 1}/{n_chunks})" if n_chunks > 1 else "")
+    return f"""You are a quantitative trading analyst reviewing a backtest run for ML training purposes.
+
+Backtest run #{winner.run_id} achieved {winner.total_return_pct:+.2f}% return over a 1-year simulation
+using ML article sentiment + RSI/MACD/momentum signals. No live Claude calls were used — decisions
+are pure quantitative signals. Other top runs this cycle: {other_returns or "none"}
+
+DECISION LOG{chunk_note} (including HOLDs):
+Format: date ACTION TICKER qty portfolio →5d_actual_return | reasoning | NEWS_CONTEXT
+{chr(10).join(decision_lines)}
+
+Your task:
+1. For EVERY decision (BUY, SELL, and HOLD), assign quality: GOOD / NEUTRAL / BAD
+   - GOOD: the decision led to profit or correctly avoided loss (5d return confirms it)
+   - BAD: the decision lost money or missed a clear profitable opportunity
+   - NEUTRAL: outcome was mixed or the 5d return was near zero
+   - For HOLDs: was holding the right call? Did a missed trade (5d return > +2%) mean BAD HOLD?
+2. For BAD decisions: specify what signal should have triggered differently
+3. For GOOD decisions: identify the specific signal that made it right
+4. Provide an OVERALL LESSON as a concise trading rule derived from this run's outcomes
+
+Respond as JSON with this schema (no markdown fences):
+{{
+  "trade_labels": [
+    {{
+      "sim_date": "YYYY-MM-DD",
+      "action": "BUY/SELL/HOLD",
+      "ticker": "...",
+      "quality": "GOOD/NEUTRAL/BAD",
+      "rationale": "...",
+      "forward_return_5d": <number or null>,
+      "signal_fix": "what signal should have changed this decision (if BAD or missed opportunity)"
+    }}
+  ],
+  "overall_lesson": "...",
+  "key_patterns": ["pattern1", "pattern2"],
+  "improvement_suggestions": ["specific change to ML scoring or thresholds"]
+}}"""
+
+
+def _parse_opus_annotation_json(raw: str) -> dict | None:
+    if not raw:
+        return None
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def _opus_annotate(engine: "BacktestEngine", top_runs: list[BacktestRun],
                    cycle: int, outcome_records: list[dict] | None = None) -> int:
     """Ask Grok to annotate ALL decisions (BUY, SELL, HOLD) in the winner run.
@@ -4508,63 +4691,36 @@ def _opus_annotate(engine: "BacktestEngine", top_runs: list[BacktestRun],
         return 0
 
     other_returns = " / ".join(f"run{r.run_id}={r.total_return_pct:+.1f}%" for r in top_runs[1:])
-    prompt = f"""You are a quantitative trading analyst reviewing a backtest run for ML training purposes.
-
-Backtest run #{winner.run_id} achieved {winner.total_return_pct:+.2f}% return over a 1-year simulation
-using ML article sentiment + RSI/MACD/momentum signals. No live Claude calls were used — decisions
-are pure quantitative signals. Other top runs this cycle: {other_returns or "none"}
-
-FULL DECISION LOG (including HOLDs):
-Format: date ACTION TICKER qty portfolio →5d_actual_return | reasoning | NEWS_CONTEXT
-{chr(10).join(decision_lines[:60])}
-
-Your task:
-1. For EVERY decision (BUY, SELL, and HOLD), assign quality: GOOD / NEUTRAL / BAD
-   - GOOD: the decision led to profit or correctly avoided loss (5d return confirms it)
-   - BAD: the decision lost money or missed a clear profitable opportunity
-   - NEUTRAL: outcome was mixed or the 5d return was near zero
-   - For HOLDs: was holding the right call? Did a missed trade (5d return > +2%) mean BAD HOLD?
-2. For BAD decisions: specify what signal should have triggered differently
-3. For GOOD decisions: identify the specific signal that made it right
-4. Provide an OVERALL LESSON as a concise trading rule derived from this run's outcomes
-
-Respond as JSON with this schema (no markdown fences):
-{{
-  "trade_labels": [
-    {{
-      "sim_date": "YYYY-MM-DD",
-      "action": "BUY/SELL/HOLD",
-      "ticker": "...",
-      "quality": "GOOD/NEUTRAL/BAD",
-      "rationale": "...",
-      "forward_return_5d": <number or null>,
-      "signal_fix": "what signal should have changed this decision (if BAD or missed opportunity)"
-    }}
-  ],
-  "overall_lesson": "...",
-  "key_patterns": ["pattern1", "pattern2"],
-  "improvement_suggestions": ["specific change to ML scoring or thresholds"]
-}}"""
-
-    try:
-        # Stack policy: all annotation LLM traffic goes through Grok/xAI.
-        from paper_trader.strategy import _xai_http_call, MODEL as _GROK_MODEL
-        raw = (_xai_http_call(prompt, timeout_s=240, model=_GROK_MODEL) or "").strip()
-    except Exception as e:
-        print(f"[opus_annotate] grok error: {e}")
-        return 0
-
-    if not raw:
+    # Cap at 60 decisions but send them in small chunks. A single 60-row
+    # JSON completion routinely exceeded the 240s xAI timeout.
+    to_review = decision_lines[:60]
+    chunk_size = max(1, int(OPUS_ANNOTATE_CHUNK) or 12)
+    chunks = [to_review[i:i + chunk_size] for i in range(0, len(to_review), chunk_size)]
+    annotation: dict = {
+        "trade_labels": [],
+        "overall_lesson": "",
+        "key_patterns": [],
+        "improvement_suggestions": [],
+    }
+    n_ok = 0
+    for i, chunk in enumerate(chunks):
+        prompt = _build_opus_annotate_prompt(
+            winner, other_returns, chunk, i, len(chunks),
+        )
+        raw = _call_grok_annotate(prompt, OPUS_ANNOTATE_TIMEOUT_S)
+        parsed = _parse_opus_annotation_json(raw)
+        if not parsed:
+            print(f"[opus_annotate] chunk {i + 1}/{len(chunks)} empty or unparseable")
+            continue
+        n_ok += 1
+        annotation["trade_labels"].extend(parsed.get("trade_labels") or [])
+        if not annotation["overall_lesson"] and (parsed.get("overall_lesson") or ""):
+            annotation["overall_lesson"] = parsed.get("overall_lesson") or ""
+        annotation["key_patterns"].extend(parsed.get("key_patterns") or [])
+        annotation["improvement_suggestions"].extend(
+            parsed.get("improvement_suggestions") or [])
+    if n_ok == 0:
         print("[opus_annotate] grok returned empty")
-        return 0
-    m = re.search(r"\{[\s\S]*\}", raw)
-    if not m:
-        print("[opus_annotate] no JSON in response")
-        return 0
-    try:
-        annotation = json.loads(m.group(0))
-    except Exception as e:
-        print(f"[opus_annotate] JSON parse error: {e}")
         return 0
 
     written = 0
@@ -4638,6 +4794,12 @@ def _inject_and_train() -> str:
     import zlib
 
     DB_PATH = DIGITAL_INTERN_ARTICLES_DB
+    # sqlite3.connect raises "unable to open database file" when the parent
+    # directory is missing (the old /home/zeph/... hardcode on this VPS).
+    try:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return f"inject err: unable to open database file ({e})"
 
     def _compress(text: str) -> bytes:
         return zlib.compress(text.encode("utf-8", errors="replace"), level=6)
@@ -4775,7 +4937,7 @@ def _inject_and_train() -> str:
              "s=ArticleStore(); res=train(s,force=True); "
              "print(f\"trainer n={res.get('n',0)} loss={res.get('final_loss',0):.4f} "
              "val={res.get('val_loss',0):.4f}\")"],
-            cwd="/home/zeph/digital-intern",
+            cwd=str(Path(DB_PATH).parent.parent),
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode == 0:
@@ -4853,7 +5015,7 @@ Be concise. Only output the labeled lines, no intro text."""
 
     try:
         # Stack policy: all annotation LLM traffic goes through Grok/xAI.
-        annotation_text = (call_llm(_GROK_MODEL, prompt, timeout=90) or "").strip()
+        annotation_text = (call_llm(_GROK_MODEL, prompt, timeout=LLM_ANNOTATE_TIMEOUT_S) or "").strip()
         if not annotation_text:
             print(f"[continuous] LLM annotation cycle {cycle}: empty Grok response")
             return outcome_records
@@ -4865,12 +5027,7 @@ Be concise. Only output the labeled lines, no intro text."""
         # one run's trade onto identically-named trades in the three unreviewed
         # middle runs, corrupting their training sample weights.
         allowed_run_ids = {winner.run_id, loser.run_id}
-        for line in annotation_text.splitlines():
-            # [\w\-]* (not +) so single-letter tickers like V are not dropped.
-            m = re.match(r"(\w[\w\-]*)\s+(BUY|SELL|HOLD)[:\s]+(ENDORSE|CONDEMN)", line.upper())
-            if not m:
-                continue
-            ticker, action, verdict = m.group(1), m.group(2), m.group(3)
+        for ticker, action, verdict in _parse_llm_annotation_labels(annotation_text):
             label = 1 if verdict == "ENDORSE" else -1
             for r in outcome_records:
                 if r.get("run_id") not in allowed_run_ids:

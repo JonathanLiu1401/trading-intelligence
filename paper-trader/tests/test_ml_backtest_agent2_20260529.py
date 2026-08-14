@@ -166,11 +166,7 @@ def test_opus_annotate_emits_urgency_zero(tmp_path, monkeypatch):
     jsonl_path = tmp_path / "winner_training.jsonl"
     monkeypatch.setattr(rcb, "WINNER_JSONL", jsonl_path)
 
-    # Mock the subprocess.run that calls claude to return a synthetic
-    # annotation JSON with both a lesson and a GOOD trade label.
-    mock_proc = MagicMock()
-    mock_proc.returncode = 0
-    mock_proc.stdout = json.dumps({
+    annotation_json = json.dumps({
         "overall_lesson": "Buy semis on RSI<35 bounces.",
         "key_patterns": ["mean-revert"],
         "improvement_suggestions": ["tighten stop"],
@@ -181,7 +177,6 @@ def test_opus_annotate_emits_urgency_zero(tmp_path, monkeypatch):
              "quality": "BAD", "rationale": "Sold too early"},
         ],
     })
-    mock_proc.stderr = ""
 
     # _opus_annotate needs an engine.store with a queryable conn for
     # backtest_decisions; same _FakeStore works.
@@ -197,11 +192,11 @@ def test_opus_annotate_emits_urgency_zero(tmp_path, monkeypatch):
     engine = _FakeEngine(store)
     winner = _FakeRun(7, 32.5)
 
-    # `claude` CLI presence is checked first via shutil.which; pretend it
-    # exists so the function actually proceeds to subprocess.run.
-    with patch("shutil.which", return_value="/usr/bin/claude"), \
-         patch("subprocess.run", return_value=mock_proc):
-        n = rcb._opus_annotate(engine, [winner], cycle=42, outcome_records=[])
+    monkeypatch.setattr(
+        "paper_trader.llm_adapter.call_llm",
+        lambda *a, **k: annotation_json,
+    )
+    n = rcb._opus_annotate(engine, [winner], cycle=42, outcome_records=[])
 
     assert n >= 1, f"_opus_annotate should write at least 1 row, got {n}"
     rows = [json.loads(l) for l in jsonl_path.read_text().splitlines() if l.strip()]

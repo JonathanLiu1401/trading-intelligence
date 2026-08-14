@@ -31,14 +31,11 @@ from pathlib import Path
 from .backtest import (
     CACHE_DIR,
     GDELT_CACHE,
+    GDELT_COVERAGE_START,
     GDELT_RATE_LIMIT_S,
     KEYWORD_GROUPS,
     GDELTFetcher,
 )
-
-# GDELT 2.0 article-search API has documented coverage from 2015-02-19.
-# Earlier windows fall back to SEC + price/quant signals only.
-GDELT_COVERAGE_START = date(2015, 2, 19)
 
 # SEC EDGAR full-text search covers ~1994+; we use 1996 as the floor matching
 # _pick_window's EARLIEST_WINDOW_START.
@@ -128,8 +125,13 @@ def warm_gdelt_weekly(start: date, end: date) -> int:
     GDELT_CACHE.mkdir(parents=True, exist_ok=True)
     fetcher = GDELTFetcher()
 
-    # Walk by week starting at the Monday of `start`.
+    # Walk by week starting at the Monday of `start`, but never before
+    # GDELT coverage. `start=2015-02-19` (Thu) used to rewind to
+    # 2015-02-16 (Mon) and every keyword for that Monday hit the API,
+    # got rate-limited, then cached as "outside coverage".
     cur = start - timedelta(days=start.weekday())
+    if cur < GDELT_COVERAGE_START:
+        cur = GDELT_COVERAGE_START
     weeks: list[date] = []
     while cur <= end:
         weeks.append(cur)

@@ -801,3 +801,59 @@ class TestInjectAndTrain:
         assert status == "inject err: disk I/O error", status
         assert sleeps == [], sleeps
         assert state["calls"] == 1, state["calls"]
+
+
+    def test_missing_parent_dir_is_created_not_unable_to_open(
+            self, tmp_path, monkeypatch):
+        """Live VPS bug: DIGITAL_INTERN_ARTICLES_DB pointed at
+        /home/zeph/digital-intern/data/articles.db whose parent dir does
+        not exist → sqlite3.OperationalError: unable to open database file
+        every cycle. mkdir the parent, then insert into a freshly created
+        schema so inject succeeds.
+        """
+        db = tmp_path / "no_such_dir" / "nested" / "articles.db"
+        assert not db.parent.exists()
+        jsonl = tmp_path / "winners.jsonl"
+        rec = {"title": "BUY NVDA on 2025-01-01", "ai_score": 4.0,
+               "weight": 1.0, "ticker": "NVDA", "reasoning": "r",
+               "sim_date": "2025-01-01", "label": "BUY", "run_id": 1,
+               "cycle": 3}
+        jsonl.write_text(json.dumps(rec) + "\n")
+        monkeypatch.setattr(rcb, "WINNER_JSONL", jsonl)
+        monkeypatch.setattr(rcb, "DIGITAL_INTERN_ARTICLES_DB", str(db))
+        monkeypatch.setattr(rcb.subprocess, "run",
+                            lambda *a, **k: self._fake_trainer_ok())
+
+        # First connect will create an empty file with no schema. Seed the
+        # schema after mkdir by wrapping connect: first real connect creates
+        # the file; we create the table if missing.
+        real_connect = sqlite3.connect
+
+        def connect_and_schema(*a, **k):
+            conn = real_connect(*a, **k)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS articles ("
+                "id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, "
+                "published TEXT, kw_score REAL, ai_score REAL, urgency REAL, "
+                "first_seen TEXT, cycle INTEGER, full_text BLOB)"
+            )
+            conn.commit()
+            return conn
+
+        monkeypatch.setattr(rcb.sqlite3, "connect", connect_and_schema)
+        status = rcb._inject_and_train()
+        assert not status.startswith("inject err"), status
+        assert status.startswith("injected 1 new"), status
+        assert db.exists()
+        assert db.parent.is_dir()
+
+
+def test_resolve_digital_intern_dir_prefers_existing_articles_db(tmp_path, monkeypatch):
+    """Resolver must pick a checkout that actually has articles.db, not a
+    hardcoded /home/zeph path that is missing on the VPS."""
+    intern = tmp_path / "digital-intern"
+    (intern / "data").mkdir(parents=True)
+    (intern / "data" / "articles.db").write_bytes(b"x")
+    monkeypatch.setenv("DIGITAL_INTERN_DIR", str(intern))
+    got = rcb._resolve_digital_intern_dir()
+    assert got == intern

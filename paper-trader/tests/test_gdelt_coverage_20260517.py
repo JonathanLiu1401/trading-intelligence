@@ -38,7 +38,9 @@ class TestGdeltPermanentError:
                              "message was: Invalid query start date.")
 
         monkeypatch.setattr(f._client, "article_search", _boom)
-        d, kw = date(2001, 6, 15), "stock market earnings semiconductor"
+        # Post-coverage date so we exercise the API-error short-circuit,
+        # not the new pre-coverage skip (that path never calls article_search).
+        d, kw = date(2016, 6, 15), "stock market earnings semiconductor"
 
         res = f.fetch(d, kw)
         assert res == []
@@ -90,3 +92,73 @@ class TestGdeltPermanentError:
         d, kw = date(2024, 6, 18), "semiconductor chip AI earnings beat"
         assert f.fetch(d, kw) == []
         assert json.loads(f._cache_key(d, kw).read_text()) == []
+
+
+class TestGdeltPreCoverageSkip:
+    def test_pre_coverage_date_skips_network_and_caches_empty(self, monkeypatch):
+        """Dates before GDELT_COVERAGE_START must not hit the API at all."""
+        sleeps: list[float] = []
+        monkeypatch.setattr(bt.time, "sleep", lambda s: sleeps.append(s))
+        bt.GDELTFetcher._last_request_ts = 0.0
+        f = bt.GDELTFetcher()
+        calls: list[int] = []
+        monkeypatch.setattr(f._client, "article_search",
+                            lambda _f: calls.append(1))
+        d, kw = date(2001, 6, 15), "stock market earnings semiconductor"
+        assert f.fetch(d, kw) == []
+        assert calls == []
+        assert sleeps == []
+        cache = f._cache_key(d, kw)
+        assert cache.exists()
+        assert json.loads(cache.read_text()) == []
+        # Second call is a disk hit.
+        assert f.fetch(d, kw) == []
+        assert calls == []
+
+    def test_coverage_monday_before_start_is_skipped(self, monkeypatch):
+        """2015-02-16 (Monday of the coverage-start week) used to be queried
+        by weekly prewarm and then cached as 'outside coverage' after 3
+        rate-limit retries. Must skip with zero API calls."""
+        bt.GDELTFetcher._last_request_ts = 0.0
+        f = bt.GDELTFetcher()
+        calls: list[int] = []
+        monkeypatch.setattr(f._client, "article_search",
+                            lambda _f: calls.append(1))
+        d = date(2015, 2, 16)
+        assert d < bt.GDELT_COVERAGE_START
+        assert f.fetch(d, "SP500 market rally selloff") == []
+        assert calls == []
+
+
+class TestGdeltSharedLimiter:
+    def test_two_instances_share_one_lock_and_timestamp(self):
+        a = bt.GDELTFetcher()
+        b = bt.GDELTFetcher()
+        assert a._request_lock is b._request_lock
+        assert a._request_lock is bt.GDELTFetcher._request_lock
+        # Class-level timestamp, not per-instance.
+        bt.GDELTFetcher._last_request_ts = 123.0
+        assert a._last_request_ts == 123.0
+        assert b._last_request_ts == 123.0
+        bt.GDELTFetcher._last_request_ts = 0.0
+
+
+class TestGdeltWeeklyWarmClamp:
+    def test_weekly_warm_does_not_start_before_coverage(self, monkeypatch):
+        import paper_trader.historical_collector as hc
+        fetched: list[date] = []
+
+        class _FakeFetcher:
+            def _cache_key(self, d, kw):
+                return bt.GDELT_CACHE / f"{d.isoformat()}_x.json"
+
+            def fetch(self, d, kw):
+                fetched.append(d)
+                return []
+
+        monkeypatch.setattr(hc, "GDELTFetcher", _FakeFetcher)
+        monkeypatch.setattr(hc, "KEYWORD_GROUPS", ["kw-only"])
+        n = hc.warm_gdelt_weekly(date(2015, 2, 19), date(2015, 2, 25))
+        assert date(2015, 2, 16) not in fetched
+        assert all(d >= bt.GDELT_COVERAGE_START for d in fetched)
+        assert n == len(fetched) >= 1

@@ -311,17 +311,10 @@ class TestOpusAnnotateOutcomeLookupDefensive:
              "forward_return_5d": 3.0},
         ]
 
-        # Force `shutil.which("claude")` to return a path so the early
-        # exit doesn't fire; mock subprocess.run to return a no-op response
-        # that has no trade_labels (so no extra annotation rows are written).
-        monkeypatch.setattr(rcb.shutil, "which", lambda _: "/usr/bin/claude")
-        def _fake_run(*a, **k):
-            return SimpleNamespace(
-                returncode=0,
-                stdout='{"trade_labels": [], "overall_lesson": ""}',
-                stderr="",
-            )
-        monkeypatch.setattr(rcb.subprocess, "run", _fake_run)
+        monkeypatch.setattr(
+            "paper_trader.llm_adapter.call_llm",
+            lambda *a, **k: '{"trade_labels": [], "overall_lesson": ""}',
+        )
         # Redirect WINNER_JSONL to a temp file so we don't pollute real data.
         monkeypatch.setattr(rcb, "WINNER_JSONL", tmp_path / "winner.jsonl")
         # Silence the news context query (it would otherwise try to open
@@ -336,3 +329,144 @@ class TestOpusAnnotateOutcomeLookupDefensive:
         # is "did not raise", not the write count itself.
         assert isinstance(n_written, int)
         assert n_written == 0
+
+
+
+class TestLlmAnnotateJsonWrapper:
+    """Live grok-4.6 returned {"reviews":["MSFT BUY: ENDORSE ..."]} and the
+    old re.match-per-line parser produced 0 endorsed / 0 condemned."""
+
+    def _runs(self):
+        winner = BacktestRun(run_id=1, seed=1, start_date="2025-01-01",
+                             end_date="2025-12-31", total_return_pct=50.0)
+        loser = BacktestRun(run_id=3, seed=3, start_date="2025-01-01",
+                            end_date="2025-12-31", total_return_pct=-30.0)
+        return winner, loser
+
+    def test_json_reviews_array_applies_labels(self, monkeypatch):
+        winner, loser = self._runs()
+        recs = [
+            {"run_id": 1, "ticker": "MSFT", "action": "BUY",
+             "ml_score": 3.0, "rsi": 40, "forward_return_5d": 4.1},
+            {"run_id": 3, "ticker": "AMD", "action": "SELL",
+             "ml_score": 1.0, "rsi": 70, "forward_return_5d": -2.0},
+        ]
+        payload = (
+            '{"reviews":["MSFT BUY: ENDORSE High ML score and +4.1% 5d return",'
+            '"AMD SELL: CONDEMN poor exit timing"]}'
+        )
+        monkeypatch.setattr("paper_trader.llm_adapter.call_llm", _fake_llm(payload))
+        out = rcb._llm_annotate_outcomes(None, winner, loser, recs, cycle=1)
+        by = {(r["run_id"], r["ticker"]): r["llm_quality_label"] for r in out}
+        assert by[(1, "MSFT")] == 1
+        assert by[(3, "AMD")] == -1
+
+    def test_parse_helper_finds_labels_inside_json_and_plaintext(self):
+        json_blob = (
+            '{"reviews":["MSFT BUY: ENDORSE High ML score",'
+            '"AMD SELL: CONDEMN poor exit"]}'
+        )
+        got = rcb._parse_llm_annotation_labels(json_blob)
+        assert ("MSFT", "BUY", "ENDORSE") in got
+        assert ("AMD", "SELL", "CONDEMN") in got
+        plain = "NVDA BUY: ENDORSE strong AI\nTSLA HOLD: CONDEMN missed exit"
+        got2 = rcb._parse_llm_annotation_labels(plain)
+        assert ("NVDA", "BUY", "ENDORSE") in got2
+        assert ("TSLA", "HOLD", "CONDEMN") in got2
+        assert rcb._parse_llm_annotation_labels("") == []
+        assert rcb._parse_llm_annotation_labels("no labels here") == []
+
+
+class TestOpusAnnotateChunking:
+    def test_large_decision_log_is_chunked_and_merged(self, monkeypatch, tmp_path):
+        """A 5-decision winner with chunk size 2 must make 3 Grok calls,
+        not one 240s mega-prompt, and merge trade_labels + lesson."""
+        import sqlite3
+        import threading as _th
+
+        winner = BacktestRun(run_id=7, seed=7, start_date="2025-01-01",
+                             end_date="2025-12-31", total_return_pct=12.0)
+        store = bt.BacktestStore.__new__(bt.BacktestStore)
+        store.conn = sqlite3.connect(":memory:")
+        store.conn.row_factory = sqlite3.Row
+        store.conn.executescript(bt.SCHEMA)
+        store.conn.commit()
+        store._lock = _th.Lock()
+        for i, (action, ticker) in enumerate(
+                [("BUY", "NVDA"), ("HOLD", "AMD"), ("SELL", "MSFT"),
+                 ("BUY", "AAPL"), ("HOLD", "TSM")], start=1):
+            store.conn.execute(
+                "INSERT INTO backtest_decisions "
+                "(run_id, sim_date, action, ticker, qty, total_value, "
+                "reasoning, status) VALUES (?,?,?,?,?,?,?,?)",
+                (7, f"2025-06-{i:02d}", action, ticker, 1.0, 1000.0,
+                 "test", "FILLED"),
+            )
+        store.conn.commit()
+        engine = SimpleNamespace(store=store)
+
+        calls: list[str] = []
+
+        def _fake_llm(model_id, prompt, timeout=None):
+            calls.append(prompt)
+            n = len(calls)
+            return (
+                '{"trade_labels":[{"sim_date":"2025-06-0%d","action":"BUY",'
+                '"ticker":"X%d","quality":"GOOD","rationale":"ok"}],'
+                '"overall_lesson":"lesson-%d","key_patterns":["p%d"],'
+                '"improvement_suggestions":[]}'
+            ) % (n, n, n, n)
+
+        monkeypatch.setattr("paper_trader.llm_adapter.call_llm", _fake_llm)
+        monkeypatch.setattr(rcb, "WINNER_JSONL", tmp_path / "winner.jsonl")
+        monkeypatch.setattr(rcb, "_query_news_context", lambda *a, **k: [])
+        monkeypatch.setattr(rcb, "OPUS_ANNOTATE_CHUNK", 2)
+        monkeypatch.setattr(rcb, "OPUS_ANNOTATE_RETRIES", 0)
+
+        n = rcb._opus_annotate(engine, [winner], cycle=3, outcome_records=[])
+        assert len(calls) == 3, f"expected 3 chunks, got {len(calls)}"
+        # 1 lesson + 3 trade labels (one per chunk)
+        assert n == 4
+        rows = [__import__("json").loads(l)
+                for l in (tmp_path / "winner.jsonl").read_text().splitlines()
+                if l.strip()]
+        lessons = [r for r in rows if r.get("type") == "opus_lesson"]
+        labels = [r for r in rows if r.get("type") == "opus_trade_label"]
+        assert len(lessons) == 1
+        assert lessons[0]["reasoning"] == "lesson-1"  # first non-empty lesson
+        assert len(labels) == 3
+        assert all(r.get("urgency") == 0 for r in rows)
+
+    def test_empty_chunks_retry_then_report_empty(self, monkeypatch, tmp_path):
+        import sqlite3
+        import threading as _th
+
+        winner = BacktestRun(run_id=8, seed=8, start_date="2025-01-01",
+                             end_date="2025-12-31", total_return_pct=1.0)
+        store = bt.BacktestStore.__new__(bt.BacktestStore)
+        store.conn = sqlite3.connect(":memory:")
+        store.conn.row_factory = sqlite3.Row
+        store.conn.executescript(bt.SCHEMA)
+        store.conn.commit()
+        store._lock = _th.Lock()
+        store.conn.execute(
+            "INSERT INTO backtest_decisions "
+            "(run_id, sim_date, action, ticker, qty, total_value, "
+            "reasoning, status) VALUES (?,?,?,?,?,?,?,?)",
+            (8, "2025-06-01", "BUY", "NVDA", 1.0, 1000.0, "test", "FILLED"),
+        )
+        store.conn.commit()
+        engine = SimpleNamespace(store=store)
+        n_calls = {"n": 0}
+
+        def _empty(*a, **k):
+            n_calls["n"] += 1
+            return None
+
+        monkeypatch.setattr("paper_trader.llm_adapter.call_llm", _empty)
+        monkeypatch.setattr(rcb, "WINNER_JSONL", tmp_path / "winner.jsonl")
+        monkeypatch.setattr(rcb, "_query_news_context", lambda *a, **k: [])
+        monkeypatch.setattr(rcb, "OPUS_ANNOTATE_RETRIES", 1)
+        n = rcb._opus_annotate(engine, [winner], cycle=1, outcome_records=[])
+        assert n == 0
+        assert n_calls["n"] == 2  # initial + 1 retry

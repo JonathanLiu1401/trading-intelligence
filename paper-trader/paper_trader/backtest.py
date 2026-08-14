@@ -47,6 +47,10 @@ GDELT_MAX_RECORDS = 100
 GDELT_RETRY_BACKOFF_S = 20.0  # reduced; 30s was too conservative
 GDELT_WARM_WORKERS = 1        # single worker — parallel workers share rate-limit lock and deadlock
 GDELT_MAX_WARM_REQUESTS = 150  # cap per warm cycle — full window warming takes hours; not worth it
+# GDELT DOC 2.0 article-search coverage starts 2015-02-19. Queries before
+# this raise a deterministic "Invalid query start date" after burning the
+# 20/40/60s retry budget. Skip them before any HTTP call.
+GDELT_COVERAGE_START = date(2015, 2, 19)
 OPUS_TIMEOUT_S = 150
 # Concurrency for claude subprocesses now lives in paper_trader.llm_adapter
 # (`_CLAUDE_SEM`) so it is shared across all callers that route through
@@ -1408,15 +1412,21 @@ def _vix_level(sim_date: date, prices: "PriceCache") -> float | None:
 class GDELTFetcher:
     """Cached GDELT fetcher using the gdeltdoc library (alex9smith/gdelt-doc-api).
 
-    Thread-safe: a class-level lock serializes outbound GDELT requests so 10
-    parallel run threads don't all hit the 5s rate limit simultaneously."""
+    Thread-safe: a *class-level* lock + last-request timestamp serialize
+    outbound GDELT requests across every instance (BacktestEngine warm,
+    weekly prewarm, per-run fetch) so they share one process-wide
+    1-req / GDELT_RATE_LIMIT_S limiter. Instance locks were a no-op
+    whenever two fetchers existed — the continuous log's overlapping
+    rate-limit storms were the result.
+    """
+
+    _request_lock = threading.Lock()
+    _last_request_ts = 0.0
 
     def __init__(self):
         GDELT_CACHE.mkdir(parents=True, exist_ok=True)
         from gdeltdoc import GdeltDoc
         self._client = GdeltDoc()
-        self._request_lock = threading.Lock()
-        self._last_request_ts = 0.0
 
     def _cache_key(self, d: date, keywords: str) -> Path:
         slug = hashlib.md5(keywords.encode()).hexdigest()[:8]
@@ -1443,6 +1453,14 @@ class GDELTFetcher:
             except Exception:
                 pass
 
+        # Known-uncovered dates: never hit the API. Negative-cache empty so
+        # the warm-cache exists()-filter and later cycles are disk hits.
+        # Weekly prewarm used to walk the Monday *before* 2015-02-19
+        # (2015-02-16) and every 1993–2015 window burned 3 retries + backoff.
+        if d < GDELT_COVERAGE_START:
+            _atomic_write_json(path, [])
+            return []
+
         from gdeltdoc import Filters
         from gdeltdoc.errors import RateLimitError
         start_str = d.strftime("%Y-%m-%d")
@@ -1453,24 +1471,24 @@ class GDELTFetcher:
         permanent = False
         for attempt in range(3):
             err: str | None = None
-            with self._request_lock:
-                elapsed = time.time() - self._last_request_ts
+            with GDELTFetcher._request_lock:
+                elapsed = time.time() - GDELTFetcher._last_request_ts
                 if elapsed < GDELT_RATE_LIMIT_S:
                     time.sleep(GDELT_RATE_LIMIT_S - elapsed)
                 try:
                     f = Filters(keyword=keywords, start_date=start_str, end_date=end_str)
                     df = self._client.article_search(f)
-                    self._last_request_ts = time.time()
+                    GDELTFetcher._last_request_ts = time.time()
                     if df is not None and not df.empty:
                         keep = [c for c in ["title", "url", "domain", "seendate"]
                                 if c in df.columns]
                         articles = df[keep].rename(columns={"domain": "source"}).to_dict("records")
                     success = True
                 except RateLimitError:
-                    self._last_request_ts = time.time()
+                    GDELTFetcher._last_request_ts = time.time()
                     err = "rate-limited"
                 except Exception as e:
-                    self._last_request_ts = time.time()
+                    GDELTFetcher._last_request_ts = time.time()
                     err = f"{type(e).__name__}: {e}"
                     # GDELT DOC 2.0 only indexes ~2017-onward. A pre-coverage
                     # date raises a deterministic ValueError ("The query was
@@ -3615,7 +3633,7 @@ class BacktestEngine:
         When run_all() calls this first, every subsequent thread cache-lookup is a
         disk hit — zero outbound GDELT requests during the parallel phase.
         """
-        days = self._sampled_days()
+        days = [d for d in self._sampled_days() if d >= GDELT_COVERAGE_START]
         combos = [(d, kw) for d in days for kw in KEYWORD_GROUPS]
         uncached = [(d, kw) for d, kw in combos
                     if not self.gdelt._cache_key(d, kw).exists()]
