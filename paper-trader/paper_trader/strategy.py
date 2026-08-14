@@ -3160,6 +3160,8 @@ def _minimum_hold_exit_guard(
 
     Default 4h. Hard SL still owns forced risk exits independently.
     Real thesis-kill / map-failure / hard-stop language bypasses the lock.
+    Long-option premium down >= OPTION_PREMIUM_KILL_PCT also bypasses
+    (same hard-risk exception as _underwater_discretionary_exit_guard).
     Pure "weakening / largest drag / went red" language does NOT bypass.
     """
     if MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S <= 0:
@@ -3170,6 +3172,12 @@ def _minimum_hold_exit_guard(
 
     if _is_hard_stop_exit(decision) or _is_thesis_kill_exit(decision):
         return True, ""
+    # 2026-08-14: 0-DTE NVDA 225s were -63%/-68% past the -50% premium kill
+    # and still lock-blocked because this guard ran before the underwater
+    # premium-kill exception. Dying long options must flatten.
+    if position_type != "stock" and match_pos is not None:
+        if _option_premium_kill_hit(match_pos):
+            return True, ""
     try:
         total = float(snapshot.get("total_value") or 0.0)
     except (TypeError, ValueError):

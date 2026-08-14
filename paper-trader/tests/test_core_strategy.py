@@ -1302,7 +1302,79 @@ class TestExecuteSell:
         assert detail.startswith("SELL 5")
         assert fresh_store.open_positions() == []
 
+    def test_sell_call_min_hold_blocks_when_premium_not_killed(
+        self, fresh_store, monkeypatch
+    ):
+        """Discretionary option flatten still waits out the 4h lock if the
+        long is only mildly red — premium-kill is the hard exception."""
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 4 * 3600)
+        monkeypatch.setattr(market, "get_option_price", lambda t, e, s, ot: 1.50)
+        opened = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        fresh_store.upsert_position(
+            "NVDA", "call", qty=3, avg_cost=1.84,
+            expiry="2026-08-14", strike=225.0,
+        )
+        with fresh_store._lock:
+            fresh_store.conn.execute(
+                "UPDATE positions SET opened_at=? WHERE ticker='NVDA'",
+                (opened,),
+            )
+            fresh_store.conn.commit()
+        pos = {
+            "ticker": "NVDA", "type": "call", "qty": 3,
+            "avg_cost": 1.84, "current_price": 1.50,
+            "strike": 225.0, "expiry": "2026-08-14",
+            "opened_at": opened,
+        }
+        snap = {"cash": 8710.5, "total_value": 9600.0, "positions": [pos]}
+        decision = {
+            "action": "SELL_CALL", "ticker": "NVDA", "qty": 3,
+            "strike": 225, "expiry": "2026-08-14",
+            "reasoning": "take the rest of the premium, tape weakening",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "minimum-hold lock" in detail
 
+    def test_sell_call_min_hold_allows_option_premium_kill(
+        self, fresh_store, monkeypatch
+    ):
+        """Live 2026-08-14 10:34/10:48 PT: 0-DTE NVDA 225s were -63%/-68%
+        past the -50% premium kill and still lock-blocked because min-hold
+        ran before the underwater premium-kill exception. Salvage must fill.
+        """
+        monkeypatch.setattr(strategy, "MIN_HOLD_BEFORE_DISCRETIONARY_EXIT_S", 4 * 3600)
+        monkeypatch.setattr(market, "get_option_price", lambda t, e, s, ot: 0.68)
+        opened = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        fresh_store.upsert_position(
+            "NVDA", "call", qty=3, avg_cost=1.84,
+            expiry="2026-08-14", strike=225.0,
+        )
+        with fresh_store._lock:
+            fresh_store.conn.execute(
+                "UPDATE positions SET opened_at=? WHERE ticker='NVDA'",
+                (opened,),
+            )
+            fresh_store.conn.commit()
+        pos = {
+            "ticker": "NVDA", "type": "call", "qty": 3,
+            "avg_cost": 1.84, "current_price": 0.68,
+            "strike": 225.0, "expiry": "2026-08-14",
+            "opened_at": opened,
+        }
+        snap = {"cash": 8710.5, "total_value": 9600.0, "positions": [pos]}
+        decision = {
+            "action": "SELL_CALL", "ticker": "NVDA", "qty": 3,
+            "strike": 225, "expiry": "2026-08-14",
+            "confidence": 0.78,
+            "reasoning": (
+                "0-DTE NVDA 225 calls are -63% past the -50% premium kill "
+                "with CRITICAL theta and a broken weekly-closer thesis"
+            ),
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert "SELL_CALL" in detail
 
 
 class TestUnderwaterPanicSellGuard:
