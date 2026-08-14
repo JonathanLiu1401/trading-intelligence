@@ -111,27 +111,13 @@ def build_x_search_payload(accounts: list[str], *, from_date: str | None = None)
         handles = list(_DEFAULT_ACCOUNTS)
     mentioned = ", ".join(f"@{h}" for h in handles)
     prompt = (
-        f"Search X (Twitter) for the latest market-moving posts from these "
-        f"accounts in the last {LOOKBACK_HOURS} hours: {mentioned}.\n\n"
-        "Return ONLY a JSON array. Each object must have:\n"
-        '  "handle": account without @,\n'
-        '  "text": tweet text,\n'
-        '  "url": https://x.com/{handle}/status/{id},\n'
-        '  "published": ISO-8601 if known else "",\n'
-        '  "tickers": array of ticker symbols if obvious else []\n\n'
-        "Prefer original posts with market facts, breaking news, or notable "
-        "commentary. Skip replies, spam, and empty quote-tweets."
+        f"Latest market-moving X posts from {mentioned} in the last "
+        f"{LOOKBACK_HOURS} hours. Return ONLY a JSON array of objects with "
+        "handle, text, url, published, tickers. JSON only."
     )
     return {
         "model": MODEL,
         "input": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a markets desk intern. Use x_search only. "
-                    "Return a JSON array of recent tweets. No markdown."
-                ),
-            },
             {"role": "user", "content": prompt},
         ],
         "tools": [

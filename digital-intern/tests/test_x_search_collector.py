@@ -30,7 +30,7 @@ def test_build_payload_uses_x_search_and_handles():
         "from_date": "2026-08-13",
     }]
     assert payload["model"]
-    user = payload["input"][1]["content"]
+    user = payload["input"][0]["content"]
     assert "@KobeissiLetter" in user
     assert "@Reuters" in user
 
