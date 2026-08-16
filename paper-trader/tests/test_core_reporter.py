@@ -6554,3 +6554,60 @@ class TestSendQuotaRecoveredAlert:
         )
         body = captured[0]
         assert "after ~1d5h dark" in body
+
+
+class TestHourlyHostNametag:
+    """Mac hourlies must open with a host nametag. Linux stays unlabeled."""
+
+    def test_mac_pile_is_line_one(self, monkeypatch):
+        monkeypatch.setattr(reporter.sys, "platform", "darwin")
+        line = reporter._hourly_host_nametag([
+            {"ticker": "NVDA"},
+            {"ticker": "TQQQ"},
+            {"ticker": "NVDU"},
+            {"ticker": "NVDA"},
+        ])
+        assert line.splitlines()[0] == "Mac. Still piled."
+        assert line.splitlines()[1] == "TQQQ / NVDU / NVDA"
+
+    def test_linux_stays_unlabeled(self, monkeypatch):
+        monkeypatch.setattr(reporter.sys, "platform", "linux")
+        assert reporter._hourly_host_nametag([
+            {"ticker": "TQQQ"},
+            {"ticker": "NVDU"},
+        ]) == ""
+
+    def test_hourly_body_starts_with_nametag(self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter.sys, "platform", "darwin")
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        fresh_store.upsert_position("TQQQ", "stock", 80, 50.0)
+        fresh_store.upsert_position("NVDU", "stock", 30, 80.0)
+        fresh_store.upsert_position("NVDA", "stock", 10, 100.0)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert body.startswith("Mac. Still piled.\nTQQQ / NVDU / NVDA\n")
+        assert "**HOURLY**" in body
+
+    def test_toast_prefix_skips_linux(self, monkeypatch):
+        monkeypatch.setattr(reporter.sys, "platform", "linux")
+        assert reporter._toast_host_prefix("**PAPER TRADER ONLINE**") == (
+            "**PAPER TRADER ONLINE**"
+        )
+
+    def test_toast_prefix_labels_mac_online(self, monkeypatch):
+        monkeypatch.setattr(reporter.sys, "platform", "darwin")
+        assert reporter._toast_host_prefix(
+            "**PAPER TRADER ONLINE** ◈ engine booted, decision loop starting"
+        ) == (
+            "Mac.\n**PAPER TRADER ONLINE** ◈ engine booted, decision loop starting"
+        )
+
+    def test_toast_prefix_does_not_double_hourly(self, monkeypatch):
+        monkeypatch.setattr(reporter.sys, "platform", "darwin")
+        body = "Mac. Still piled.\nTQQQ / NVDU / NVDA\n**HOURLY**"
+        assert reporter._toast_host_prefix(body) == body

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -203,7 +204,25 @@ def _resolve_openclaw() -> str | None:
     return None
 
 
+def _toast_host_prefix(message: str) -> str:
+    """Host line on every Discord toast. Darwin only.
+
+    Hourlies already carry ``Mac. Still piled.`` from
+    ``_hourly_host_nametag``; do not double-prefix those. Other toasts
+    (ONLINE, restart, alerts) get a bare ``Mac.`` so a boot banner
+    cannot look like the VPS book. Linux/VPS stays unlabeled.
+    """
+    if sys.platform != "darwin":
+        return message
+    text = message or ""
+    first = (text.splitlines() or [""])[0].strip()
+    if first.startswith("Mac."):
+        return text
+    return "Mac.\n" + text
+
+
 def _send(message: str) -> bool:
+    message = _toast_host_prefix(message)
     bin_ = _resolve_openclaw()
     if not bin_:
         print(f"[reporter] openclaw not installed; would send:\n{message}")
@@ -5485,6 +5504,37 @@ def _alarm_latch_line() -> str:
         return ""
 
 
+_MAC_PILE_NAMES = ("TQQQ", "NVDU", "NVDA")
+
+
+def _hourly_host_nametag(positions=None) -> str:
+    """Line-1 host nametag for Mac hourlies only.
+
+    Linux/VPS dumps stay unlabeled here. Mac dumps open with
+    ``Mac. Still piled.`` while TQQQ/NVDU/NVDA are still on the book,
+    then the live names. Empty string on non-Darwin so this file can
+    ship to the VPS without tagging the wrong book.
+    """
+    if sys.platform != "darwin":
+        return ""
+    seen: set[str] = set()
+    names: list[str] = []
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        tk = (p.get("ticker") or "").upper().strip()
+        if tk and tk not in seen:
+            seen.add(tk)
+            names.append(tk)
+    pile = [n for n in _MAC_PILE_NAMES if n in seen]
+    other = sorted(n for n in names if n not in _MAC_PILE_NAMES)
+    ordered = pile + other
+    header = "Mac. Still piled." if pile else "Mac."
+    if ordered:
+        return header + "\n" + " / ".join(ordered)
+    return header
+
+
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
@@ -5521,7 +5571,10 @@ def send_hourly_summary() -> bool:
         print(f"[reporter] equity_curve read for alpha skipped: {e}")
         equity_asc = []
 
+    nametag = _hourly_host_nametag(positions)
+    prefix = f"{nametag}\n" if nametag else ""
     body = (
+        f"{prefix}"
         f"**HOURLY** ◈ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"```\n"
         f"Equity      ${pf['total_value']:.2f}\n"
