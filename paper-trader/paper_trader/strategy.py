@@ -1714,8 +1714,74 @@ def _mark_to_market(
     return enriched, open_value, marks
 
 
+def settle_expired_options(store: Store) -> list[dict]:
+    """Cash-settle and close every option past the NYSE expiry bell.
+
+    Lark 2026-08-23: marking expired lots to intrinsic/$0 still left them on
+    the open list, so the hourly kept printing "held 6d / -100%" on dead
+    contracts. After expiry, convert remaining intrinsic to cash and close
+    the lot. OTM longs/shorts settle at $0 (premium already in cash).
+    ITM longs credit intrinsic; ITM shorts debit it.
+
+    Returns the settled rows. Safe to call more than once — a second pass
+    sees no open expired lots. Never raises; a single bad row is skipped.
+    """
+    settled: list[dict] = []
+    try:
+        positions = store.open_positions() or []
+    except Exception:
+        return settled
+    cash_delta = 0.0
+    for p in positions:
+        try:
+            if (p.get("type") or "") not in ("call", "put"):
+                continue
+            if not _option_expired(p.get("expiry")):
+                continue
+            qty = float(p.get("qty") or 0.0)
+            if abs(qty) <= 0.0001:
+                continue
+            otype = p["type"]
+            settle_px = float(_expired_intrinsic(p["ticker"], otype, p["strike"]))
+            abs_qty = abs(qty)
+            if qty > 0:
+                action = "SELL_CALL" if otype == "call" else "SELL_PUT"
+                delta = -abs_qty
+            else:
+                action = "BUY_CALL" if otype == "call" else "BUY_PUT"
+                delta = abs_qty
+            store.record_trade(
+                p["ticker"], action, abs_qty, settle_px,
+                reason="expired option cash settlement — sweep off open list",
+                expiry=p.get("expiry"), strike=p.get("strike"), option_type=otype,
+            )
+            store.upsert_position(
+                p["ticker"], otype, delta, settle_px,
+                expiry=p.get("expiry"), strike=p.get("strike"),
+            )
+            cash_delta += settle_px * qty * 100.0
+            settled.append({**p, "settle_price": settle_px})
+        except Exception as e:
+            print(
+                f"[strategy] settle_expired skip {p.get('ticker')} "
+                f"{p.get('expiry')}: {e}",
+                flush=True,
+            )
+    if settled:
+        try:
+            pf = store.get_portfolio()
+            store.update_portfolio(
+                float(pf["cash"] or 0.0) + cash_delta,
+                float(pf["total_value"] or 0.0),
+            )
+        except Exception as e:
+            print(f"[strategy] settle_expired cash write failed: {e}", flush=True)
+    return settled
+
+
 def _portfolio_snapshot(store: Store) -> dict:
     """Mark-to-market every open position, write back to DB, return summary."""
+    settle_expired_options(store)
     positions = store.open_positions()
     enriched, open_value, marks = _mark_to_market(positions)
 

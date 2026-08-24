@@ -5488,6 +5488,11 @@ def _alarm_latch_line() -> str:
 
 def send_hourly_summary() -> bool:
     store = get_store()
+    try:
+        from .strategy import settle_expired_options
+        settle_expired_options(store)
+    except Exception as e:
+        print(f"[reporter] expired-option sweep skipped: {e}", flush=True)
     pf = store.get_portfolio()
     # ``store.open_positions()`` rows lack ``stale_mark`` (no such column in
     # the positions TABLE — it's an in-memory enrichment from
@@ -5884,6 +5889,11 @@ def send_hourly_summary() -> bool:
 
 def send_daily_close() -> bool:
     store = get_store()
+    try:
+        from .strategy import settle_expired_options
+        settle_expired_options(store)
+    except Exception as e:
+        print(f"[reporter] expired-option sweep skipped: {e}", flush=True)
     pf = store.get_portfolio()
     # See send_hourly_summary — merge stale_mark from positions_json so the
     # ⚠ STALE annotation can fire on the daily close too.

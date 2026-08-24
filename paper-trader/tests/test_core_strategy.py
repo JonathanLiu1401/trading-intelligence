@@ -1956,40 +1956,66 @@ class TestPortfolioSnapshotSummation:
 
 
 class TestPortfolioSnapshotExpiredOptions:
-    def test_expired_otm_option_marked_to_zero_not_premium(self, fresh_store, monkeypatch):
-        # Bought a call for $5.00 premium; it expired OTM. Must mark to 0,
-        # realizing the full -$500 loss — NOT sit at avg_cost showing $0 P/L.
+    def test_expired_otm_option_is_swept_off_the_open_list(self, fresh_store, monkeypatch):
+        # Bought a call for $5.00 premium; it expired OTM. Must not stay on
+        # the hourly as a -100% open lot. Cash is unchanged (premium already
+        # left the book on the original buy; this fixture never deducted it).
         monkeypatch.setattr(market, "get_price", lambda t: 550.0)  # OTM vs 600 strike
         monkeypatch.setattr(market, "get_option_price",
                             lambda *a, **k: pytest.fail("must not query a dead chain"))
         fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
         snap = strategy._portfolio_snapshot(fresh_store)
-        assert len(snap["positions"]) == 1
-        pos = snap["positions"][0]
-        assert pos["current_price"] == 0.0
-        assert pos["unrealized_pl"] == pytest.approx(-500.0)  # (0 - 5) * 1 * 100
+        assert snap["positions"] == []
         assert snap["open_value"] == 0.0
+        assert fresh_store.open_positions() == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(store_mod.INITIAL_CASH)
 
-    def test_expired_itm_option_settles_at_intrinsic(self, fresh_store, monkeypatch):
+    def test_expired_itm_option_credits_intrinsic_and_closes(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 650.0)  # ITM vs 600
         fresh_store.upsert_position("NVDA", "call", qty=2, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
         snap = strategy._portfolio_snapshot(fresh_store)
-        pos = snap["positions"][0]
-        assert pos["current_price"] == 50.0          # 650 - 600
-        assert pos["unrealized_pl"] == pytest.approx((50.0 - 5.0) * 2 * 100)
-        assert snap["open_value"] == pytest.approx(50.0 * 2 * 100)
+        assert snap["positions"] == []
+        assert snap["open_value"] == 0.0
+        # 2 contracts * $50 intrinsic * 100
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(
+            store_mod.INITIAL_CASH + 10000.0)
+        assert snap["total_value"] == pytest.approx(store_mod.INITIAL_CASH + 10000.0)
 
     def test_expired_option_no_underlying_does_not_inflate_equity(self, fresh_store, monkeypatch):
         # The phantom-equity regression: underlying price unavailable AND
-        # chain dead → still 0.0, never the $5 premium.
+        # chain dead → settle at 0.0, never the $5 premium, and sweep the lot.
         monkeypatch.setattr(market, "get_price", lambda t: None)
         fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
         snap = strategy._portfolio_snapshot(fresh_store)
-        assert snap["positions"][0]["current_price"] == 0.0
+        assert snap["positions"] == []
         assert snap["open_value"] == 0.0
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(store_mod.INITIAL_CASH)
+
+    def test_expired_short_otm_is_swept_and_keeps_premium(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 550.0)
+        fresh_store.upsert_position("NVDA", "call", qty=-3, avg_cost=1.55,
+                                    expiry="2020-01-17", strike=600.0)
+        snap = strategy._portfolio_snapshot(fresh_store)
+        assert snap["positions"] == []
+        assert fresh_store.open_positions() == []
+        # Short OTM expires worthless; cover is $0 so cash does not move.
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(store_mod.INITIAL_CASH)
+        trades = fresh_store.recent_trades(1)
+        assert trades[0]["action"] == "BUY_CALL"
+        assert trades[0]["price"] == pytest.approx(0.0)
+
+    def test_expired_sweep_is_idempotent(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 550.0)
+        fresh_store.upsert_position("MU", "call", qty=1, avg_cost=0.04,
+                                    expiry="2020-01-17", strike=1050.0)
+        first = strategy.settle_expired_options(fresh_store)
+        second = strategy.settle_expired_options(fresh_store)
+        assert len(first) == 1
+        assert second == []
+        assert fresh_store.open_positions() == []
 
     def test_live_option_still_uses_chain_price(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_option_price", lambda t, e, s, ot: 7.5)
@@ -2084,14 +2110,15 @@ class TestStaleMarkFlag:
         assert pos["current_price"] == pytest.approx(5.0)  # behaviour preserved
 
     def test_expired_option_intrinsic_is_not_stale(self, fresh_store, monkeypatch):
-        # An expired option settled at intrinsic is a DELIBERATE, real mark —
-        # not a missing price. It must NOT be flagged stale even though no
-        # live chain price exists.
+        # Mark math still treats expired intrinsic as a real mark, not a
+        # missing price. Snapshot now sweeps the lot off the open list, so
+        # pin the flag on _mark_to_market directly.
         monkeypatch.setattr(market, "get_price", lambda t: 650.0)  # ITM vs 600
         fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
-        snap = strategy._portfolio_snapshot(fresh_store)
-        pos = snap["positions"][0]
+        rows = fresh_store.open_positions()
+        enriched, _open_value, _marks = strategy._mark_to_market(rows)
+        pos = enriched[0]
         assert pos["stale_mark"] is False
         assert pos["current_price"] == pytest.approx(50.0)  # 650 - 600
 
