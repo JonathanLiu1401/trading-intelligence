@@ -1885,22 +1885,42 @@ class TestPortfolioSnapshotExpiredOptions:
                             lambda *a, **k: pytest.fail("must not query a dead chain"))
         fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
+        cash_before = fresh_store.get_portfolio()["cash"]
         snap = strategy._portfolio_snapshot(fresh_store)
-        assert len(snap["positions"]) == 1
-        pos = snap["positions"][0]
-        assert pos["current_price"] == 0.0
-        assert pos["unrealized_pl"] == pytest.approx(-500.0)  # (0 - 5) * 1 * 100
+        assert snap["positions"] == []
         assert snap["open_value"] == 0.0
+        assert fresh_store.open_positions() == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(cash_before)
+        expire_trades = [t for t in fresh_store.recent_trades() if t["action"] == "EXPIRE"]
+        assert len(expire_trades) == 1
+        assert expire_trades[0]["price"] == pytest.approx(0.0)
+
+    def test_expired_otm_short_call_is_removed_with_no_cash_move(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 550.0)
+        monkeypatch.setattr(market, "get_option_price",
+                            lambda *a, **k: pytest.fail("must not query a dead chain"))
+        fresh_store.upsert_position("NVDA", "call", qty=-3, avg_cost=4.0,
+                                    expiry="2020-01-17", strike=600.0)
+        cash_before = fresh_store.get_portfolio()["cash"]
+        snap = strategy._portfolio_snapshot(fresh_store)
+        assert snap["positions"] == []
+        assert snap["open_value"] == 0.0
+        assert fresh_store.open_positions() == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(cash_before)
 
     def test_expired_itm_option_settles_at_intrinsic(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 650.0)  # ITM vs 600
         fresh_store.upsert_position("NVDA", "call", qty=2, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
+        cash_before = fresh_store.get_portfolio()["cash"]
         snap = strategy._portfolio_snapshot(fresh_store)
-        pos = snap["positions"][0]
-        assert pos["current_price"] == 50.0          # 650 - 600
-        assert pos["unrealized_pl"] == pytest.approx((50.0 - 5.0) * 2 * 100)
-        assert snap["open_value"] == pytest.approx(50.0 * 2 * 100)
+        assert snap["positions"] == []
+        assert snap["open_value"] == 0.0
+        assert fresh_store.open_positions() == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(cash_before + 10000.0)
+        expire_trades = [t for t in fresh_store.recent_trades() if t["action"] == "EXPIRE"]
+        assert len(expire_trades) == 1
+        assert expire_trades[0]["price"] == pytest.approx(50.0)
 
     def test_expired_option_no_underlying_does_not_inflate_equity(self, fresh_store, monkeypatch):
         # The phantom-equity regression: underlying price unavailable AND
@@ -1908,9 +1928,12 @@ class TestPortfolioSnapshotExpiredOptions:
         monkeypatch.setattr(market, "get_price", lambda t: None)
         fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
+        cash_before = fresh_store.get_portfolio()["cash"]
         snap = strategy._portfolio_snapshot(fresh_store)
-        assert snap["positions"][0]["current_price"] == 0.0
+        assert snap["positions"] == []
         assert snap["open_value"] == 0.0
+        assert fresh_store.open_positions() == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(cash_before)
 
     def test_live_option_still_uses_chain_price(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_option_price", lambda t, e, s, ot: 7.5)
@@ -2011,10 +2034,11 @@ class TestStaleMarkFlag:
         monkeypatch.setattr(market, "get_price", lambda t: 650.0)  # ITM vs 600
         fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
                                     expiry="2020-01-17", strike=600.0)
+        cash_before = fresh_store.get_portfolio()["cash"]
         snap = strategy._portfolio_snapshot(fresh_store)
-        pos = snap["positions"][0]
-        assert pos["stale_mark"] is False
-        assert pos["current_price"] == pytest.approx(50.0)  # 650 - 600
+        assert snap["positions"] == []
+        assert fresh_store.open_positions() == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(cash_before + 5000.0)
 
     def test_build_payload_annotates_stale_position(self):
         # The core value: Opus must SEE that a $0.00 P/L is unreliable, not a

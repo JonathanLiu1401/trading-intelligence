@@ -1649,6 +1649,57 @@ def _mark_to_market(
     return enriched, open_value, marks
 
 
+def _settle_expired_option_lots(store: Store, enriched: list[dict]) -> set[int]:
+    """Cash-settle expired option lots and close them off the open book.
+
+    Expired contracts were already being marked at intrinsic (usually $0) and
+    then left open forever, so hourlies kept printing dead -100% rows. A close
+    at that mark moves any remaining intrinsic into cash and removes the lot
+    from ``open_positions`` / the hourly list. OTM longs and shorts are a $0
+    cash move; ITM longs credit intrinsic; ITM shorts debit it. Equity is
+    unchanged because the same dollars were already in ``market_value``.
+    """
+    settled: set[int] = set()
+    for pos in enriched:
+        if pos.get("type") not in ("call", "put"):
+            continue
+        if not _option_expired(pos.get("expiry")):
+            continue
+        qty = float(pos.get("qty") or 0.0)
+        if abs(qty) <= 0.0001:
+            continue
+        try:
+            settle_px = float(pos.get("current_price") or 0.0)
+        except (TypeError, ValueError):
+            settle_px = 0.0
+        if settle_px < 0:
+            settle_px = 0.0
+        ticker = pos["ticker"]
+        otype = pos["type"]
+        expiry = pos.get("expiry")
+        try:
+            strike_f = float(pos["strike"]) if pos.get("strike") is not None else None
+        except (TypeError, ValueError):
+            strike_f = None
+        store.record_trade(
+            ticker, "EXPIRE", abs(qty), settle_px,
+            reason="expired option settled and removed from open book",
+            expiry=expiry, strike=strike_f, option_type=otype,
+        )
+        store.upsert_position(
+            ticker, otype, -qty, settle_px,
+            expiry=expiry, strike=strike_f,
+        )
+        pf = store.get_portfolio()
+        store.update_portfolio(
+            float(pf["cash"]) + settle_px * qty * 100.0,
+            float(pf["total_value"]),
+        )
+        if pos.get("id") is not None:
+            settled.add(pos["id"])
+    return settled
+
+
 def _portfolio_snapshot(store: Store) -> dict:
     """Mark-to-market every open position, write back to DB, return summary."""
     positions = store.open_positions()
@@ -1656,6 +1707,11 @@ def _portfolio_snapshot(store: Store) -> dict:
 
     if marks:
         store.update_position_marks(marks)
+
+    settled_ids = _settle_expired_option_lots(store, enriched)
+    if settled_ids:
+        enriched = [p for p in enriched if p.get("id") not in settled_ids]
+        open_value = sum(float(p.get("market_value") or 0.0) for p in enriched)
 
     pf = store.get_portfolio()
     total = pf["cash"] + open_value
