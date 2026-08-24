@@ -1742,7 +1742,23 @@ def settle_expired_options(store: Store) -> list[dict]:
             if abs(qty) <= 0.0001:
                 continue
             otype = p["type"]
-            settle_px = float(_expired_intrinsic(p["ticker"], otype, p["strike"]))
+            # Leftover lots already marked after expiry (including 0.0 with a
+            # nonzero unrealized_pl) must keep that mark. Recomputing live
+            # intrinsic days later would settle last week's NVDA shorts
+            # against today's spot.
+            settle_px = None
+            try:
+                stored_px = p.get("current_price")
+                stored_pl = float(p.get("unrealized_pl") or 0.0)
+                if stored_px is not None and (
+                    float(stored_px) != 0.0 or stored_pl != 0.0
+                ):
+                    settle_px = float(stored_px)
+            except (TypeError, ValueError):
+                settle_px = None
+            if settle_px is None:
+                settle_px = float(_expired_intrinsic(
+                    p["ticker"], otype, p["strike"]))
             abs_qty = abs(qty)
             if qty > 0:
                 action = "SELL_CALL" if otype == "call" else "SELL_PUT"

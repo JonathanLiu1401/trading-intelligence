@@ -2007,6 +2007,19 @@ class TestPortfolioSnapshotExpiredOptions:
         assert trades[0]["action"] == "BUY_CALL"
         assert trades[0]["price"] == pytest.approx(0.0)
 
+    def test_leftover_marked_short_does_not_reprice_against_today(self, fresh_store, monkeypatch):
+        # Live book: expired NVDA shorts already marked at $0. Today's spot
+        # can be well through those strikes. Do not debit current intrinsic.
+        monkeypatch.setattr(market, "get_price", lambda t: 900.0)
+        fresh_store.upsert_position("NVDA", "call", qty=-3, avg_cost=0.155,
+                                    expiry="2020-01-17", strike=230.0)
+        pos = fresh_store.open_positions()[0]
+        fresh_store.update_position_marks({pos["id"]: (0.0, 46.5)})
+        snap = strategy._portfolio_snapshot(fresh_store)
+        assert snap["positions"] == []
+        assert fresh_store.get_portfolio()["cash"] == pytest.approx(store_mod.INITIAL_CASH)
+        assert fresh_store.recent_trades(1)[0]["price"] == pytest.approx(0.0)
+
     def test_expired_sweep_is_idempotent(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 550.0)
         fresh_store.upsert_position("MU", "call", qty=1, avg_cost=0.04,
