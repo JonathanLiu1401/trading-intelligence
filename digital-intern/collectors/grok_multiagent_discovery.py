@@ -43,7 +43,7 @@ XAI_AUTH_PROFILES_PATH = Path(
 )
 XAI_AUTH_PROFILE = os.environ.get(
     "PAPER_TRADER_XAI_AUTH_PROFILE",
-    "xai:artintel1110@gmail.com",
+    "xai:iamthemostproguy@gmail.com",
 )
 CURSOR_API_BASE = os.environ.get(
     "PAPER_TRADER_CURSOR_API_BASE", "http://127.0.0.1:4646/v1"

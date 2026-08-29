@@ -56,7 +56,7 @@ XAI_AUTH_PROFILES_PATH = Path(os.environ.get(
 ))
 XAI_AUTH_PROFILE = os.environ.get(
     "PAPER_TRADER_XAI_AUTH_PROFILE",
-    "xai:artintel1110@gmail.com",
+    "xai:iamthemostproguy@gmail.com",
 )
 # Cursor CLI OpenAI-compatible proxy (LaunchAgent com.cursor-agent-api).
 # Fallback ONLY when SuperGrok/xAI is rate-limited or credits are exhausted.
@@ -250,7 +250,7 @@ def _read_openclaw_auth_profiles() -> dict | None:
     made every Grok decision fail closed.
     """
     path = Path(XAI_AUTH_PROFILES_PATH)
-    if path.is_file():
+    if path.is_file() and path.suffix.lower() != ".sqlite":
         try:
             raw = json.loads(path.read_text())
             if isinstance(raw, dict) and raw.get("profiles"):
@@ -285,34 +285,28 @@ def _read_openclaw_auth_profiles() -> dict | None:
     return None
 
 
-def _load_xai_access_token() -> str | None:
-    """Resolve a bearer token for api.x.ai from env or OpenClaw auth profiles."""
-    for key in ("PAPER_TRADER_XAI_API_KEY", "XAI_API_KEY"):
-        value = (os.environ.get(key) or "").strip()
-        if value:
-            return value
-    raw = _read_openclaw_auth_profiles()
-    if not raw:
-        return None
-    profiles = raw.get("profiles") if isinstance(raw, dict) else None
+_OPENCLAW_XAI_REFRESH_COOLDOWN_S = 120.0
+_openclaw_xai_refresh_blocked_until = 0.0
+
+
+def _xai_access_from_profiles(profiles: dict | None, *, log_prefix: str = "[strategy]") -> tuple[str | None, list[str]]:
+    """Pick a non-expired xAI access token. Never logs token values."""
     if not isinstance(profiles, dict):
-        return None
-    preferred = [
-        XAI_AUTH_PROFILE,
-        "xai:default",
-        "xai",
-    ]
+        return None, []
+    preferred = [XAI_AUTH_PROFILE, "xai:default", "xai"]
     candidates = []
     for key in preferred:
         if key and key in profiles:
             candidates.append((key, profiles[key]))
     for key, value in profiles.items():
         if str(key).startswith("xai:") or (
-            isinstance(value, dict) and str(value.get("provider", "")).lower() == "xai"
+            isinstance(value, dict)
+            and str(value.get("provider", "")).lower() == "xai"
         ):
             if (key, value) not in candidates:
                 candidates.append((key, value))
     now_ms = int(time.time() * 1000)
+    stale = []
     for key, value in candidates:
         if not isinstance(value, dict):
             continue
@@ -323,17 +317,135 @@ def _load_xai_access_token() -> str | None:
             or value.get("api_key")
             or value.get("token")
         )
-        if not token:
-            continue
         expires = value.get("expires")
         try:
             exp_i = int(expires) if expires is not None else None
         except (TypeError, ValueError):
             exp_i = None
         if exp_i is not None and exp_i < now_ms:
-            print(f"[strategy] xAI auth profile expired: {key}")
+            print(f"{log_prefix} xAI auth profile expired: {key}")
+            stale.append(str(key))
             continue
-        return str(token)
+        if not token:
+            stale.append(str(key))
+            continue
+        return str(token), stale
+    return None, stale
+
+
+def _openclaw_bin() -> str | None:
+    for key in (
+        "DIGITAL_INTERN_OPENCLAW_BIN",
+        "PAPER_TRADER_OPENCLAW_BIN",
+        "OPENCLAW_BIN",
+    ):
+        value = (os.environ.get(key) or "").strip()
+        if value and Path(value).exists():
+            return value
+    found = shutil.which("openclaw")
+    if found:
+        return found
+    fallback = Path.home() / ".openclaw" / "bin" / "openclaw"
+    if fallback.is_file():
+        return str(fallback)
+    return None
+
+
+def _openclaw_xai_refresh_enabled() -> bool:
+    raw = os.environ.get(
+        "DIGITAL_INTERN_OPENCLAW_XAI_REFRESH",
+        os.environ.get("PAPER_TRADER_OPENCLAW_XAI_REFRESH", "1"),
+    )
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _refresh_openclaw_xai_oauth() -> bool:
+    """Ask OpenClaw to refresh sqlite oauth. Do not POST refresh tokens ourselves.
+
+    xAI rotates refresh tokens; a second writer knocks OpenClaw out. Probe
+    uses OpenClaw's existing lock + persist path, then we re-read sqlite.
+    stdout/stderr are captured and never printed (may contain secrets).
+    """
+    global _openclaw_xai_refresh_blocked_until
+    if not _openclaw_xai_refresh_enabled():
+        return False
+    now = time.time()
+    if now < _openclaw_xai_refresh_blocked_until:
+        print("[strategy] OpenClaw xAI oauth probe skipped (cooldown)")
+        return False
+    cli = _openclaw_bin()
+    if not cli:
+        print("[strategy] OpenClaw CLI not found; cannot refresh xAI oauth")
+        _openclaw_xai_refresh_blocked_until = now + _OPENCLAW_XAI_REFRESH_COOLDOWN_S
+        return False
+    cmd = [
+        cli,
+        "models",
+        "status",
+        "--probe",
+        "--probe-provider",
+        "xai",
+        "--probe-max-tokens",
+        "1",
+        "--probe-timeout",
+        "20000",
+    ]
+    print("[strategy] asking OpenClaw to refresh xAI oauth store")
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+    except Exception as e:
+        print(f"[strategy] OpenClaw xAI oauth probe failed: {type(e).__name__}")
+        _openclaw_xai_refresh_blocked_until = time.time() + _OPENCLAW_XAI_REFRESH_COOLDOWN_S
+        return False
+    stdout_len = len(proc.stdout or b"")
+    stderr_len = len(proc.stderr or b"")
+    print(
+        f"[strategy] OpenClaw xAI oauth probe rc={proc.returncode} "
+        f"stdout_len={stdout_len} stderr_len={stderr_len}"
+    )
+    # rc 2 is OpenClaw "expiring" on --check; probe may still have refreshed.
+    if proc.returncode not in (0, 2):
+        _openclaw_xai_refresh_blocked_until = time.time() + _OPENCLAW_XAI_REFRESH_COOLDOWN_S
+        return False
+    _openclaw_xai_refresh_blocked_until = time.time() + 30.0
+    return True
+
+
+def _load_xai_access_token() -> str | None:
+    """Resolve a bearer token for api.x.ai from env or OpenClaw auth profiles.
+
+    If the sqlite/JSON access token is expired or missing, ask OpenClaw to
+    refresh its own store (`models status --probe --probe-provider xai`)
+    and re-read. Never POSTs the refresh token from intern/trader.
+    """
+    for key in ("PAPER_TRADER_XAI_API_KEY", "XAI_API_KEY"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    raw = _read_openclaw_auth_profiles()
+    profiles = raw.get("profiles") if isinstance(raw, dict) else None
+    token, stale = _xai_access_from_profiles(profiles, log_prefix="[strategy]")
+    if token:
+        return token
+    if stale:
+        print(
+            f"[strategy] xAI auth expired/missing for {len(stale)} profile(s); "
+            "requesting OpenClaw refresh"
+        )
+    elif not raw:
+        print("[strategy] xAI auth missing; requesting OpenClaw refresh")
+    if _refresh_openclaw_xai_oauth():
+        raw = _read_openclaw_auth_profiles()
+        profiles = raw.get("profiles") if isinstance(raw, dict) else None
+        token, _stale = _xai_access_from_profiles(profiles, log_prefix="[strategy]")
+        if token:
+            print("[strategy] xAI auth refreshed via OpenClaw")
+            return token
     return None
 
 
@@ -4539,7 +4651,7 @@ def decide() -> dict:
     ml_opinion_block: str | None = None
     ml_op: dict | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
-    if ml_qualified:
+    if ml_qualified or ML_DROUGHT_ALLOW_ENTRIES:
         try:
             ml_op = _ml_live_opinion(ml_articles, quant_sigs, snap, watch_px)
             if ml_op:
@@ -4709,7 +4821,7 @@ def decide() -> dict:
         "ml_fallback_used": False,
     }
 
-    if not decision:
+    if (not decision) or (ML_DROUGHT_ALLOW_ENTRIES and isinstance(decision, dict) and str(decision.get("action") or "").upper()=="HOLD" and float(snap.get("cash") or 0)>=20 and not any((p.get("qty") or 0) for p in store.open_positions())):
         # Capture an excerpt of what Claude actually returned so we can
         # diagnose parse failures from the dashboard / DB instead of staring
         # at a generic "no parseable JSON" line.
@@ -4735,7 +4847,7 @@ def decide() -> dict:
             # The new analytics sub-buckets read the parenthesised suffix.
             cause = _last_claude_fail or "timeout/empty"
             reason_text = f"claude returned no response ({cause})"
-        if ml_qualified and ml_op:
+        if ml_op:
             ml_decision = _ml_drought_decision(
                 ml_op, snap, watch_px, reason_text,
             )
