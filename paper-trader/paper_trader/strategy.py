@@ -111,8 +111,7 @@ AUTO_LEVERAGE_WHEN_UNDERDEPLOYED = True
 
 # Hard operator discipline for the live paper book. These are deliberately
 # enforced in _execute(), not merely described to the model, because the live
-# trade log showed repeated same-ticker round trips. Single-name / sector
-# concentration is guidance only — not a hard post-trade block.
+# trade log showed repeated same-ticker round trips and sector pile-ons.
 TRADE_DISCIPLINE_MIN_BOOK_VALUE = float(os.environ.get(
     "PAPER_TRADER_DISCIPLINE_MIN_BOOK_VALUE", "5000",
 ))
@@ -145,8 +144,12 @@ UNDERWATER_EXIT_EPS = float(
 OPTION_PREMIUM_KILL_PCT = float(
     os.environ.get("PAPER_TRADER_OPTION_PREMIUM_KILL_PCT", "0.50")
 )
-# Art 2026-08-14: single-name and sector 70% post-trade blocks are DROPPED.
-# Diversify stays guidance only. Leveraged-ETF sleeve still has a hard cap.
+MAX_POST_TRADE_SINGLE_NAME_PCT = float(os.environ.get(
+    "PAPER_TRADER_MAX_POST_TRADE_SINGLE_NAME_PCT", "70",
+))
+MAX_POST_TRADE_SECTOR_PCT = float(os.environ.get(
+    "PAPER_TRADER_MAX_POST_TRADE_SECTOR_PCT", "70",
+))
 MAX_POST_TRADE_LEVERAGED_PCT = float(os.environ.get(
     "PAPER_TRADER_MAX_POST_TRADE_LEVERAGED_PCT", "70",
 ))
@@ -2882,14 +2885,14 @@ def _trade_discipline_guard(
     effective_qty: float,
     now: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Hard block repeated entries. Concentration is not a fill block.
+    """Hard block repeated entries and concentration pile-ons.
 
     Applies only to new stock entries (BUY/SHORT). Exits are always allowed so
-    the guard cannot trap risk. Single-name and sector weights are guidance
-    only (Art 2026-08-14 dropped the 70% post-trade blocks). Leveraged-ETF
-    sleeves still have a hard cap. The small-book threshold keeps legacy unit
-    tests and toy local simulations from turning into cooldown-only noise; the
-    live book is above this threshold.
+    the guard cannot trap risk. The small-book threshold keeps legacy unit tests
+    and toy local simulations from turning into cooldown-only noise; the live
+    book is above this threshold. 2026-09-02: restore 70% single-name and
+    sector fill blocks after BUY 100 INTC @ 2x printed at 111% of book with
+    cash negative.
     """
     action = (decision.get("action") or "").upper()
     if action not in {"BUY", "SHORT"}:
@@ -2948,6 +2951,7 @@ def _trade_discipline_guard(
     except Exception:
         classify = lambda _ticker: "other"  # noqa: E731
 
+    name_values: dict[str, float] = {}
     sector_values: dict[str, float] = {}
     for p in snapshot.get("positions") or []:
         tk = str(p.get("ticker") or "").upper()
@@ -2956,14 +2960,31 @@ def _trade_discipline_guard(
         value = _position_abs_value(p)
         if value <= 0:
             continue
+        name_values[tk] = name_values.get(tk, 0.0) + value
         sec = classify(tk)
         sector_values[sec] = sector_values.get(sec, 0.0) + value
 
     sector = classify(ticker)
-    denom = max(total, sum(sector_values.values()) + notional, 1.0)
+    denom = max(total, sum(name_values.values()) + notional, 1.0)
+    post_name = name_values.get(ticker, 0.0) + notional
     post_sector = sector_values.get(sector, 0.0) + notional
+    post_name_pct = post_name / denom * 100.0
     post_sector_pct = post_sector / denom * 100.0
 
+    if post_name_pct > MAX_POST_TRADE_SINGLE_NAME_PCT + 1e-6:
+        return (
+            False,
+            f"diversification block: {ticker} would be "
+            f"{post_name_pct:.1f}% of book; max "
+            f"{MAX_POST_TRADE_SINGLE_NAME_PCT:.1f}%",
+        )
+    if post_sector_pct > MAX_POST_TRADE_SECTOR_PCT + 1e-6:
+        return (
+            False,
+            f"sector concentration block: {sector} would be "
+            f"{post_sector_pct:.1f}% of book; max "
+            f"{MAX_POST_TRADE_SECTOR_PCT:.1f}%",
+        )
     if sector.endswith("_lev") and post_sector_pct > MAX_POST_TRADE_LEVERAGED_PCT + 1e-6:
         return (
             False,

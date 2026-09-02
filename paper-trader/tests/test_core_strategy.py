@@ -1000,11 +1000,10 @@ class TestExecuteBuy:
         assert status == "BLOCKED"
         assert "qty" in detail.lower()
 
-    def test_buy_allows_over_70pct_single_name_like_lite(
+    def test_buy_blocked_when_it_would_overconcentrate_live_book(
         self, fresh_store, monkeypatch
     ):
-        # Art 2026-08-14: 70% single-name post-trade block is dropped.
-        # A LITE-sized 75.7% sleeve must fill, not hard-block.
+        # LITE-sized 76% sleeve must hard-block (Art 2026-08-14 drop reversed).
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
         snap = {
             "cash": 10000.0,
@@ -1016,10 +1015,9 @@ class TestExecuteBuy:
 
         status, detail = strategy._execute(decision, snap, fresh_store)
 
-        assert status == "FILLED"
-        assert "BUY 76" in detail
-        assert "diversification block" not in detail
-        assert fresh_store.open_positions()[0]["ticker"] == "LITE"
+        assert status == "BLOCKED"
+        assert "diversification block" in detail
+        assert fresh_store.open_positions() == []
 
     def test_buy_allows_bounded_entry_on_live_book(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
@@ -1036,11 +1034,10 @@ class TestExecuteBuy:
         assert status == "FILLED"
         assert "BUY 30" in detail
 
-    def test_buy_allows_over_70pct_same_sector_like_mu(
+    def test_buy_blocked_when_same_sector_would_exceed_cap(
         self, fresh_store, monkeypatch
     ):
-        # Art 2026-08-14: 70% sector post-trade block is dropped.
-        # A MU-sized add that takes semis to ~80% must fill, not hard-block.
+        # MU-sized add that takes semis to ~80% must hard-block.
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
         snap = {
             "cash": 7000.0,
@@ -1056,9 +1053,40 @@ class TestExecuteBuy:
 
         status, detail = strategy._execute(decision, snap, fresh_store)
 
-        assert status == "FILLED"
-        assert "BUY 50" in detail
-        assert "sector concentration block" not in detail
+        assert status == "BLOCKED"
+        assert "sector concentration block" in detail
+        assert all(p["ticker"] != "MU" for p in fresh_store.open_positions())
+
+    def test_intc_2x_dump_is_blocked_on_live_book(
+        self, fresh_store, monkeypatch
+    ):
+        # 2026-09-02 dump: requested 50 INTC @ 2x printed 100 shares, 111% of
+        # book, cash -$2574. Equity ~$7970 is above the $5k cooldown skip, so
+        # the restored 70% name cap must block before fill.
+        monkeypatch.setattr(market, "get_price", lambda t: 88.81)
+        snap = {
+            "cash": 6306.23,
+            "total_value": 7969.78,
+            "stock_buying_power": 10300.0,
+            "positions": [{
+                "ticker": "BIRD", "type": "stock", "qty": 679.0,
+                "avg_cost": 2.49, "current_price": 2.45,
+                "market_value": 1663.55,
+            }],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "INTC",
+            "qty": 50,
+            "leverage": 2,
+            "reasoning": "Intel foundry/x86, not an NVDA/QQQ GPU clone",
+        }
+
+        status, detail = strategy._execute(decision, snap, fresh_store)
+
+        assert status == "BLOCKED"
+        assert "diversification block" in detail
+        assert all(p["ticker"] != "INTC" for p in fresh_store.open_positions())
 
     def test_rebuy_after_recent_exit_is_blocked(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 100.0)
