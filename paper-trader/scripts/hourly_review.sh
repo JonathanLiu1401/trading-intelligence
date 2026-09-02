@@ -15,7 +15,7 @@ set -euo pipefail
 
 export PATH="/home/zeph/.local/bin:/home/zeph/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-DISCORD_TARGET="channel:1496099475838603324"
+DISCORD_TARGET="channel:1541660894331928576"
 LOG_DIR="/tmp/review_logs"
 mkdir -p "$LOG_DIR"
 TS=$(date +%Y%m%d_%H%M%S)
@@ -104,8 +104,8 @@ python3 -c "import sys; sys.path.insert(0,\".\"); from paper_trader import signa
 python3 -m pytest tests/ -v 2>&1 | tail -20
 
 ## COMPLETION (send exactly one message at the very end)
-Success: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 1 (paper-trader core) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
-Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 1 (paper-trader core) FAILED: [reason]"' \
+Success: openclaw message send --channel discord --target channel:1541660894331928576 --message "[REVIEW] Agent 1 (paper-trader core) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
+Failure: openclaw message send --channel discord --target channel:1541660894331928576 --message "[REVIEW] Agent 1 (paper-trader core) FAILED: [reason]"' \
 > "$LOG_DIR/agent1_$TS.log" 2>&1
 ) &
 A1=$!
@@ -176,8 +176,8 @@ Final verify:
 python3 -m pytest tests/ -v 2>&1 | tail -20
 
 ## COMPLETION (send exactly one message at the very end)
-Success: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 2 (ML+backtests) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
-Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 2 (ML+backtests) FAILED: [reason]"' \
+Success: openclaw message send --channel discord --target channel:1541660894331928576 --message "[REVIEW] Agent 2 (ML+backtests) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
+Failure: openclaw message send --channel discord --target channel:1541660894331928576 --message "[REVIEW] Agent 2 (ML+backtests) FAILED: [reason]"' \
 > "$LOG_DIR/agent2_$TS.log" 2>&1
 ) &
 A2=$!
@@ -266,8 +266,8 @@ python3 -c "import sys; sys.path.insert(0,\".\"); from storage import article_st
 python3 -m pytest tests/ -v 2>&1 | tail -20
 
 ## COMPLETION (send exactly one message at the very end)
-Success: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 3 (digital-intern) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
-Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 3 (digital-intern) FAILED: [reason]"' \
+Success: openclaw message send --channel discord --target channel:1541660894331928576 --message "[REVIEW] Agent 3 (digital-intern) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
+Failure: openclaw message send --channel discord --target channel:1541660894331928576 --message "[REVIEW] Agent 3 (digital-intern) FAILED: [reason]"' \
 > "$LOG_DIR/agent3_$TS.log" 2>&1
 ) &
 A3=$!
@@ -335,8 +335,8 @@ In whichever repo you changed files in, run: git diff --stat HEAD
   - If you implemented a real feature or change: stage ONLY the specific files you actually changed (NEVER git add -A — never stage config/, data/, logs/, *.json data files), run git diff --staged to verify only your intentional changes are staged, then git commit -m "feature: [specific description]" and git push.
 If after honest effort nothing meaningful changed in any repo, make no commit and still send the completion message below with built: none.
 
-Completion: openclaw message send --channel discord --target channel:1496099475838603324 --message "[FEATURE] Agent 4 (feature-dev) done — built: [specific list], tests: [N passed]"
-Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[FEATURE] Agent 4 (feature-dev) FAILED: [reason]"' \
+Completion: openclaw message send --channel discord --target channel:1541660894331928576 --message "[FEATURE] Agent 4 (feature-dev) done — built: [specific list], tests: [N passed]"
+Failure: openclaw message send --channel discord --target channel:1541660894331928576 --message "[FEATURE] Agent 4 (feature-dev) FAILED: [reason]"' \
 > "$LOG_DIR/agent4_$TS.log" 2>&1
 ) &
 A4=$!

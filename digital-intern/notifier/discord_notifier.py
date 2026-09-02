@@ -6,7 +6,7 @@ import time
 import requests
 
 DISCORD_LIMIT = 2000
-DEFAULT_DISCORD_CHANNEL = "channel:1496099475838603324"
+DEFAULT_DISCORD_CHANNEL = "channel:1541660894331928576"
 
 # Max POST attempts per chunk before the chunk is dropped. Used by the
 # retry loop and the gave-up log line so the two never disagree.

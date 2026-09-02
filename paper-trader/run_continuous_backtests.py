@@ -51,7 +51,7 @@ KEEP_LAST_RUNS = 500
 N_MONKEY_BT_PER_CYCLE = 20  # monkey runs added to backtest.db each cycle
 MAX_OUTCOMES_FOR_TRAINING = 5000  # cap decision_outcomes.jsonl tail used per retrain
 COOLDOWN_SECONDS = 600  # throttled from 300s — 10 min cooldown to give box breathing room
-DISCORD_CHANNEL = "channel:1496099475838603324"
+DISCORD_CHANNEL = "channel:1541660894331928576"
 WINNER_JSONL = ROOT / "data" / "winner_training.jsonl"
 # winner_training.jsonl is append-only across the whole loop lifetime
 # (`_append_top_decisions` + `_opus_annotate` both append, nothing trimmed).

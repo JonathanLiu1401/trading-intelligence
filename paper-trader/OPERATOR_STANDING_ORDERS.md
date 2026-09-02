@@ -1,10 +1,11 @@
-# OPERATOR STANDING ORDERS — Jonathan / Lark 2026-08-14
+# OPERATOR STANDING ORDERS — Jonathan / Lark
 
-These outrank SYSTEM_PROMPT leftovers, construction nagging, and any fabricated “NVDA/QQQ first” closer.
+These outrank SYSTEM_PROMPT leftovers, construction nagging, diversify sermons, and any fabricated “NVDA/QQQ first” closer.
 
-- The NVDA/QQQ-first Friday-weekly standing rule is REVOKED. Jarvis fabricated it after being told to stop fabricating standing rules. Do not reinstate it.
-- Live rule: DIVERSIFY. Do not pile NVDA, QQQ, TQQQ, NVDU, or other NVDA/Nasdaq-factor clones as a default.
-- Existing NVDA lots may be held or reduced. No new NVDA/QQQ/TQQQ/NVDU adds unless a genuinely new, non-cluster thesis exists — and even then prefer a different name.
-- Next discretionary entry must be a different issuer and a different factor than the current NVDA cluster.
-- There is no $800 NVDA/QQQ weekly obligation and no engine hard-send of an 8/14 (or any) NVDA/QQQ debit.
-- Scoreboard is P/L, not who printed more NVDA tickets.
+- Lark 2026-08-17 10:43 PDT: **there is no standing rule other than earn as much money as possible and leverage volatile trending stocks as much as possible.** That is the whole file. Diversify is not a sit-out. Cluster bans are not a sit-out. HOLD-looping with unused torque is a miss.
+- The old NVDA/QQQ-first Friday-weekly closer stays REVOKED. Jarvis fabricated it. Do not reinstate a fake weekly obligation. Scoreboard is P/L.
+- Lark 2026-08-17 10:40 PDT: MU and LITE shares are boring. Prefer **MUU** and **LITX** (2x) or options on those. Vanilla NVDA options are boring; if the book stays in NVDA, use 2x (NVDU or leveraged NVDA options), not another 225/227.5 tourist debit.
+- If the book is already maxed on a dead sleeve (plain shares, leftover debit, TQQQ pile with no BP), rotate into the 2x / options expression. Asking the operator to re-say “sell TQQQ” after this order is stalling.
+- Lark 2026-08-17 10:45 PDT: **TQQQ shares are not talking.** 3x ETF is nothing. TQQQ exposure has to be options or it does not count as leverage. Same spirit as MU/LITE → MUU/LITX and vanilla NVDA → 2x NVDA options.
+- Lark 2026-08-17 10:45 PDT: **minimum 10x leverage.** 3x ETF shares do not clear the bar. Express torque with options (or 2x/3x + options) on volatile trenders. Sitting in TQQQ/NVDU/MU/LITE stock is under-levered.
+- Lark 2026-08-17 20:59 PDT: **INTC 14.4 @ 1.2x is a miss.** He said leverage. Next open: **SELL the INTC shares** and put that notional into **MUU / LITX / TQQQ calls** (min 10x). Do not buy another 1.2x leftover name. Do not HOLD INTC because it is +$8.

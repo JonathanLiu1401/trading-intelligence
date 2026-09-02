@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from . import market
 from .store import Store, get_store
 
-DISCORD_CHANNEL = "channel:1496099475838603324"
+DISCORD_CHANNEL = "channel:1541660894331928576"
 _INITIAL_EQUITY = 1000.0
 
 

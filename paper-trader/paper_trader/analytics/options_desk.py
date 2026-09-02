@@ -9,11 +9,10 @@ from datetime import date
 from typing import Any
 
 _PREAMBLE = (
-    "OPTIONS DESK (chain + strategy awareness -- facts for instrument choice "
-    "only, NOT a directive; you retain complete autonomy; use BUY_CALL / "
-    "BUY_PUT when options are the better expression of conviction, else stock). "
-    "No preferred-underlying list. NVDA/QQQ Friday-weekly hard-send is revoked. "
-    "Diversify: do not pile the same factor. Snapshot DTE is observational only."
+    "OPTIONS DESK (chain + strategy awareness). Lark standing order: earn money "
+    "and leverage volatile trenders as much as possible. Minimum 10x. Prefer "
+    "MUU / LITX / TQQQ CALLS, not share-count 2x. NVDA/QQQ Friday-weekly hard-send "
+    "is revoked. Doubling stock qty is not leverage. Snapshot DTE is observational."
 )
 
 STRATEGY_SKILLS = [
@@ -278,10 +277,14 @@ def _candidate_tickers(positions, names_in_play, watch_prices, limit=4):
         u = str(t).upper()
         if u and u not in held and u not in play:
             play.append(u)
-    closer_first = ["NVDA", "QQQ"]
+    # Lark 2026-08-17: min 10x via MUU/LITX/TQQQ calls. NVDA/QQQ-first closer is revoked.
+    torque_first = ["MUU", "LITX", "TQQQ"]
+    skip_unless_held = {"NVDA", "QQQ"}
     out = []
-    for t in closer_first + held + play:
+    for t in torque_first + held + play:
         if t in out:
+            continue
+        if t in skip_unless_held and t not in held:
             continue
         out.append(t)
         if len(out) >= limit:

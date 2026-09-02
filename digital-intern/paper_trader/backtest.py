@@ -918,7 +918,7 @@ class BacktestEngine:
         try:
             r = subprocess.run(
                 ["openclaw", "message", "send", "--channel", "discord",
-                 "--target", "channel:1496099475838603324", "--message", message],
+                 "--target", "channel:1541660894331928576", "--message", message],
                 capture_output=True, text=True, timeout=60,
             )
             if r.returncode != 0:

@@ -20,7 +20,7 @@ from .store import (
     get_store,
 )
 
-DISCORD_CHANNEL = "channel:1496099475838603324"
+DISCORD_CHANNEL = "channel:1541660894331928576"
 # Single source of truth — keep P/L baselines in lockstep with the store.
 # A hardcoded copy silently desyncs every reported P/L% if INITIAL_CASH moves.
 _INITIAL_EQUITY = INITIAL_CASH
