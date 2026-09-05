@@ -138,6 +138,42 @@ class TestSend:
         assert reporter._send("hi") is True
         assert captured["env"]["PATH"].split(os.pathsep)[0] == "/opt/oc/bin"
 
+    def test_darwin_fans_out_to_main_and_test_claw(self, monkeypatch):
+        """Mac trading stack must hit both #claws. Lark 2026-09-04."""
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: "/usr/bin/openclaw")
+        monkeypatch.setattr(reporter.sys, "platform", "darwin")
+        calls = []
+
+        def _fake_run(*a, **k):
+            calls.append(list(a[0]))
+            fake = MagicMock()
+            fake.returncode = 0
+            fake.stderr = ""
+            return fake
+
+        monkeypatch.setattr(reporter.subprocess, "run", _fake_run)
+        assert reporter._send("hi") is True
+        targets = [c[c.index("--target") + 1] for c in calls]
+        assert targets == [reporter.DISCORD_CHANNEL, reporter.DISCORD_CHANNEL_TEST]
+
+    def test_linux_stays_main_claw_only(self, monkeypatch):
+        """VPS book stays main-only so the two books do not mix."""
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: "/usr/bin/openclaw")
+        monkeypatch.setattr(reporter.sys, "platform", "linux")
+        calls = []
+
+        def _fake_run(*a, **k):
+            calls.append(list(a[0]))
+            fake = MagicMock()
+            fake.returncode = 0
+            fake.stderr = ""
+            return fake
+
+        monkeypatch.setattr(reporter.subprocess, "run", _fake_run)
+        assert reporter._send("hi") is True
+        targets = [c[c.index("--target") + 1] for c in calls]
+        assert targets == [reporter.DISCORD_CHANNEL]
+
 
 @pytest.fixture
 def fresh_notify_state(monkeypatch):

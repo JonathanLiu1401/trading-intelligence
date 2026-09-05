@@ -21,7 +21,10 @@ from .store import (
     get_store,
 )
 
+# Main-server #claw always. Darwin/Mac also fans out to test-server #claw.
+# VPS stays main-only so the two books do not mix.
 DISCORD_CHANNEL = "channel:1496099475838603324"
+DISCORD_CHANNEL_TEST = "channel:1541660894331928576"
 # Single source of truth — keep P/L baselines in lockstep with the store.
 # A hardcoded copy silently desyncs every reported P/L% if INITIAL_CASH moves.
 _INITIAL_EQUITY = INITIAL_CASH
@@ -221,6 +224,13 @@ def _toast_host_prefix(message: str) -> str:
     return "Mac.\n" + text
 
 
+def _discord_targets() -> tuple[str, ...]:
+    """Mac trading stack goes to both #claws. VPS stays main-only."""
+    if sys.platform == "darwin":
+        return (DISCORD_CHANNEL, DISCORD_CHANNEL_TEST)
+    return (DISCORD_CHANNEL,)
+
+
 def _send(message: str) -> bool:
     message = _toast_host_prefix(message)
     bin_ = _resolve_openclaw()
@@ -246,32 +256,38 @@ def _send(message: str) -> bool:
     bin_dir = os.path.dirname(bin_)
     if bin_dir:
         env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
-    try:
-        r = subprocess.run(
-            [bin_, "message", "send",
-             "--channel", "discord",
-             "--target", DISCORD_CHANNEL,
-             "--message", message],
-            capture_output=True, text=True, timeout=60, env=env,
-        )
-        if r.returncode != 0:
-            # The CLI sometimes writes the real error to stdout with an empty
-            # stderr (the shebang/PATH failure does land on stderr, but be
-            # defensive so the health tracker always has a usable reason).
-            err = (r.stderr or "").strip() or (r.stdout or "").strip()
-            print(f"[reporter] openclaw failed: {err[:300]}")
-            _record_send_outcome(False, f"rc={r.returncode}: {err}")
-            return False
+    ok_all = True
+    last_reason = ""
+    for target in _discord_targets():
+        try:
+            r = subprocess.run(
+                [bin_, "message", "send",
+                 "--channel", "discord",
+                 "--target", target,
+                 "--message", message],
+                capture_output=True, text=True, timeout=60, env=env,
+            )
+            if r.returncode != 0:
+                # The CLI sometimes writes the real error to stdout with an empty
+                # stderr (the shebang/PATH failure does land on stderr, but be
+                # defensive so the health tracker always has a usable reason).
+                err = (r.stderr or "").strip() or (r.stdout or "").strip()
+                print(f"[reporter] openclaw failed ({target}): {err[:300]}")
+                ok_all = False
+                last_reason = f"rc={r.returncode}: {err}"
+        except subprocess.TimeoutExpired:
+            print(f"[reporter] openclaw timeout ({target})")
+            ok_all = False
+            last_reason = "openclaw timeout (60s)"
+        except Exception as e:
+            print(f"[reporter] openclaw exception ({target}): {e}")
+            ok_all = False
+            last_reason = f"exception: {e}"
+    if ok_all:
         _record_send_outcome(True)
         return True
-    except subprocess.TimeoutExpired:
-        print("[reporter] openclaw timeout")
-        _record_send_outcome(False, "openclaw timeout (60s)")
-        return False
-    except Exception as e:
-        print(f"[reporter] openclaw exception: {e}")
-        _record_send_outcome(False, f"exception: {e}")
-        return False
+    _record_send_outcome(False, last_reason or "discord fanout failed")
+    return False
 
 
 def _hold_str_from_days(days: float | None) -> str:
