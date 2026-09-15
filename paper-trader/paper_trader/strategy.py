@@ -244,13 +244,41 @@ def _read_openclaw_auth_profiles_sqlite(db_path: Path) -> dict | None:
         return None
 
 
+def _read_openclaw_auth_profiles_state_db(db_path: Path) -> dict | None:
+    """Read auth profiles from OpenClaw machine-state DB (post doctor --fix).
+
+    Newer OpenClaw builds keep OAuth under
+    ``~/.openclaw/state/openclaw.sqlite`` key ``authProfiles.store`` instead
+    of ``auth_profile_store`` in ``openclaw-agent.sqlite``.
+    """
+    try:
+        import sqlite3
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM config_machine_state "
+                "WHERE state_key = ? LIMIT 1",
+                ("authProfiles.store",),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        raw = json.loads(row[0])
+        return raw if isinstance(raw, dict) else None
+    except Exception as e:
+        print(f"[strategy] xAI auth state-db unreadable ({db_path}): {e}")
+        return None
+
+
 def _read_openclaw_auth_profiles() -> dict | None:
     """Load OpenClaw auth profiles from JSON file or the SQLite token sink.
 
     OpenClaw 2026+ stores secrets in ``openclaw-agent.sqlite`` under the
-    logical name ``auth-profiles.json``. The JSON file is often absent on
-    VPS installs (only the SQLite WAL store exists), which previously
-    made every Grok decision fail closed.
+    logical name ``auth-profiles.json``. After ``openclaw doctor --fix`` /
+    workspace migration, the live OAuth blob often moves to
+    ``~/.openclaw/state/openclaw.sqlite`` (``authProfiles.store``).
     """
     path = Path(XAI_AUTH_PROFILES_PATH)
     if path.is_file() and path.suffix.lower() != ".sqlite":
@@ -280,6 +308,11 @@ def _read_openclaw_auth_profiles() -> dict | None:
             continue
         seen.add(resolved)
         loaded = _read_openclaw_auth_profiles_sqlite(cand)
+        if loaded and loaded.get("profiles"):
+            return loaded
+    state_db = Path.home() / ".openclaw" / "state" / "openclaw.sqlite"
+    if state_db.is_file():
+        loaded = _read_openclaw_auth_profiles_state_db(state_db)
         if loaded and loaded.get("profiles"):
             return loaded
     print(
