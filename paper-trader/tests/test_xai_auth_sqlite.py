@@ -106,3 +106,46 @@ def test_expired_access_refreshed_via_openclaw_probe(tmp_path, monkeypatch):
     assert calls["n"] == 1
     assert tok
     assert len(tok) > 0
+
+
+def test_load_xai_token_from_openclaw_state_db_when_agent_store_empty(tmp_path, monkeypatch):
+    """OpenClaw shared auth lives in state DB after authProfiles.store migration."""
+    agent_db = tmp_path / "openclaw-agent.sqlite"
+    state_db = tmp_path / "openclaw-state.sqlite"
+    json_missing = tmp_path / "auth-profiles.json"
+    profile = "xai:iamthemostproguy@gmail.com"
+    fixture = "xai-test-token-from-state-db"
+    # empty agent sink (post-migration shape)
+    _write_store(agent_db, {})
+    conn = sqlite3.connect(state_db)
+    conn.execute(
+        "CREATE TABLE config_machine_state ("
+        "state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO config_machine_state VALUES (?, ?, ?)",
+        (
+            "authProfiles.store",
+            json.dumps({
+                "version": 1,
+                "profiles": {
+                    profile: {
+                        "type": "oauth",
+                        "provider": "xai",
+                        "access": fixture,
+                        "expires": int(time.time() * 1000) + 3_600_000,
+                    }
+                },
+            }),
+            int(time.time() * 1000),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    _isolate_auth(monkeypatch, json_missing, profile)
+    monkeypatch.setattr(strategy, "_refresh_openclaw_xai_oauth", lambda: False)
+    monkeypatch.setenv("PAPER_TRADER_OPENCLAW_STATE_SQLITE", str(state_db))
+    monkeypatch.setenv("PAPER_TRADER_XAI_AUTH_SQLITE", str(agent_db))
+    tok = strategy._load_xai_access_token()
+    assert tok
+    assert len(tok) == len(fixture)

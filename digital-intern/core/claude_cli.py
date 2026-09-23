@@ -153,13 +153,54 @@ def _read_openclaw_auth_profiles_sqlite(db_path: Path) -> dict | None:
         return None
 
 
-def _read_openclaw_auth_profiles() -> dict | None:
-    """Load OpenClaw auth profiles from JSON file or the SQLite token sink.
+def _read_openclaw_auth_profiles_state_db(db_path: Path | None = None) -> dict | None:
+    """Read shared OpenClaw auth profiles from state DB config_machine_state.
 
-    OpenClaw 2026+ stores secrets in ``openclaw-agent.sqlite`` under the
-    logical name ``auth-profiles.json``. The JSON file is often absent on
-    VPS installs (only the SQLite WAL store exists), which previously
-    made intern Grok calls fail closed.
+    OpenClaw 2026.9+ migrates the shared auth singleton into
+    ``~/.openclaw/state/openclaw.sqlite`` under ``authProfiles.store``.
+    The per-agent ``auth_profile_store`` can be empty after that migration
+    even while OAuth is healthy.
+    """
+    try:
+        import sqlite3
+
+        path = db_path or Path(
+            os.environ.get(
+                "DIGITAL_INTERN_OPENCLAW_STATE_SQLITE",
+                os.environ.get(
+                    "PAPER_TRADER_OPENCLAW_STATE_SQLITE",
+                    str(Path.home() / ".openclaw" / "state" / "openclaw.sqlite"),
+                ),
+            )
+        )
+        if not path.is_file():
+            return None
+        uri = f"file:{path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM config_machine_state "
+                "WHERE state_key = ? LIMIT 1",
+                ("authProfiles.store",),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        raw = json.loads(row[0])
+        return raw if isinstance(raw, dict) else None
+    except Exception as e:
+        print(f"[claude_cli] xAI auth state-db unreadable: {type(e).__name__}")
+        return None
+
+
+def _read_openclaw_auth_profiles() -> dict | None:
+    """Load OpenClaw auth profiles from JSON, agent SQLite, or shared state DB.
+
+    OpenClaw 2026+ first stored secrets in ``openclaw-agent.sqlite`` under the
+    logical name ``auth-profiles.json``. Later builds migrate the shared
+    singleton into ``state/openclaw.sqlite`` ``authProfiles.store``; the
+    per-agent table may then be empty while OAuth still works.
     """
     path = Path(XAI_AUTH_PROFILES_PATH)
     if path.is_file() and path.suffix.lower() != ".sqlite":
@@ -204,6 +245,9 @@ def _read_openclaw_auth_profiles() -> dict | None:
         loaded = _read_openclaw_auth_profiles_sqlite(cand)
         if loaded and loaded.get("profiles"):
             return loaded
+    loaded = _read_openclaw_auth_profiles_state_db()
+    if loaded and loaded.get("profiles"):
+        return loaded
     print(
         f"[claude_cli] xAI auth profiles unreadable: no JSON or SQLite store at {path}"
     )
